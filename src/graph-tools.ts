@@ -4,7 +4,10 @@ import logger from './logger.js';
 import { auditLog, getUserIdentityForAudit } from './audit-log.js';
 import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
-import { convertBufferToMarkdown } from './lib/document-conversion.js';
+import {
+  acquireConversionSlot,
+  convertReservedBufferToMarkdown,
+} from './lib/document-conversion.js';
 import { positiveIntFromEnv } from './lib/env.js';
 import AuthManager, {
   getEndpointScopeGroups,
@@ -462,6 +465,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           isError: true,
         };
       }
+      let releaseConversionSlot: (() => void) | undefined;
       try {
         const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
         if (accountModeError) {
@@ -474,6 +478,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
           accountAccessToken = await authManager.getTokenForAccount(accountParam);
         }
+        // Reserved before the Graph fetch below, not just before the worker-based conversion:
+        // makeRequest still buffers up to MAX_CONVERT_SOURCE_BYTES (plus its base64 overhead)
+        // in the main process before any worker even starts, so gating only the conversion step
+        // would let more concurrent calls than MS365_MCP_MAX_CONCURRENT_CONVERSIONS each hold
+        // that much memory at once, defeating the point of the limit. Released in the `finally`
+        // below on every path — success, an early "not binary"/"too large" return, or an error.
+        releaseConversionSlot = acquireConversionSlot();
         const raw = (await graphClient.makeRequest(target, {
           accessToken: accountAccessToken,
           // Stops Graph's response from being fully buffered (then base64-inflated) in
@@ -514,7 +525,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
             isError: true,
           };
         }
-        const { markdown, truncated, totalLength } = await convertBufferToMarkdown(buffer, {
+        const { markdown, truncated, totalLength } = await convertReservedBufferToMarkdown(buffer, {
           ocr,
         });
         return {
@@ -540,6 +551,8 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           content: [{ type: 'text', text: JSON.stringify({ error: message }) }],
           isError: true,
         };
+      } finally {
+        releaseConversionSlot?.();
       }
     },
   },
