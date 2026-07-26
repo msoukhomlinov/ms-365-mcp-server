@@ -5,6 +5,7 @@ import { auditLog, getUserIdentityForAudit } from './audit-log.js';
 import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
 import { convertBufferToMarkdown } from './lib/document-conversion.js';
+import { positiveIntFromEnv } from './lib/env.js';
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
@@ -123,18 +124,6 @@ const DEFAULT_MAX_ITEMS = 10_000;
 // well below the kind of file that would produce an unusably large markdown output
 // regardless of how well it converts.
 const MAX_CONVERT_SOURCE_BYTES = 25 * 1024 * 1024;
-
-/** Reads a positive-integer env var, falling back to `defaultValue` when unset or invalid. */
-function positiveIntFromEnv(name: string, defaultValue: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return defaultValue;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) {
-    logger.warn(`Ignoring invalid ${name}=${JSON.stringify(raw)} (use a positive integer)`);
-    return defaultValue;
-  }
-  return n;
-}
 
 /**
  * Whether `fetchAllPages` is permitted. Defaults to true; set MS365_MCP_ALLOW_PAGINATION
