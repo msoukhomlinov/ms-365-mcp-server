@@ -4,6 +4,7 @@ import logger from './logger.js';
 import { auditLog, getUserIdentityForAudit } from './audit-log.js';
 import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
+import { convertBufferToMarkdown } from './lib/document-conversion.js';
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
@@ -111,6 +112,12 @@ function clampTopQueryParam(queryParams: Record<string, string>): void {
 
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_MAX_ITEMS = 10_000;
+
+// Defense-in-depth ceiling on convert-document's source size, independent of whatever
+// limit officeparser itself enforces. Comfortably above a normal email attachment or
+// small document, well below the kind of file that would produce an unusably large
+// markdown output regardless of how well it converts.
+const MAX_CONVERT_SOURCE_BYTES = 25 * 1024 * 1024;
 
 /** Reads a positive-integer env var, falling back to `defaultValue` when unset or invalid. */
 function positiveIntFromEnv(name: string, defaultValue: number): number {
@@ -228,6 +235,10 @@ interface UtilityTool {
   // registered in stdio mode — never in HTTP/OAuth mode, where a remote client
   // must not be able to write arbitrary files onto the host.
   stdioOnly?: boolean;
+  // When true, this tool is only registered if the operator passed
+  // --enable-document-conversion. It depends on the optional officeparser package and
+  // parses untrusted binary content, so it stays opt-in rather than on by default.
+  requiresDocumentConversion?: boolean;
 }
 
 interface DisabledToolScope {
@@ -383,6 +394,139 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           accessToken: accountAccessToken,
           rawResponse: true,
         });
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+          isError: true,
+        };
+      }
+    },
+  },
+  {
+    name: 'convert-document',
+    method: 'GET',
+    path: 'tool:convert-document',
+    searchKeywords:
+      'pdf docx word excel xlsx powerpoint pptx odt attachment text extract markdown convert read document office file',
+    description:
+      'Fetch Microsoft Graph binary content (mail attachment, drive/SharePoint file, etc.) and convert it to markdown text on the server, instead of returning raw bytes. Supports PDF, Word, PowerPoint, Excel, OpenDocument and several other formats via the optional "officeparser" package. Prefer this over download-bytes for anything you need to actually read — download-bytes returns base64 a caller cannot parse; this returns text. Requires --enable-document-conversion (off by default) and the officeparser package installed alongside the server; returns a clear error if either is missing. Images/audio/video are out of scope, and this does not save the original bytes to disk — use download-bytes-to-file for that.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    requiresDocumentConversion: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Relative Microsoft Graph path starting with "/", pointing at binary document content. Common paths: ' +
+              '/me/messages/{message-id}/attachments/{attachment-id}/$value (mail attachment, list-mail-attachments returns the IDs); ' +
+              '/drives/{drive-id}/items/{driveItem-id}/content (drive/SharePoint file content).'
+          ),
+        ocr: z
+          .boolean()
+          .optional()
+          .describe(
+            'Run OCR on embedded/scanned images. Off by default: adds real latency and is only useful when the document is scanned or image-based. Try without it first.'
+          ),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager }) => {
+      const target = params.target;
+      const accountParam = params.account as string | undefined;
+      const ocr = params.ocr === true;
+      if (typeof target !== 'string' || target.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'target is required and must be a non-empty string.' }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (!target.startsWith('/')) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error:
+                  'target must be a relative Microsoft Graph path starting with "/", e.g. /me/messages/{message-id}/attachments/{attachment-id}/$value.',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      try {
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: accountModeError }) }],
+            isError: true,
+          };
+        }
+        let accountAccessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accountAccessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        const raw = (await graphClient.makeRequest(target, {
+          accessToken: accountAccessToken,
+        })) as { contentType?: string; contentLength?: number; contentBytes?: string };
+        if (typeof raw?.contentBytes !== 'string') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    'target did not return binary content to convert. convert-document only works on binary endpoints such as a /$value or /content path — use download-bytes first to check what a target actually returns.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (typeof raw.contentLength === 'number' && raw.contentLength > MAX_CONVERT_SOURCE_BYTES) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: `Source is ${raw.contentLength} bytes, over the ${MAX_CONVERT_SOURCE_BYTES}-byte conversion limit. Use download-bytes-to-file (stdio mode) or download-bytes instead.`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const buffer = Buffer.from(raw.contentBytes, 'base64');
+        const { markdown, truncated, totalLength } = await convertBufferToMarkdown(buffer, {
+          ocr,
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                contentType: raw.contentType,
+                markdown,
+                truncated,
+                totalLength,
+              }),
+            },
+          ],
+        };
       } catch (error) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
@@ -1431,7 +1575,8 @@ export function registerGraphTools(
   multiAccount: boolean = false,
   accountNames: string[] = [],
   allowedScopesValue?: string,
-  httpMode: boolean = false
+  httpMode: boolean = false,
+  documentConversionEnabled: boolean = false
 ): number {
   let enabledToolsRegex: RegExp | undefined;
   if (enabledToolsPattern) {
@@ -1733,6 +1878,7 @@ export function registerGraphTools(
   for (const utility of UTILITY_TOOLS) {
     if (readOnly && !utility.readOnlyHint) continue;
     if (httpMode && utility.stdioOnly) continue;
+    if (utility.requiresDocumentConversion && !documentConversionEnabled) continue;
     if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
@@ -1909,7 +2055,8 @@ export function registerDiscoveryTools(
   accountNames: string[] = [],
   enabledTools?: string,
   allowedScopesValue?: string,
-  httpMode: boolean = false
+  httpMode: boolean = false,
+  documentConversionEnabled: boolean = false
 ): void {
   let enabledToolsRegex: RegExp | undefined;
   if (enabledTools) {
@@ -1939,6 +2086,7 @@ export function registerDiscoveryTools(
   const utilityTools = UTILITY_TOOLS.filter((u) => {
     if (readOnly && !u.readOnlyHint) return false;
     if (httpMode && u.stdioOnly) return false;
+    if (u.requiresDocumentConversion && !documentConversionEnabled) return false;
     if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
     return true;
   });
