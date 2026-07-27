@@ -185,7 +185,9 @@ setting — off by default), every mail, calendar, contact, and task mutation is
 ## Authentication
 
 In stdio mode with local MSAL login, tokens are cached and normally persist across restarts.
-Only if a call returns `Failed to acquire token`:
+Only if a call returns `Failed to acquire token` or `No accounts found. Please login first.`
+(the latter is normal on a fresh install or right after logout, since the token cache starts
+empty):
 
 1. Call `verify-login` to confirm the actual state rather than assuming.
 2. If the session really has expired, `login` returns a device code URL — the user has to open
