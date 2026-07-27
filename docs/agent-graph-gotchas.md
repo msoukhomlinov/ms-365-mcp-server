@@ -118,12 +118,19 @@ Read one message in full — pass the listing's `id` as `messageId`, and use `se
 
 Omitting `select` returns the whole message, which is also fine and often smaller than expected.
 
-Reply, draft-first — get the user's approval before anything is sent:
+Reply, draft-first — get the user's approval before anything is sent. `comment` is not a
+registered top-level parameter here; the tool's only declared argument is `body`, so a
+top-level `comment` gets silently dropped and the draft is created with no reply text. Nest it
+under `body` instead — same shape applies to `create-reply-all-draft` and `create-forward-draft`:
 
 ```json
 {
   "name": "create-reply-draft",
-  "arguments": { "messageId": "AAMkAGU3...", "comment": "...", "confirm": true }
+  "arguments": {
+    "messageId": "AAMkAGU3...",
+    "body": { "comment": "..." },
+    "confirm": true
+  }
 }
 ```
 
