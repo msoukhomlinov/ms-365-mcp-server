@@ -219,9 +219,11 @@ One object per attachment: `id`, `name`, `contentType`, `size` (bytes, approxima
 `isInline`. That's enough to know what arrived and which entries are inline signature images
 rather than real files.
 
-**Copy the `messageId` and attachment `id` exactly, character-for-character, from this result.**
-Don't retype or shorten them, and don't reuse an ID from earlier in the conversation — get a
-fresh one from the listing you just made. See mistake 6.
+**This result has no `messageId` field — it's attachment objects only (`id`, `name`,
+`contentType`, `size`, `isInline`).** Keep using the same `messageId` you already passed in to
+make this call; don't retype it. Copy the attachment `id` exactly, character-for-character, from
+this result — don't retype or shorten it, and don't reuse one from earlier in the conversation,
+get a fresh one from the listing you just made. See mistake 6.
 
 **To read a PDF, Word, PowerPoint, Excel, OpenDocument, or RTF attachment, call
 `convert-document` on its `/$value` path — it returns markdown text, not bytes you'd have to
