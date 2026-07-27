@@ -31,7 +31,10 @@ own MCP client adds.
    `search` cannot be combined with `filter`, and `skip` does not work with `search`.
 
 4. **`search` cannot be combined with `orderby` either — a separate error from the one above.**
-   Right: drop `orderby` and rely on relevance ranking, or drop `search` in favor of `filter`.
+   Right: drop `orderby` (results on messages are already sorted by sent date/time, newest
+   first — not by relevance), or drop `search` in favor of `filter`. If you need the single most
+   relevant match rather than the most recent one, narrow the KQL query instead of trying to sort
+   for it — add more specific terms, `AND` extra clauses, or quote exact phrases.
    Wrong: passing both → Graph 400 `SearchWithOrderBy`: *"The query parameter '$orderBy' is not
    supported with '$search'."*
 
@@ -247,20 +250,26 @@ size; over that, `convert-document` returns a clear error instead of buffering t
 (default cap 20,000 characters) — ask for OCR (`ocr: true`) only for scanned/image-based
 documents; it's off by default because it adds real latency.
 
-For a format `convert-document` doesn't handle (images, unusual binary types), or a file you
-want saved rather than read, `download-bytes` on the same `/$value` path returns raw bytes as
-base64 — usable, but only worth calling for genuinely small files, since the bytes land in your
-own context as base64. For document *content*, `convert-document` (where enabled) is almost
-always the right tool instead.
+For a file the user wants **saved to disk** rather than read, prefer `download-bytes-to-file` on
+the same `/$value` path where it's registered (stdio deployments only — it's gated off entirely
+over HTTP). It writes the authenticated bytes straight to an absolute `outputPath` on the
+server's filesystem and returns `{ path, contentType, bytesWritten }`, never base64 through your
+context, so it's the right choice regardless of file size. Reach for `download-bytes` instead
+only in HTTP-mode deployments (where `download-bytes-to-file` isn't available), or when you
+genuinely need the bytes in-context rather than on disk — in which case keep it to small files,
+since the bytes still land in your own context as base64. For document *content* you need to
+read rather than save, `convert-document` (where enabled) is almost always the right tool
+instead of either.
 
 - **Avoid `get-mail-message-mime` for reaching an attachment.** It returns the whole RFC 5322
   message with every attachment base64-inline, so a modest attachment can balloon the response
   well past its own file size once base64-encoded and wrapped in the surrounding MIME structure.
 - **Avoid dropping `select` on a message just to get at an attachment's content.** Without
   `select`, `list-mail-attachments` includes `contentBytes` — the entire file as base64, inline
-  in the listing result. Use `convert-document` (documents) or `download-bytes` (small
-  non-document files) with the attachment's own `/$value` path instead; both take the
-  attachment `id` from a normal, `select`ed listing call.
+  in the listing result. Use `convert-document` (documents), `download-bytes-to-file` (saving to
+  disk, stdio only), or `download-bytes` (small non-document files read into context) with the
+  attachment's own `/$value` path instead; all three take the attachment `id` from a normal,
+  `select`ed listing call.
 
 ### What to say when a format truly can't be read
 
