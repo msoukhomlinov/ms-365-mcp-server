@@ -56,12 +56,15 @@ own MCP client adds.
 
 ## Recipes
 
-Recent inbox mail:
+Recent inbox mail — `list-mail-messages` maps to `/me/messages` and searches across every
+mailbox folder (sent items, drafts, everything), so it's the wrong tool when you actually want
+the inbox. Use `list-mail-folder-messages` with `mailFolderId: "inbox"` instead:
 
 ```json
 {
-  "name": "list-mail-messages",
+  "name": "list-mail-folder-messages",
   "arguments": {
+    "mailFolderId": "inbox",
     "top": 20,
     "orderby": "receivedDateTime desc",
     "select": "id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments"
@@ -176,10 +179,17 @@ Only if a call returns `Failed to acquire token`:
 
 1. Call `verify-login` to confirm the actual state rather than assuming.
 2. If the session really has expired, `login` returns a device code URL — the user has to open
-   it and enter the code themselves; the server never opens a browser.
+   it and enter the code themselves; the server never opens a browser. This is the default,
+   device-code flow.
 3. Call `verify-login` again before retrying the original operation.
 
 Don't call `login` pre-emptively before ordinary mail or calendar work.
+
+If the server was started with `--auth-browser` instead, this is different: `login` calls
+`acquireTokenInteractive()`, which opens the system browser itself for the user to sign in,
+rather than returning a device-code URL. If you're talking to a server configured that way,
+don't expect a device-code URL back from `login` — the browser flow handles the interaction
+directly.
 
 ## Attachments — read documents directly with `convert-document`
 
