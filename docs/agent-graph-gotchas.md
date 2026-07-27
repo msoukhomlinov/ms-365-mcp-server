@@ -282,8 +282,14 @@ all. One sentence, then offer the alternative:
 
 ## When a call fails
 
-- `-32602 Input validation error` → wrong parameter **name**. See mistake 1, or fetch the tool's
-  schema once. Don't re-send the same arguments unchanged.
+- `-32602 Input validation error` → the arguments didn't validate against the tool's schema at
+  all — the SDK returns this same code whether the problem is a wrong parameter **name** (see
+  mistake 1), a wrong **type** for a correctly-named parameter (e.g. passing `expand` as a plain
+  string instead of an array of strings — see mistake 2), a missing required field, or a value
+  outside an allowed set. Don't assume it's always the mistake-1 naming issue and reflexively
+  rename something. Read the validation details in the error response, or fetch the tool's
+  schema once, to see the actual names, required fields, types, and allowed values. Don't
+  re-send the same arguments unchanged.
 - Graph 400 `Parsing OData Select and Expand failed` / `Only navigation properties can be
   expanded` → mistake 2.
 - Graph 400 with a `$search` quoting complaint → mistake 3.
