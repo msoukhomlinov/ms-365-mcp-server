@@ -144,6 +144,23 @@ describe('endpoints.json validation', () => {
     expect(endpoint?.llmTip).toContain('call download-bytes');
   });
 
+  // Upstream #618 corrected the Planner priority bands on update-planner-task and
+  // left the read tools advertising the shifted mapping. Assert the class rather
+  // than those two tools: anywhere a tip spells the preset mapping out, it must
+  // spell out the same one.
+  it('should state one correct Planner priority preset mapping wherever it appears', () => {
+    const CANONICAL =
+      "Priority is 0-10 (lower = higher priority); Planner's own UI presets are " +
+      '1=Urgent, 3=Important, 5=Medium, 9=Low.';
+    const withMapping = endpoints.filter((e) => /=\s*Urgent/i.test(e.llmTip ?? ''));
+
+    expect(withMapping.length, 'no endpoint documents the mapping any more').toBeGreaterThan(0);
+    const wrong = withMapping
+      .filter((e) => !e.llmTip!.includes(CANONICAL))
+      .map((e) => `${e.toolName}: ${e.llmTip}`);
+    expect(wrong).toEqual([]);
+  });
+
   it('should document the @mention shape on the Teams send/reply tools', () => {
     const mentionTools = [
       'send-chat-message',

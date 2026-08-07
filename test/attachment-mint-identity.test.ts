@@ -92,3 +92,73 @@ describe('minting refuses whenever Graph identity comes from the request', () =>
     expect(parse(result as never).error).toMatch(/do not expose a pre-authenticated/i);
   });
 });
+
+/**
+ * The descriptions are what an LLM reads to decide what to call, so a description
+ * that is wrong in either direction is a real failure: the agent either rules out
+ * a call that would succeed on a flag-enabled server, or makes one that cannot
+ * succeed without the flag. These pin the guidance to both deployment modes.
+ */
+describe('download guidance stays true in both deployment modes', () => {
+  const utilityTexts: Array<{ tool: string; where: string; text: string }> = [];
+  for (const tool of UTILITY_TOOLS) {
+    // stdio-only tools are exempt from the flag rule below: minting needs HTTP,
+    // and `--enable-attachment-urls` is warned about and ignored in stdio mode
+    // (server.ts). A stdio-only tool's text can never be read in a deployment
+    // where the flag does anything, so an unqualified claim there stays true.
+    if (tool.stdioOnly) continue;
+    utilityTexts.push({ tool: tool.name, where: 'description', text: tool.description });
+    const schema = tool.buildSchema({
+      graphClient: {} as never,
+      authManager: undefined as never,
+      multiAccount: true,
+      accountNames: [],
+    } as never);
+    for (const [field, zodType] of Object.entries(schema)) {
+      utilityTexts.push({
+        tool: tool.name,
+        where: `${field} schema`,
+        text: zodType.description ?? '',
+      });
+    }
+  }
+
+  // Class rule, not a spot check: any tool text that routes mail/event
+  // attachments, recordings, or other /$value byte endpoints at get-download-url
+  // -- including get-download-url's own text -- must name the flag those targets
+  // depend on. Without it the text is false in one of the two deployments.
+  it('names --enable-attachment-urls wherever byte endpoints are tied to get-download-url', () => {
+    const BYTE_ENDPOINT = /attachment|recording|\$value/i;
+    const offenders = utilityTexts
+      .filter(({ tool, text }) => tool === 'get-download-url' || text.includes('get-download-url'))
+      .filter(({ text }) => BYTE_ENDPOINT.test(text))
+      .filter(({ text }) => !text.includes('--enable-attachment-urls'))
+      .map(({ tool, where }) => `${tool} ${where}`);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it('get-download-url states the unconditional drive/SharePoint case', () => {
+    const tool = UTILITY_TOOLS.find((t) => t.name === 'get-download-url')!;
+    expect(tool.description).toContain('always available for drive/SharePoint file content');
+    expect(tool.description).toContain('@microsoft.graph.downloadUrl');
+    expect(tool.description).toContain('needs no flag');
+  });
+
+  it('get-download-url states the minted case and its refusal conditions', () => {
+    const tool = UTILITY_TOOLS.find((t) => t.name === 'get-download-url')!;
+    expect(tool.description).toContain('--enable-attachment-urls');
+    expect(tool.description).toContain('HTTP mode only');
+    expect(tool.description).toContain('singleUse: true');
+    // The identity guard that attachment-mint-identity pins above.
+    expect(tool.description).toMatch(/OAuth, OBO, or bearer mode/);
+    expect(tool.description).toMatch(/refused/i);
+    expect(tool.description).toContain('download-bytes');
+  });
+
+  it('download-bytes keeps the drive/SharePoint advice and qualifies the rest', () => {
+    const tool = UTILITY_TOOLS.find((t) => t.name === 'download-bytes')!;
+    expect(tool.description).toContain('prefer get-download-url');
+    expect(tool.description).toContain('--enable-attachment-urls');
+  });
+});

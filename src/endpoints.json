@@ -1253,7 +1253,7 @@
     "toolName": "list-planner-tasks",
     "presets": ["tasks", "work"],
     "scopes": ["Tasks.Read"],
-    "llmTip": "Priority values: 0=Urgent, 1=Important, 3=Medium, 5=Low, 9=unset."
+    "llmTip": "Priority is 0-10 (lower = higher priority); Planner's own UI presets are 1=Urgent, 3=Important, 5=Medium, 9=Low."
   },
   {
     "pathPattern": "/planner/plans/{plannerPlan-id}",
@@ -1268,7 +1268,7 @@
     "toolName": "list-plan-tasks",
     "presets": ["tasks", "work"],
     "scopes": ["Tasks.Read"],
-    "llmTip": "Priority values: 0=Urgent, 1=Important, 3=Medium, 5=Low, 9=unset."
+    "llmTip": "Priority is 0-10 (lower = higher priority); Planner's own UI presets are 1=Urgent, 3=Important, 5=Medium, 9=Low."
   },
   {
     "pathPattern": "/planner/tasks/{plannerTask-id}",
