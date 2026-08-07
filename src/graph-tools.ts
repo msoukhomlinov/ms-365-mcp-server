@@ -24,7 +24,7 @@ import { readFileSync } from 'fs';
 import { access } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { TOOL_CATEGORIES } from './tool-categories.js';
+import { getCategoryPattern, TOOL_CATEGORIES } from './tool-categories.js';
 import { getRequestTokens } from './request-context.js';
 import { parseTeamsUrl } from './lib/teams-url-parser.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
@@ -418,6 +418,32 @@ async function checkAccountParamInBearerMode(
     `where cached accounts are available.`
   );
 }
+
+// The Graph byte targets that have no pre-authenticated URL of their own, and therefore the exact
+// set --enable-attachment-urls exists to serve. Each is matched separately in get-download-url
+// because each gets its own refusal message when the flag is off.
+//
+// Named and exported rather than inlined at the three call sites so that "which resources does this
+// flag serve?" has one answer in the codebase. Preset membership for get-download-url is derived
+// from this set (tool-categories.ts), and its tests re-derive it from these patterns rather than
+// restating them -- a copy would let the flag's reach grow while the preset wiring stayed still,
+// which is precisely how the tool came to be missing from the mail-shaped presets.
+//
+// Deliberately narrow: match only real Graph mail/calendar attachment resources so driveItem path
+// addressing with folders literally named messages/events/attachments is not falsely rejected.
+const MAIL_EVENT_ATTACHMENT_TARGET =
+  /^(?:\/me|\/users\/[^/]+|\/groups\/[^/]+)\/(?:messages|events)\/[^/]+\/attachments\//;
+const MEETING_RECORDING_TARGETS = [
+  /^(?:\/me|\/users\/[^/]+)\/onlineMeetings\/[^/]+\/recordings\/[^/]+(?:\/content)?$/,
+  /^\/communications\/calls\/[^/]+\/recordings\/[^/]+(?:\/content)?$/,
+];
+const VALUE_BYTE_TARGET = /\/\$value$/;
+
+export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
+  MAIL_EVENT_ATTACHMENT_TARGET,
+  ...MEETING_RECORDING_TARGETS,
+  VALUE_BYTE_TARGET,
+];
 
 /**
  * Mint a server-served download URL for a Graph byte resource Graph itself
@@ -866,12 +892,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // only from base64 contentBytes or the authenticated /$value endpoint (use download-bytes).
       // Match only real Graph mail/calendar attachment resources so driveItem path addressing
       // with folders named messages/events/attachments is not falsely rejected.
-      if (
-        /^(\/me|\/users\/[^/]+)\/messages\/[^/]+\/attachments\//.test(pathPart) ||
-        /^(\/me|\/users\/[^/]+)\/events\/[^/]+\/attachments\//.test(pathPart) ||
-        /^\/groups\/[^/]+\/messages\/[^/]+\/attachments\//.test(pathPart) ||
-        /^\/groups\/[^/]+\/events\/[^/]+\/attachments\//.test(pathPart)
-      ) {
+      if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart)) {
         const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
         if (minted) return minted;
         return {
@@ -888,12 +909,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         };
       }
       // Recording content endpoints return authenticated bytes, not a pre-authenticated URL.
-      if (
-        /^(\/me|\/users\/[^/]+)\/onlineMeetings\/[^/]+\/recordings\/[^/]+(?:\/content)?$/.test(
-          pathPart
-        ) ||
-        /^\/communications\/calls\/[^/]+\/recordings\/[^/]+(?:\/content)?$/.test(pathPart)
-      ) {
+      if (MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(pathPart))) {
         const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
         if (minted) return minted;
         return {
@@ -910,7 +926,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         };
       }
       // Other /$value byte endpoints (profile photo, Teams hosted content) likewise have no URL.
-      if (pathPart.endsWith('/$value')) {
+      if (VALUE_BYTE_TARGET.test(pathPart)) {
         const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
         if (minted) return minted;
         return {
@@ -1040,6 +1056,49 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     },
   },
 ];
+
+/** Every gate that can keep a utility tool out of the registered set. */
+export interface UtilityToolGates {
+  readOnly?: boolean;
+  httpMode?: boolean;
+  /** Raw --enabled-tools / --preset pattern. An uncompilable pattern is ignored, as at registration. */
+  enabledTools?: string;
+}
+
+function compileToolFilter(pattern?: string): RegExp | undefined {
+  if (!pattern) return undefined;
+  try {
+    return new RegExp(pattern, 'i');
+  } catch {
+    // Registration logs and then ignores an invalid pattern, exposing everything. Mirror that
+    // here rather than guessing, so a predicate built from these gates can never disagree with
+    // what actually gets registered.
+    return undefined;
+  }
+}
+
+/**
+ * The single definition of which utility tools a given configuration registers.
+ *
+ * Both registration paths (registerGraphTools and registerDiscoveryTools) select through this, and
+ * so does the startup check that warns when a flag has been enabled but the only tool that can act
+ * on it was filtered away. Duplicating these three conditions is how "enabled, validated, and
+ * unreachable" happens in the first place: the gate and the warning drift apart and the warning
+ * stops describing the server.
+ */
+export function selectUtilityTools(gates: UtilityToolGates): UtilityTool[] {
+  const enabledToolsRegex = compileToolFilter(gates.enabledTools);
+  return UTILITY_TOOLS.filter((utility) => {
+    if (gates.readOnly && !utility.readOnlyHint) return false;
+    if (gates.httpMode && utility.stdioOnly) return false;
+    if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) return false;
+    return true;
+  });
+}
+
+export function utilityToolWillRegister(name: string, gates: UtilityToolGates): boolean {
+  return selectUtilityTools(gates).some((utility) => utility.name === name);
+}
 
 function registerUtilityToolWithMcp(
   server: McpServer,
@@ -1927,10 +1986,11 @@ export function registerGraphTools(
     multiAccount,
     accountNames,
   };
-  for (const utility of UTILITY_TOOLS) {
-    if (readOnly && !utility.readOnlyHint) continue;
-    if (httpMode && utility.stdioOnly) continue;
-    if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
+  for (const utility of selectUtilityTools({
+    readOnly,
+    httpMode,
+    enabledTools: enabledToolsPattern,
+  })) {
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
       registeredCount++;
@@ -2106,7 +2166,8 @@ export function registerDiscoveryTools(
   accountNames: string[] = [],
   enabledTools?: string,
   allowedScopesValue?: string,
-  httpMode: boolean = false
+  httpMode: boolean = false,
+  attachmentUrls: boolean = false
 ): void {
   let enabledToolsRegex: RegExp | undefined;
   if (enabledTools) {
@@ -2133,12 +2194,7 @@ export function registerDiscoveryTools(
       `Discovery mode: allowed scopes disabled ${disabledByAllowedScopes.length} Graph tools: ${formatDisabledToolsForLog(disabledByAllowedScopes)}`
     );
   }
-  const utilityTools = UTILITY_TOOLS.filter((u) => {
-    if (readOnly && !u.readOnlyHint) return false;
-    if (httpMode && u.stdioOnly) return false;
-    if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
-    return true;
-  });
+  const utilityTools = selectUtilityTools({ readOnly, httpMode, enabledTools });
   const searchIndex = buildDiscoverySearchIndex(toolsRegistry, utilityTools);
   const totalCount = toolsRegistry.size + utilityTools.length;
   logger.info(
@@ -2203,8 +2259,13 @@ export function registerDiscoveryTools(
     },
     async ({ query, category, limit = 10 }) => {
       const maxLimit = Math.min(Math.max(limit, 1), 50);
-      const categoryDef = category ? TOOL_CATEGORIES[category] : undefined;
-      const categoryFilter = (name: string) => !categoryDef || categoryDef.pattern.test(name);
+      // Built with the same flags the registration filter used. A category pattern that ignores
+      // them would hide a tool this server did register under that category — the same staleness
+      // that made get-download-url unreachable, one layer up.
+      const categoryPattern = category
+        ? getCategoryPattern(category, { attachmentUrls })
+        : undefined;
+      const categoryFilter = (name: string) => !categoryPattern || categoryPattern.test(name);
 
       let orderedNames: string[];
       if (query && query.trim().length > 0) {

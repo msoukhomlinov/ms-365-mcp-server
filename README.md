@@ -679,6 +679,13 @@ commonly a container address. A missing or malformed setting fails at startup ra
 per-request — a signing feature that comes up without a key would mint URLs nothing can
 verify, silently.
 
+`get-download-url` is the only tool that mints, so it has to be one of the tools you expose.
+With the flag on, `--preset` handles that for you: the tool joins **every** preset, because the
+resources the flag serves (mail and event attachments, meeting recordings, `/$value` endpoints)
+are spread across all of them — `--preset mail,calendar --enable-attachment-urls` gets it, and so
+does any preset added in future. A hand-written `--enabled-tools` regex does not, so if your
+filter drops `get-download-url` the server warns at startup that the flag cannot do anything.
+
 ### Splitting the attachment listener
 
 By default `/attachment` is served by the same Express app, on the same port, as `/mcp`.
