@@ -22,8 +22,7 @@ own MCP client adds.
 2. **`expand` is for navigation properties only.** `body`, `sender`, `from` and `subject` are
    NOT expandable — ask for them in `select` instead. `expand` takes an array of strings;
    `select` takes a comma-separated string. Expanding a non-navigation property fails with Graph
-   400 `Parsing OData Select and Expand failed: ... is not a navigation property or complex
-   property. Only navigation properties can be expanded.`
+   400 `Parsing OData Select and Expand failed: ... is not a navigation property or complex property. Only navigation properties can be expanded.`
 
 3. **`search` takes ONE pair of double quotes around the WHOLE expression.**
    Right: `"search": "\"from:jane@example.com AND subject:flooring\""`
@@ -35,8 +34,8 @@ own MCP client adds.
    first — not by relevance), or drop `search` in favor of `filter`. If you need the single most
    relevant match rather than the most recent one, narrow the KQL query instead of trying to sort
    for it — add more specific terms, `AND` extra clauses, or quote exact phrases.
-   Wrong: passing both → Graph 400 `SearchWithOrderBy`: *"The query parameter '$orderBy' is not
-   supported with '$search'."*
+   Wrong: passing both → Graph 400 `SearchWithOrderBy`: _"The query parameter '$orderBy' is not
+   supported with '$search'."_
 
 5. **With `filter` + `orderby` together (no `search`), the `orderby` property must come FIRST
    in `filter`.**
@@ -203,7 +202,7 @@ rather than returning a device-code URL. If you're talking to a server configure
 don't expect a device-code URL back from `login` — the browser flow handles the interaction
 directly.
 
-## Attachments — read documents directly with `convert-document`
+## Attachments — listing them, and getting at their content
 
 `list-mail-attachments` works and is how you see what's on a message. **Always pass `select`:**
 
@@ -219,7 +218,8 @@ directly.
 
 One object per attachment: `id`, `name`, `contentType`, `size` (bytes, approximate), and
 `isInline`. That's enough to know what arrived and which entries are inline signature images
-rather than real files.
+rather than real files. **Read `size` before you try to move any bytes** — it decides which of
+the options below is worth attempting at all.
 
 **This result has no `messageId` field — it's attachment objects only (`id`, `name`,
 `contentType`, `size`, `isInline`).** Keep using the same `messageId` you already passed in to
@@ -227,62 +227,120 @@ make this call; don't retype it. Copy the attachment `id` exactly, character-for
 this result — don't retype or shorten it, and don't reuse one from earlier in the conversation,
 get a fresh one from the listing you just made. See mistake 6.
 
-**To read a PDF, Word, PowerPoint, Excel, OpenDocument, or RTF attachment, call
-`convert-document` on its `/$value` path — it returns markdown text, not bytes you'd have to
-decode and parse yourself:**
+**This server does not convert documents to text.** No tool here turns a PDF, Word, PowerPoint,
+Excel, OpenDocument or RTF attachment into markdown, so don't tell the user you can read one.
+Reaching an attachment's content means moving its raw bytes somewhere, and which of the three
+tools below can do that depends on how the server was started.
+
+### `get-download-url` — a URL fetched out-of-band
+
+Always registered, but what it can actually resolve varies by resource and by deployment:
+
+- **OneDrive and SharePoint files: always works, no configuration.** It returns Graph's own
+  pre-authenticated `@microsoft.graph.downloadUrl` for a driveItem, which streams the bytes with
+  no `Authorization` header. Pass a drive item path — `/me/drive/items/{driveItem-id}`,
+  `/drives/{drive-id}/items/{driveItem-id}/content`, or
+  `/me/drive/root:/path/file.pdf:/content`. A trailing `/content` is optional and is stripped
+  for you. Prefer this over `download-bytes` for any drive file above a few KB.
+- **Mail attachments, event attachments, meeting recordings and other `/$value` endpoints: only
+  if the operator opted in.** Graph publishes no pre-authenticated URL for these, so the server
+  has to mint one of its own — and it only does that when started with
+  `--enable-attachment-urls`, **in HTTP mode**, using credentials the server itself holds.
+
+Where minting is enabled, the same `/$value` path you'd hand `download-bytes` returns a URL
+served by this server rather than by Graph:
 
 ```json
 {
-  "name": "convert-document",
+  "name": "get-download-url",
   "arguments": {
     "target": "/me/messages/AAMkAGU3.../attachments/AAMkAGU3.../$value"
   }
 }
 ```
 
-`convert-document` only exists if the server was started with `--enable-document-conversion`
-(off by default — see the README's "Document Conversion" section for the rest of the
-prerequisites). If it isn't registered, fall back to `download-bytes` and note that the caller
-will get raw base64 to decode itself, not text.
+→ `{ downloadUrl, expiresAt, singleUse: true, note }`. It is good for exactly **one** fetch and
+expires quickly (120 seconds by default, 300 at most), so pass it straight to whatever will
+fetch it. Don't sit on it, don't log it for later, and don't retry a URL some fetch has already
+spent — mint a fresh one.
 
-Where it is available, `convert-document` is dramatically more token-efficient than pulling the
-same file as inline base64 through `list-mail-attachments` — a multi-hundred-KB document becomes
-a few thousand tokens of markdown instead of tens of thousands of tokens of unreadable base64.
-Source size is capped at 25 MB, checked against the real decoded bytes rather than a reported
-size; over that, `convert-document` returns a clear error instead of buffering the whole file.
-`truncated` / `totalLength` in the result tell you if the markdown itself was cut down further
-(default cap 20,000 characters) — ask for OCR (`ocr: true`) only for scanned/image-based
-documents; it's off by default because it adds real latency.
+Where minting is off, you get an error naming the resource kind instead of a URL:
 
-For a file the user wants **saved to disk** rather than read, prefer `download-bytes-to-file` on
-the same `/$value` path where it's registered (stdio deployments only — it's gated off entirely
-over HTTP). It writes the authenticated bytes straight to an absolute `outputPath` on the
-server's filesystem and returns `{ path, contentType, bytesWritten }`, never base64 through your
-context, so it's the right choice regardless of file size. Reach for `download-bytes` instead
-only in HTTP-mode deployments (where `download-bytes-to-file` isn't available), or when you
-genuinely need the bytes in-context rather than on disk — in which case keep it to small files,
-since the bytes still land in your own context as base64. For document *content* you need to
-read rather than save, `convert-document` (where enabled) is almost always the right tool
-instead of either.
+```text
+Mail and calendar event attachments do not expose a pre-authenticated download URL. Use download-bytes for small attachments.
+
+Meeting recordings do not expose a pre-authenticated download URL. Use download-bytes for small recordings or get-meeting-recording-content where available.
+
+$value byte endpoints do not expose a pre-authenticated download URL. Use download-bytes to read these bytes.
+```
+
+And on a server that _does_ pass the flag but takes its Graph identity from the request — plain
+HTTP bearer mode, `--obo`, or OAuth — minting is refused on purpose:
+
+```text
+Server-minted download URLs are unavailable when Graph identity comes from the request (OAuth, OBO, or bearer mode): the URL is redeemed later without an Authorization header, so the bytes would be fetched as a different identity than the one that asked for them. Use download-bytes.
+```
+
+Read any of those four as "this deployment can't give me a URL for this resource," and move on to
+the options below. Don't re-send the same call.
+
+**Don't rule this tool out from its own description.** The `get-download-url` description states
+flatly that mail attachments and meeting recordings do not expose a pre-authenticated URL and
+points you at `download-bytes`; it describes Graph's behaviour and doesn't mention the minting
+flag. On a server started with `--enable-attachment-urls` the call succeeds regardless. One
+attempt is cheap and the refusal above is short and unambiguous.
+
+### `download-bytes-to-file` — straight to the server's disk (stdio only)
+
+For a file the user wants **saved** rather than read, this writes the authenticated bytes to an
+absolute `outputPath` on the server's own filesystem and returns
+`{ path, contentType, bytesWritten }` — never base64 through your context, so it's the right
+choice regardless of file size. It won't overwrite an existing file. **stdio deployments only:
+it isn't registered at all over HTTP.**
+
+That makes it the mirror image of minting, and the pairing is worth remembering: minted
+attachment URLs are HTTP-mode-only, `download-bytes-to-file` is stdio-only. No single deployment
+offers both, so for a mail attachment's bytes at most one out-of-band route exists on whatever
+server you're talking to.
+
+### `download-bytes` — base64 into your context, last resort
+
+Returns `{ contentType, encoding: "base64", contentLength, contentBytes }` — the whole file,
+inline, in your own context. Base64 inflates it by about a third, and the result is only useful
+to you if the underlying bytes are already text.
+
+Call it only when the file is **both small and genuinely plain text** (`.txt`, `.csv`, `.md`,
+`.json`, `.xml`, `.log`), or when the user has explicitly asked for raw bytes knowing what they
+are. A few hundred KB of PDF costs tens of thousands of tokens and yields nothing readable.
+
+**One trap:** this tool's own description tells you that for large files you should "prefer
+`get-download-url`". For a drive or SharePoint file that's correct — follow it. For a mail
+attachment or a recording on a deployment that didn't pass `--enable-attachment-urls`, it's a
+dead end: `get-download-url` refuses with one of the errors above and you end up back here.
 
 - **Avoid `get-mail-message-mime` for reaching an attachment.** It returns the whole RFC 5322
   message with every attachment base64-inline, so a modest attachment can balloon the response
   well past its own file size once base64-encoded and wrapped in the surrounding MIME structure.
 - **Avoid dropping `select` on a message just to get at an attachment's content.** Without
   `select`, `list-mail-attachments` includes `contentBytes` — the entire file as base64, inline
-  in the listing result. Use `convert-document` (documents), `download-bytes-to-file` (saving to
-  disk, stdio only), or `download-bytes` (small non-document files read into context) with the
-  attachment's own `/$value` path instead; all three take the attachment `id` from a normal,
-  `select`ed listing call.
+  in the listing result. That's the same cost as `download-bytes` with no chance to read `size`
+  and back out first. Use `get-download-url` (out-of-band, where the deployment supports it),
+  `download-bytes-to-file` (saving to disk, stdio only), or `download-bytes` (small plain-text
+  files read into context) on the attachment's own `/$value` path instead; all three take the
+  attachment `id` from a normal, `select`ed listing call.
 
-### What to say when a format truly can't be read
+### What to say when you can't read an attachment
 
-This only applies to formats `convert-document` doesn't cover (images, most non-document binary
-types), a source over the 25 MB cap, or a deployment where document conversion isn't enabled at
-all. One sentence, then offer the alternative:
+For document formats this is the **common** case, not the exception: nothing in this server
+extracts text, so a PDF, Word, PowerPoint or Excel attachment is unreadable to you unless
+something outside the server converts it. Say so in one sentence, name the file and its size,
+and offer the alternative:
 
-> There's one attachment — `photo.jpg`, 4 MB. I can't extract text from an image attachment.
-> Describe what you need from it and I'll work from that.
+> There's one attachment — `Quote-1042.pdf`, 191 KB. I can't read PDF content — this server hands
+> me raw bytes, not text. Paste the part you care about and I'll work from that.
+
+Never pull a document down with `download-bytes` and then guess at its contents from the base64.
+If you can't read it, say so.
 
 ## When a call fails
 
@@ -294,8 +352,7 @@ all. One sentence, then offer the alternative:
   rename something. Read the validation details in the error response, or fetch the tool's
   schema once, to see the actual names, required fields, types, and allowed values. Don't
   re-send the same arguments unchanged.
-- Graph 400 `Parsing OData Select and Expand failed` / `Only navigation properties can be
-  expanded` → mistake 2.
+- Graph 400 `Parsing OData Select and Expand failed` / `Only navigation properties can be expanded` → mistake 2.
 - Graph 400 with a `$search` quoting complaint → mistake 3.
 - Graph 400 `SearchWithOrderBy` → mistake 4.
 - Graph 400 `InefficientFilter` → mistake 5.
