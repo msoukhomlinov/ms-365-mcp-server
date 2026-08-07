@@ -48,6 +48,33 @@ export function isBinaryContentType(contentType: string): boolean {
   return false;
 }
 
+/**
+ * Read an HTTP `content-length` header as a byte count, or null when the
+ * upstream did not state one.
+ *
+ * `Headers.get()` answers `null` for an absent header, and `Number(null)` is
+ * `0` -- a *finite* number -- so a bare `Number()` here silently turns "Graph
+ * said nothing" into "Graph said zero". That is not hypothetical: Graph does
+ * not send `content-length` on `/$value` attachment responses at all, so the
+ * absent case is the normal path. Declaring the resulting `0` downstream ends
+ * the response after zero bytes and the caller reads a clean, well-formed,
+ * empty 200 instead of an error it could retry.
+ *
+ * Deliberately strict: only a bare run of digits is a length. Absent, empty,
+ * whitespace-only, signed (`-5`), fractional, non-numeric (`abc`) and values
+ * past `Number.MAX_SAFE_INTEGER` all answer null rather than a number nobody
+ * should act on. A literal `0` is a real statement by the upstream and parses
+ * to `0`; refusing to *re-emit* that on a streamed body is the consumer's job,
+ * not this parser's.
+ */
+export function parseContentLengthHeader(header: string | null | undefined): number | null {
+  if (header === null || header === undefined) return null;
+  const trimmed = header.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 interface GraphRequestOptions {
   headers?: Record<string, string>;
   method?: string;
@@ -246,11 +273,10 @@ class GraphClient {
       throw new Error('Microsoft Graph returned an empty response body');
     }
 
-    const headerLength = Number(response.headers.get('content-length'));
     return {
       body: response.body,
       contentType: response.headers.get('content-type') || 'application/octet-stream',
-      contentLength: Number.isFinite(headerLength) ? headerLength : null,
+      contentLength: parseContentLengthHeader(response.headers.get('content-length')),
       contentDisposition: response.headers.get('content-disposition'),
     };
   }
@@ -301,8 +327,11 @@ class GraphClient {
       try {
         contentLength = (await stat(destinationPath)).size;
       } catch {
-        const header = Number(response.headers.get('content-length'));
-        contentLength = Number.isFinite(header) ? header : 0;
+        // Same trap as downloadStream: a missing header must not read as 0 by
+        // way of Number(null), and a malformed one (`-5`, `abc`) must not be
+        // reported as a size. Unknown falls back to 0, which is what this
+        // already meant -- the bytes are on disk either way.
+        contentLength = parseContentLengthHeader(response.headers.get('content-length')) ?? 0;
       }
 
       return {
