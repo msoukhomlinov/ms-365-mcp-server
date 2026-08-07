@@ -546,7 +546,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     method: 'GET',
     path: 'tool:download-bytes',
     description:
-      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
+      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context. That preference always holds for drive/SharePoint files; for mail and event attachments, meeting recordings, and other /$value byte endpoints, get-download-url can only return a URL when the server runs with --enable-attachment-urls, so use this tool when it refuses.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -791,8 +791,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     path: 'tool:get-download-url',
     searchKeywords:
       'download file download drive file download onedrive file sharepoint file download large drive file large sharepoint file large file out-of-band download pre-authenticated url',
+    // Front-loaded on purpose, same constraint as download-bytes-to-file: the
+    // discovery search index caps a tool's description at ~40 tokens, so
+    // "drive/SharePoint file content" has to stay in the opening sentence or this
+    // tool stops owning the "drive"/"sharepoint" download queries.
     description:
-      'Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content that exposes one (drive/SharePoint file content). The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. Returns { downloadUrl, name?, size?, contentType? }. NOTE: mail file attachments (/messages/{id}/attachments/{id}/$value) and meeting recordings do NOT expose a pre-authenticated URL — Graph offers no such link for them; use download-bytes for small ones.',
+      "Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content: always available for drive/SharePoint file content, and for other byte endpoints only when this server was started with --enable-attachment-urls. The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. For a drive/SharePoint item the URL is Graph's own @microsoft.graph.downloadUrl and needs no flag; returns { downloadUrl, name?, size?, contentType? }. Mail and event attachments (/messages/{id}/attachments/{id}/$value), meeting recordings, and other authenticated /$value byte endpoints have no such link from Graph, so with --enable-attachment-urls (HTTP mode only) this server mints and serves one itself, returning { downloadUrl, expiresAt, singleUse: true, note } — valid for one fetch until it expires. Without the flag those targets fail with an error saying they do not expose a pre-authenticated download URL; fall back to download-bytes. Minting is also refused whenever this request's Graph identity came from the caller rather than from the server's own token cache (OAuth, OBO, or bearer mode), because the minted URL is redeemed later with no Authorization header and would fetch the bytes under a different identity than the one that asked; in those modes use download-bytes.",
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -803,7 +807,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
             'Relative Microsoft Graph path starting with "/". Either a driveItem content path or the item path itself, e.g. ' +
               '/drives/{drive-id}/items/{driveItem-id}/content, /me/drive/items/{driveItem-id}/content, ' +
               'or /sites/{site-id}/drive/items/{driveItem-id}. ' +
-              'A trailing /content is optional and is stripped automatically for drive items. Mail attachment $value paths and meeting recordings are not supported (Graph exposes no pre-authenticated URL for them).'
+              'A trailing /content is optional and is stripped automatically for drive items. Mail and event attachment $value paths, meeting recordings, and other /$value byte endpoints are accepted only when the server runs with --enable-attachment-urls (Graph exposes no pre-authenticated URL for them, so the server mints one); otherwise they are rejected and download-bytes is the fallback.'
           ),
       };
       if (ctx.multiAccount) {

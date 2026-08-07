@@ -39,4 +39,16 @@ describe('buildMcpServerInstructions', () => {
     );
     expect(s).toContain('relative Microsoft Graph paths, not absolute URLs');
   });
+
+  // These instructions are emitted in every mode, so a flat claim about what
+  // get-download-url can reach is false in one of them. Same class rule as
+  // attachment-mint-identity: byte endpoints tied to get-download-url must name
+  // the flag they depend on.
+  it('qualifies get-download-url coverage of authenticated byte endpoints by the flag', () => {
+    const s = buildMcpServerInstructions({ ...baseCtx, discovery: false });
+    expect(s).toContain('--enable-attachment-urls');
+    expect(s).toContain('OAuth, OBO, or bearer mode');
+    // The old text asserted an unconditional impossibility.
+    expect(s).not.toContain('get-download-url cannot handle');
+  });
 });
