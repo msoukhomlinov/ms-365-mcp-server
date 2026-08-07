@@ -25,6 +25,10 @@ import {
   toOAuthErrorResponse,
 } from './lib/microsoft-auth.js';
 import { isAllowedRedirectUri, parseAllowlist } from './lib/redirect-uri-validation.js';
+import { loadAttachmentUrlConfig, ATTACHMENT_ROUTE } from './lib/attachment-url-config.js';
+import { AttachmentTicketStore } from './lib/attachment-tickets.js';
+import { configureAttachmentMinting } from './lib/attachment-minting.js';
+import { createAttachmentHandler } from './attachment-route.js';
 import type { CommandOptions } from './cli.ts';
 import { getSecrets, type AppSecrets } from './secrets.js';
 import { getCloudEndpoints } from './cloud-config.js';
@@ -226,6 +230,18 @@ class MicrosoftGraphServer {
 
     if (this.options.readOnly) {
       logger.info('Server running in READ-ONLY mode. Write operations are disabled.');
+    }
+
+    // The minting feature lives entirely inside the HTTP branch below, because
+    // the whole point of it is a URL something else can fetch. Passing the flag
+    // to a stdio run used to do nothing at all -- no route, no config
+    // validation, no complaint -- so an operator who set it in the wrong place
+    // saw a clean startup and a tool that never minted.
+    if (this.options.enableAttachmentUrls && !this.options.http) {
+      logger.warn(
+        '--enable-attachment-urls has no effect in stdio mode and is being ignored: ' +
+          'the minted URL has to be reachable over HTTP. Start with --http to use it.'
+      );
     }
 
     if (this.options.http) {
@@ -790,6 +806,50 @@ class MicrosoftGraphServer {
           }
         }
       );
+
+      // Server-minted attachment URLs (--enable-attachment-urls).
+      //
+      // loadAttachmentUrlConfig throws on a half-configured feature, and that
+      // exception is deliberately not caught: a signing feature that comes up
+      // without a key would mint URLs nothing can verify, and would do it
+      // silently. Failing to start names the missing variable once, to the
+      // person who can set it.
+      const attachmentConfig = loadAttachmentUrlConfig(Boolean(this.options.enableAttachmentUrls));
+      if (attachmentConfig) {
+        const ticketStore = new AttachmentTicketStore(attachmentConfig.ttlSeconds);
+        configureAttachmentMinting({ store: ticketStore, config: attachmentConfig });
+
+        // Its own limiter, tighter than the MCP one. This is the only route
+        // reachable with no credential at all -- the ticket in the query is the
+        // credential -- so it is the one brute-force surface the server exposes.
+        // A 256-bit ticket makes guessing hopeless regardless; this bounds the
+        // cost of someone trying.
+        if (!rateLimitDisabled) {
+          app.use(
+            ATTACHMENT_ROUTE,
+            rateLimit({
+              windowMs: 60_000,
+              max: 60,
+              standardHeaders: 'draft-7',
+              legacyHeaders: false,
+            })
+          );
+        }
+        app.get(
+          ATTACHMENT_ROUTE,
+          createAttachmentHandler({
+            store: ticketStore,
+            getGraphClient: () => this.graphClient,
+            authManager: this.authManager,
+          })
+        );
+        logger.info(
+          `  - Attachment URLs: ${attachmentConfig.base}${ATTACHMENT_ROUTE} ` +
+            `(ttl ${attachmentConfig.ttlSeconds}s, key id ${attachmentConfig.keyId})`
+        );
+      } else {
+        configureAttachmentMinting(null);
+      }
 
       // Health check endpoint
       app.get('/', (req, res) => {
