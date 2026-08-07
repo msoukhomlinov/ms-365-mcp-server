@@ -178,7 +178,13 @@ export function parseArgs(): CommandOptions {
   if (options.preset) {
     const presetNames = options.preset.split(',').map((p: string) => p.trim());
     try {
-      options.enabledTools = getCombinedPresetPattern(presetNames);
+      // The flag is part of the preset's definition, not a filter applied after it: with
+      // --enable-attachment-urls, get-download-url mints for mail/event attachments and
+      // recordings, so a mail- or teams-shaped preset that omitted it left the flag with no
+      // tool to act through. See FLAG_UNIVERSAL_UTILITY_TOOLS in tool-categories.ts.
+      options.enabledTools = getCombinedPresetPattern(presetNames, {
+        attachmentUrls: Boolean(options.enableAttachmentUrls),
+      });
 
       const requiresOrgMode = presetNames.some((preset: string) => presetRequiresOrgMode(preset));
       if (requiresOrgMode && !options.orgMode) {

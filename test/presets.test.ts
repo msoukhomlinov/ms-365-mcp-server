@@ -146,6 +146,12 @@ describe('utility tools in presets', () => {
     }
   );
 
+  // Everything below reads TOOL_CATEGORIES, which is the no-flag view of the presets.
+  // --enable-attachment-urls widens get-download-url to every preset (it then mints for mail and
+  // event attachments, recordings and other /$value endpoints); that behaviour and the rules that
+  // govern it live in attachment-url-preset-gating.test.ts. Read these as "unflagged", not as
+  // statements about what the tool can reach.
+
   // Pin the full get-download-url membership so a regression dropping any drive-backed preset
   // is caught. download-bytes membership is covered by the every-preset test above.
   it('get-download-url is in every drive-backed preset it declares', () => {
@@ -156,8 +162,10 @@ describe('utility tools in presets', () => {
     }
   });
 
-  it('mail preset has download-bytes but not the drive-only download-url helper', () => {
+  it('unflagged, mail preset has download-bytes but not the download-url helper', () => {
     expect(inPreset('mail', 'download-bytes')).toBe(true);
+    // Only true without --enable-attachment-urls: unflagged, get-download-url resolves nothing but
+    // Graph's own driveItem downloadUrl, which a mail-only preset can never produce an item for.
     expect(inPreset('mail', 'get-download-url')).toBe(false);
   });
 
@@ -167,7 +175,7 @@ describe('utility tools in presets', () => {
     expect(inPreset('files', 'parse-teams-url')).toBe(false);
   });
 
-  it('scoped utilities do not leak into unrelated presets', () => {
+  it('unflagged, scoped utilities do not leak into unrelated presets', () => {
     // download-bytes is universal, so only the scoped helpers should be absent here.
     expect(inPreset('calendar', 'get-download-url')).toBe(false);
     expect(inPreset('contacts', 'get-download-url')).toBe(false);

@@ -7,7 +7,11 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import logger, { enableConsoleLogging } from './logger.js';
 import { registerAuthTools } from './auth-tools.js';
-import { registerGraphTools, registerDiscoveryTools } from './graph-tools.js';
+import {
+  registerGraphTools,
+  registerDiscoveryTools,
+  utilityToolWillRegister,
+} from './graph-tools.js';
 import { buildMcpServerInstructions } from './mcp-instructions.js';
 import { installToolSchemaRefNormalization } from './normalize-tool-schema.js';
 import GraphClient from './graph-client.js';
@@ -277,7 +281,8 @@ class MicrosoftGraphServer {
         this.accountNames,
         this.options.enabledTools,
         this.options.allowedScopes,
-        Boolean(this.options.http)
+        Boolean(this.options.http),
+        Boolean(this.options.enableAttachmentUrls)
       );
     } else {
       registerGraphTools(
@@ -392,6 +397,32 @@ class MicrosoftGraphServer {
       logger.warn(
         '--enable-attachment-urls has no effect in stdio mode and is being ignored: ' +
           'the minted URL has to be reachable over HTTP. Start with --http to use it.'
+      );
+    }
+
+    // A flag that is set, validated and unreachable is worse than one that is off: the operator
+    // reads their own command line, sees the route serving and the key loaded, and concludes the
+    // feature works. get-download-url is the ONLY tool that mints, so if the active tool filter
+    // drops it there is nothing left that can produce a URL and every other part of the feature is
+    // dead weight. Preset filters now carry the tool automatically (see FLAG_UNIVERSAL_UTILITY_TOOLS
+    // in tool-categories.ts); this catches every other way it can go missing - a hand-written
+    // --enabled-tools regex, ENABLED_TOOLS, or any future gate added to utility registration -
+    // because it asks the same selector registration asks instead of re-deriving the answer.
+    if (
+      this.options.enableAttachmentUrls &&
+      !utilityToolWillRegister('get-download-url', {
+        readOnly: Boolean(this.options.readOnly),
+        httpMode: Boolean(this.options.http),
+        enabledTools: this.options.enabledTools,
+      })
+    ) {
+      logger.warn(
+        '--enable-attachment-urls is set but get-download-url is NOT registered, so this server ' +
+          'cannot mint any attachment URL and the feature is doing nothing. get-download-url is the ' +
+          'only tool that mints; the active tool filter ' +
+          `(--enabled-tools / ENABLED_TOOLS = ${JSON.stringify(this.options.enabledTools ?? null)}) ` +
+          'excludes it. Add get-download-url to the filter, drop the filter, or remove ' +
+          '--enable-attachment-urls.'
       );
     }
 

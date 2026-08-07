@@ -48,6 +48,7 @@ vi.mock('fs', async (importOriginal) => {
 // Mock tool-categories
 vi.mock('../tool-categories.js', () => ({
   TOOL_CATEGORIES: {},
+  getCategoryPattern: () => undefined,
 }));
 
 // ---------- helpers ----------
