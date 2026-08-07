@@ -97,7 +97,19 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
 
     res.status(200);
     res.setHeader('content-type', stream.contentType);
-    if (stream.contentLength !== null) {
+    // Only declare a length that is a real, positive count of bytes. A
+    // `content-length: 0` on a body we are about to stream is never correct
+    // here: Node ends the response after zero bytes, the pipeline below then
+    // rejects with "Premature close" too late to change the status, and the
+    // peer reads a clean, well-formed, empty 200 that no retry logic will ever
+    // question. Omitting the header instead lets Node chunk the body, which is
+    // always safe. Anything not a positive integer -- null, 0, a negative, a
+    // fraction -- is dropped rather than trusted.
+    if (
+      stream.contentLength !== null &&
+      Number.isInteger(stream.contentLength) &&
+      stream.contentLength > 0
+    ) {
       res.setHeader('content-length', String(stream.contentLength));
     }
     // Graph's own filename when it gave one. `attachment` either way: this
