@@ -13,12 +13,6 @@
  * line naming the field, not in a context blowout.
  */
 
-/**
- * Minimum length, in characters, at which an unrecognised string is tested for
- * base64 shape. Strictly greater than: a 4,096-character string is kept.
- */
-export const BASE64_STRIP_THRESHOLD = 4096;
-
 /** Field names that are byte payloads whatever their length or shape. */
 const BYTE_FIELD_NAMES = new Set(['contentBytes']);
 
@@ -78,6 +72,12 @@ function decodedByteLength(base64: string): number {
  */
 function payloadBytes(field: string, text: string): number | null {
   if (!BYTE_FIELD_NAMES.has(field)) return null;
+  // The marker's claim to the model is "this many bytes were removed from
+  // your context." For valid base64 that means the decoded size. For a
+  // malformed or non-base64-shaped contentBytes there is nothing to decode,
+  // so the bytes removed are the string's own bytes -- UTF-8 length is not a
+  // fallback approximation here, it is the correct answer to the question
+  // the marker is actually asking.
   return isBase64(text) ? decodedByteLength(text) : Buffer.byteLength(text, 'utf8');
 }
 

@@ -34,4 +34,15 @@ describe('scrubByteFields: the contentBytes name rule', () => {
     scrubByteFields(input);
     expect(input.contentBytes).toBe('QUJDRA==');
   });
+
+  it('strips a non-base64-shaped contentBytes and reports its own UTF-8 length', () => {
+    // The name rule does not care about shape: 'not-base64!' is not valid
+    // base64 (11 chars, not a multiple of 4), so there is nothing to decode.
+    // The bytes removed are the string's own UTF-8 bytes -- 11 of them.
+    const result = scrubByteFields({ contentBytes: 'not-base64!' });
+    expect(result.value).toEqual({
+      contentBytes: '<stripped: 11 bytes, use read-document>',
+    });
+    expect(result.stripped).toEqual([{ path: '$.contentBytes', field: 'contentBytes', bytes: 11 }]);
+  });
 });
