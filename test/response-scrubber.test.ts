@@ -213,4 +213,28 @@ describe('scrubByteFields: the base64 shape rule', () => {
       { path: '$.data', field: 'data', bytes: 6144 },
     ]);
   });
+
+  it('does not strip a long base64url string: the alphabet restriction is the guard', () => {
+    // This test proves the alphabet restriction (excluding - and _) actually works
+    // for long strings. Bearer and refresh tokens are plausibly over 4096 chars,
+    // unlike Graph IDs (152 chars, which short-circuit on length alone).
+    // A regression widening BASE64_PATTERN to accept base64url would pass all
+    // other tests but start stripping tokens. This test catches that.
+    // The ONLY thing keeping this string unstripped is the base64url alphabet.
+    const bytes = randomBytes(3075); // Converts to 4100-char base64
+    const standard = bytes.toString('base64');
+    expect(standard.length).toBe(4100);
+    expect(standard.length % 4).toBe(0);
+
+    // Convert to base64url by replacing + with - and / with _
+    const baseurl = standard.replace(/\+/g, '-').replace(/\//g, '_');
+    expect(baseurl.length).toBe(4100);
+    expect(baseurl).toMatch(/[-_]/); // Confirm it has base64url chars
+    expect(baseurl).not.toMatch(/[+/]/); // Confirm no standard base64 chars
+
+    const input = { token: baseurl };
+    const result = scrubByteFields(input);
+    expect(result.value).toBe(input);
+    expect(result.stripped).toEqual([]);
+  });
 });
