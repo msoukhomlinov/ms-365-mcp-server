@@ -57,7 +57,8 @@ export function toWireArguments(req: ConvertRequest): Record<string, unknown> {
 }
 
 /**
- * The data payload of the first SSE event that carries one, or null.
+ * The data payload of the first SSE event that carries one, or null if the
+ * stream never carries any.
  *
  * Written against the framing rather than against one server's output: comment
  * frames (`: ping - …`) are skipped, `event:`/`id:`/`retry:` lines are ignored,
@@ -65,6 +66,13 @@ export function toWireArguments(req: ConvertRequest): Record<string, unknown> {
  * over rather than parsed as JSON, and multiple `data:` lines in one frame are
  * joined with newlines as the SSE spec requires. CRLF, CR and LF all separate
  * lines, because sse_starlette defaults to CRLF and other servers do not.
+ *
+ * A stream that ends with data accumulated but no terminating blank line is
+ * truncated, not merely quiet: under SSE the body IS the conversion, so a
+ * frame that never closed means the conversion never finished. Returning that
+ * partial accumulation as success would be a clean, well-formed, wrong answer
+ * — the same failure class as the empty 200 of 2026-08-07 — so this throws
+ * instead of degrading silently.
  */
 function extractSseData(body: string): string | null {
   let current: string[] = [];
@@ -79,9 +87,10 @@ function extractSseData(body: string): string | null {
     const value = line.slice('data:'.length);
     current.push(value.startsWith(' ') ? value.slice(1) : value);
   }
-  // A stream that ended without a trailing blank line still has one event in it.
-  const trailing = current.join('\n');
-  return trailing === '' ? null : trailing;
+  if (current.length > 0) {
+    throw new Error('the proxy event stream was truncated before its terminating blank line');
+  }
+  return null;
 }
 
 /**

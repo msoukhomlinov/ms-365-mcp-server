@@ -89,4 +89,37 @@ describe('decodeJsonRpcBody', () => {
   it('treats an absent content-type as JSON rather than guessing SSE', () => {
     expect(decodeJsonRpcBody(null, JSON.stringify(message))).toEqual(message);
   });
+
+  /**
+   * A CRLF blank line (`\r\n\r\n`) is ONE frame terminator, not a `\r` line
+   * plus a real one. A reader that splits only on `\n` leaves that `\r`
+   * attached as its own non-empty "line", which never equals `''`, so the
+   * boundary between two frames is missed and their data gets joined into one
+   * blob instead of returning the first frame alone. Two back-to-back frames
+   * with genuinely different JSON make that observable: merging them yields
+   * two top-level JSON values back to back, which `JSON.parse` rejects
+   * outright (`Unexpected non-whitespace character after JSON`), where a
+   * correct reader returns the first frame's message and never even looks at
+   * the second.
+   */
+  it('treats a CRLF blank line as a single boundary, not two, between two frames', () => {
+    const other = { jsonrpc: '2.0', id: 2, result: { structuredContent: { markdown: 'other' } } };
+    const body =
+      `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n` +
+      `event: message\r\ndata: ${JSON.stringify(other)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
+  });
+
+  /**
+   * Under SSE the body IS the conversion: a frame that accumulated `data:`
+   * lines but never reached its terminating blank line means the stream cut
+   * off before the server finished, not that the server had nothing to say.
+   * Returning that partial accumulation as success would be a clean,
+   * well-formed, wrong answer — the same failure class as the empty 200 of
+   * 2026-08-07 — so this must throw, distinguishably from "no data frame".
+   */
+  it('throws on a stream that ends mid-frame, before its terminating blank line', () => {
+    const body = `event: message\r\ndata: ${JSON.stringify(message)}`;
+    expect(() => decodeJsonRpcBody('text/event-stream', body)).toThrow(/truncat/);
+  });
 });
