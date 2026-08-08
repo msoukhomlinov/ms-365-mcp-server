@@ -8,10 +8,31 @@
  * to be testable in isolation, and anything it imported would become a way for
  * the invariant to fail for reasons unrelated to bytes.
  *
+ * **Why a shape rule and not a field-name list.** Three distinct paths to the
+ * same context blowout were found in eight days (`download-bytes`,
+ * `get-mail-message-mime`, `expand: ["attachments"]`). Matching only the field
+ * name `contentBytes` would be the same story-shaped guard one level down: it
+ * covers the paths someone already thought of. The rule is therefore name
+ * **plus** shape --
+ *
+ *   1. any field named `contentBytes` (the known Graph name), **or**
+ *   2. any string over `BASE64_STRIP_THRESHOLD` characters that is valid
+ *      base64.
+ *
+ * Rule 2 is what makes this a class guard: a tool upstream adds tomorrow that
+ * returns bytes under a name nobody here has seen cannot regress this
+ * deployment.
+ *
+ * The 4,096 floor is chosen against measured data. Graph ids in this deployment
+ * are ~152 characters, so identifiers are never touched, and no real document
+ * is smaller than 4 KB of base64.
+ *
  * **Every strip is reported.** That reporting is the point of the module as
  * much as the stripping is: a fourth leak path should be discovered in a log
  * line naming the field, not in a context blowout.
  */
+
+export const BASE64_STRIP_THRESHOLD = 4096;
 
 /** Field names that are byte payloads whatever their length or shape. */
 const BYTE_FIELD_NAMES = new Set(['contentBytes']);
@@ -19,7 +40,9 @@ const BYTE_FIELD_NAMES = new Set(['contentBytes']);
 /**
  * Standard base64, whole string. Not base64url: Graph's `contentBytes` is
  * standard, and `-`/`_` are what most identifiers and tokens in these payloads
- * are built from.
+ * are built from, so accepting them would widen rule 2 towards exactly the
+ * values it must not touch. A base64url value in a field *named* `contentBytes`
+ * is still stripped, by rule 1.
  *
  * Linear: the character class excludes `=`, so the greedy run cannot backtrack
  * into the padding.
@@ -48,6 +71,22 @@ function byteMarker(bytes: number): string {
   return `<stripped: ${bytes} bytes, use read-document>`;
 }
 
+/**
+ * The base64 candidate inside `text`, or null if it is not base64.
+ *
+ * Newlines are tolerated because line-wrapped base64 is normal in MIME, and a
+ * payload would otherwise escape rule 2 by being 76 characters to a line.
+ * *Only* `\r` and `\n`: stripping spaces too would join the words of ordinary
+ * prose into a run of letters that can accidentally satisfy base64, which is
+ * the false positive this module can least afford.
+ */
+function base64Candidate(text: string): string | null {
+  if (isBase64(text)) return text;
+  if (!/[\r\n]/.test(text)) return null;
+  const joined = text.replace(/[\r\n]/g, '');
+  return isBase64(joined) ? joined : null;
+}
+
 function isBase64(text: string): boolean {
   if (text.length === 0 || text.length % 4 !== 0) return false;
   return BASE64_PATTERN.test(text);
@@ -71,14 +110,15 @@ function decodedByteLength(base64: string): number {
  * report and no decoded size exists.
  */
 function payloadBytes(field: string, text: string): number | null {
-  if (!BYTE_FIELD_NAMES.has(field)) return null;
-  // The marker's claim to the model is "this many bytes were removed from
-  // your context." For valid base64 that means the decoded size. For a
-  // malformed or non-base64-shaped contentBytes there is nothing to decode,
-  // so the bytes removed are the string's own bytes -- UTF-8 length is not a
-  // fallback approximation here, it is the correct answer to the question
-  // the marker is actually asking.
-  return isBase64(text) ? decodedByteLength(text) : Buffer.byteLength(text, 'utf8');
+  if (BYTE_FIELD_NAMES.has(field)) {
+    const named = base64Candidate(text);
+    return named === null ? Buffer.byteLength(text, 'utf8') : decodedByteLength(named);
+  }
+  // Length first: every short string in every response reaches this line, and
+  // most of them are never worth a regex.
+  if (text.length <= BASE64_STRIP_THRESHOLD) return null;
+  const candidate = base64Candidate(text);
+  return candidate === null ? null : decodedByteLength(candidate);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

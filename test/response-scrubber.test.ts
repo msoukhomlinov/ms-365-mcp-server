@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { scrubByteFields } from '../src/lib/response-scrubber.js';
+import { randomBytes } from 'node:crypto';
+import { BASE64_STRIP_THRESHOLD, scrubByteFields } from '../src/lib/response-scrubber.js';
+
+/** Valid standard base64, `chars` long. `chars` must be a multiple of 4. */
+function base64OfLength(chars: number): string {
+  return randomBytes((chars / 4) * 3).toString('base64');
+}
 
 describe('scrubByteFields: the contentBytes name rule', () => {
   it('strips a field named contentBytes and names read-document in its place', () => {
@@ -122,5 +128,89 @@ describe('scrubByteFields: nested objects and arrays', () => {
     const input = { value: original };
     scrubByteFields(input);
     expect(input.value).toBe(original);
+  });
+});
+
+describe('scrubByteFields: the base64 shape rule', () => {
+  it('strips a long base64 string in a field Graph does not call contentBytes', () => {
+    // The rule-2 test. A tool upstream adds tomorrow can return bytes under any
+    // name; the name list cannot be kept complete, so shape has to carry it.
+    const payload = base64OfLength(8192);
+    const result = scrubByteFields({ report: { data: payload } });
+    expect(result.value).toEqual({ report: { data: '<stripped: 6144 bytes, use read-document>' } });
+    expect(result.stripped).toEqual([{ path: '$.report.data', field: 'data', bytes: 6144 }]);
+  });
+
+  it('holds the 4,096 floor: 4096 chars kept, the next valid base64 length stripped', () => {
+    expect(BASE64_STRIP_THRESHOLD).toBe(4096);
+    const atFloor = base64OfLength(4096);
+    expect(scrubByteFields({ data: atFloor }).stripped).toEqual([]);
+
+    // 4097 is the next character count, but base64 comes in multiples of four,
+    // so a 4097-character string is not base64 at all -- asserted below so the
+    // floor is not accidentally proved by the wrong rule. 4100 is the next
+    // length that can be both over the floor and valid base64.
+    const justOver = 'A'.repeat(4097);
+    expect(scrubByteFields({ data: justOver }).stripped).toEqual([]);
+
+    const overFloor = base64OfLength(4100);
+    expect(scrubByteFields({ data: overFloor }).stripped).toEqual([
+      { path: '$.data', field: 'data', bytes: 3075 },
+    ]);
+  });
+
+  it('leaves a 152-character Graph id untouched', () => {
+    const id =
+      'AAMkAGI2THVSAAA=AAMkAGI2NmRlNTk3LTk5MTUtNDgxYi1iMzg3LTRkNzE3MjkzZTk5MABGAAAAAAB1ZmJk' +
+      'YWQxLTk5MTUtNDgxYi1iMzg3LTRkNzE3MjkzZTk5MAcAdWZiZGFkMS05OTE1LTQ4YjM=';
+    expect(id.length).toBe(152);
+    const input = { id, subject: 'Re: invoice' };
+    const result = scrubByteFields(input);
+    expect(result.value).toBe(input);
+    expect(result.stripped).toEqual([]);
+  });
+
+  it('leaves a long non-base64 string alone', () => {
+    const body =
+      'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor. '.repeat(
+        300
+      );
+    expect(body.length).toBeGreaterThan(BASE64_STRIP_THRESHOLD);
+    const input = { body: { contentType: 'text', content: body } };
+    const result = scrubByteFields(input);
+    expect(result.value).toBe(input);
+    expect(result.stripped).toEqual([]);
+  });
+
+  it('strips a real 291,572-character contentBytes payload', () => {
+    // The measured live case: get-mail-message with expand:["attachments"] on
+    // one message in Max's mailbox answered 291,572 bytes.
+    const pdf = Buffer.concat([Buffer.from('%PDF-1.7\n'), randomBytes(218670)]);
+    const contentBytes = pdf.toString('base64');
+    expect(contentBytes.length).toBe(291572);
+
+    const result = scrubByteFields({
+      id: 'AAMk',
+      attachments: [{ name: 'invoice.pdf', contentType: 'application/pdf', contentBytes }],
+    });
+    expect(result.value).toEqual({
+      id: 'AAMk',
+      attachments: [
+        {
+          name: 'invoice.pdf',
+          contentType: 'application/pdf',
+          contentBytes: '<stripped: 218679 bytes, use read-document>',
+        },
+      ],
+    });
+    expect(JSON.stringify(result.value).length).toBeLessThan(300);
+  });
+
+  it('strips line-wrapped base64 rather than letting the wrapping hide it', () => {
+    const wrapped = (base64OfLength(8192).match(/.{1,76}/g) ?? []).join('\r\n');
+    expect(wrapped.length).toBeGreaterThan(8192);
+    expect(scrubByteFields({ data: wrapped }).stripped).toEqual([
+      { path: '$.data', field: 'data', bytes: 6144 },
+    ]);
   });
 });
