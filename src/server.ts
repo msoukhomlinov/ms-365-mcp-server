@@ -14,6 +14,7 @@ import {
 } from './graph-tools.js';
 import { buildMcpServerInstructions } from './mcp-instructions.js';
 import { installToolSchemaRefNormalization } from './normalize-tool-schema.js';
+import { installResponseScrubbing } from './response-scrubbing.js';
 import GraphClient from './graph-client.js';
 import AuthManager, {
   buildScopesFromEndpoints,
@@ -327,6 +328,14 @@ class MicrosoftGraphServer {
     // refs for recursive/shared Microsoft Graph schemas and hard-codes its conversion
     // options, so normalize the emitted schemas here. See issue #571.
     installToolSchemaRefNormalization(server);
+
+    // Only in proxy mode. With the flag off this server behaves byte for byte as
+    // upstream -- including returning bytes, which is what upstream's tools are
+    // for. Installed AFTER every tool is registered, because it decorates the
+    // tools/call handler the registrations create.
+    if (this.attachmentProxyActive) {
+      installResponseScrubbing(server);
+    }
 
     return server;
   }
