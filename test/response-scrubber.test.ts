@@ -105,4 +105,22 @@ describe('scrubByteFields: nested objects and arrays', () => {
     const result = scrubByteFields(input) as { value: { value: unknown[] } };
     expect(result.value.value[1]).toBe(clean);
   });
+
+  it('returns a fully clean array by reference, preserving the structural-sharing invariant', () => {
+    const input = { value: [{ id: 'm1' }, { id: 'm2' }] };
+    const result = scrubByteFields(input);
+    expect(result.value).toBe(input);
+    expect(result.value.value).toBe(input.value);
+    expect(result.stripped).toEqual([]);
+  });
+
+  it('does not mutate the input array', () => {
+    const original = [
+      { id: 'm1', subject: 'hello' },
+      { id: 'm2', subject: 'world' },
+    ];
+    const input = { value: original };
+    scrubByteFields(input);
+    expect(input.value).toBe(original);
+  });
 });
