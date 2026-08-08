@@ -218,4 +218,68 @@ describe('installResponseScrubbing -- unconventional content shapes', () => {
       'just a string'
     );
   });
+
+  it('normalizes a non-array content with nothing to strip, not only a byte-carrying one', async () => {
+    // A shape this branch can hold is never legitimate -- content's schema
+    // always requires an array -- so unlike a content ARRAY ITEM (where a
+    // small valid image block must survive untouched), there is no
+    // "leave it alone, nothing found" case here. Pre-fix: nothing was
+    // stripped, so the boolean survived completely unarrayed.
+    const handler = installOverOriginal(async () => ({ content: true }));
+    const result = (await handler(fakeRequest, {})) as { content: Array<{ text?: string }> };
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(result.content[0].text).toBe('true');
+  });
+
+  it('rescues a structuredContent that scrubs down to a bare string', async () => {
+    // Pre-fix: `result.structuredContent = scrubbed.value` reassigns
+    // unconditionally once something is stripped -- but scrubByteFields
+    // replacing the whole value means the replacement is a marker STRING,
+    // and structuredContent's schema (a record) requires a plain object.
+    const handler = installOverOriginal(async () => ({
+      content: [],
+      structuredContent: BIG_BASE64,
+    }));
+    const result = (await handler(fakeRequest, {})) as {
+      content: Array<{ text?: string }>;
+      structuredContent?: unknown;
+    };
+    expect(result.structuredContent).toBeUndefined();
+    const serialized = JSON.stringify(result.content);
+    expect(serialized).not.toContain(BIG_BASE64);
+    expect(serialized).toContain('stripped');
+  });
+
+  it('rescues a structuredContent that scrubs down to an array', async () => {
+    // scrubByteFields preserves the array shape while scrubbing the item
+    // inside it -- an array is exactly as invalid a structuredContent as a
+    // bare string is, just via the other branch of the same bug.
+    const handler = installOverOriginal(async () => ({
+      content: [],
+      structuredContent: [BIG_BASE64],
+    }));
+    const result = (await handler(fakeRequest, {})) as {
+      content: Array<{ text?: string }>;
+      structuredContent?: unknown;
+    };
+    expect(result.structuredContent).toBeUndefined();
+    const serialized = JSON.stringify(result.content);
+    expect(serialized).not.toContain(BIG_BASE64);
+    expect(serialized).toContain('stripped');
+  });
+
+  it('rescues a structuredContent given as a primitive, even with nothing to strip', async () => {
+    // A boolean can never carry bytes, so scrubByteFields finds nothing to
+    // strip here -- but the shape was never valid regardless of bytes. This
+    // is the exact asymmetry under review: pre-fix, `stripped.length > 0`
+    // gated the whole rescue, so a byte-free but shape-invalid
+    // structuredContent sailed through completely unchanged.
+    const handler = installOverOriginal(async () => ({ content: [], structuredContent: true }));
+    const result = (await handler(fakeRequest, {})) as {
+      content: Array<{ text?: string }>;
+      structuredContent?: unknown;
+    };
+    expect(result.structuredContent).toBeUndefined();
+    expect(result.content.some((item) => item.text === 'true')).toBe(true);
+  });
 });

@@ -12,13 +12,21 @@
  * **Coverage.** This closes "a tool result contains `contentBytes` or a long
  * base64 string" -- see `scrubByteFields` for exactly what that rule is and is
  * not -- regardless of where in the result that string lives: a conventional
- * `content` array of text blocks, an image/audio/resource block, or `content`
+ * `content` array of text blocks, an image/audio/resource block, `content`
  * itself given as something other than the conventional array (a bare string,
- * a single object). Every one of those shapes is either walked by name or,
- * when unrecognised, passed through `scrubByteFields` whole rather than
- * skipped -- the same "an unrecognised shape is replaced, not passed through"
- * rule the scrubber's own depth cap applies one level down. It does not close
- * every byte-leak path in this deployment:
+ * a single object), or `structuredContent`. Every one of those shapes is
+ * either walked by name, or -- when unrecognised, or when scrubbing would
+ * leave a shape its own schema cannot hold (`content` must be an array;
+ * `structuredContent` must be a plain object; an image/audio/resource block's
+ * `data`/`resource.blob` must be valid base64, which a human-readable marker
+ * never is) -- converted into a text block in `content` rather than assigned
+ * back broken. That conversion runs even when nothing was actually stripped
+ * for `content`-as-a-whole and `structuredContent` (there is no legitimate
+ * value either can hold outside their required shape, so fixing costs nothing
+ * real); it does *not* run for an individual `content` array item with
+ * nothing stripped, because a small, valid image block is real and must
+ * survive untouched. It does not close every byte-leak path in this
+ * deployment:
  *   - `graph-batch` accepts arbitrary sub-requests and can smuggle a GET
  *     against a suppressed path; that is a general bypass tracked separately,
  *     not something this wrapper can see into.
@@ -91,6 +99,11 @@ function stringifyScrubbed(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
+/** True for `{}`-shaped values -- not an array, not `null`, not a primitive. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
  * Scrub one entry of a `content` array.
  *
@@ -131,6 +144,14 @@ function scrubContentItem(item: unknown, stripped: StrippedField[]): unknown {
   return textBlock(stringifyScrubbed(scrubbed.value));
 }
 
+/** Sentinel `bytes` value this module (not the scrubber) uses on a synthetic
+ * `StrippedField` it manufactures for a shape-only rescue -- see the
+ * `content`/`structuredContent` handling below. Negative and distinct from
+ * the scrubber's own `bytes: 0` depth-cap convention, so the two never
+ * describe themselves the same way in the log (see `describeStrippedField`).
+ */
+const SHAPE_RESCUE_BYTES = -1;
+
 /**
  * Render one stripped field for the warn line.
  *
@@ -142,9 +163,21 @@ function scrubContentItem(item: unknown, stripped: StrippedField[]): unknown {
  * not a size. If this ever gets summed elsewhere, that sum will understate for
  * every depth-capped entry; the fix there is to skip or flag those entries by
  * name, not to have this module fabricate a size it doesn't have.
+ *
+ * A *shape-only* rescue (`content` or `structuredContent` fixed into a valid
+ * shape with no bytes anywhere in it) is a third case this function has to
+ * tell apart from both: it is not a byte count, and calling it "depth-capped"
+ * would blame the wrong mechanism for the rescue. `SHAPE_RESCUE_BYTES` (a
+ * negative sentinel this module manufactures itself, never something
+ * `scrubByteFields` produces) keeps that case worded honestly too.
  */
 function describeStrippedField(field: StrippedField): string {
-  const size = field.bytes > 0 ? `${field.bytes} bytes` : 'depth-capped, size unknown';
+  const size =
+    field.bytes > 0
+      ? `${field.bytes} bytes`
+      : field.bytes === SHAPE_RESCUE_BYTES
+        ? 'shape rescue, no bytes involved'
+        : 'depth-capped, size unknown';
   return `${field.path || '(root)'}.${field.field} (${size})`;
 }
 
@@ -200,25 +233,58 @@ export function installResponseScrubbing(server: McpServer): void {
       const scrubbed = scrubByteFields(result.content);
       if (scrubbed.stripped.length > 0) {
         stripped.push(...scrubbed.stripped);
-        // `content` was never a valid array to begin with, so there is no
-        // conforming shape left to preserve it in. MCP requires `content` to
-        // be an array of blocks regardless of what this module does, so
-        // leaving the scrubbed value in whatever shape it already had (a bare
-        // string, an object) would still be rejected downstream -- just with
-        // the bytes now gone, trading a leak for an unconditional failure that
-        // has nothing to do with bytes. Wrap it in a single text block, same
-        // reasoning as the per-item case above: the one shape with nowhere
-        // left for the marker to violate, and the one shape the transport can
-        // always deliver.
-        result.content = [textBlock(stringifyScrubbed(scrubbed.value))];
       }
+      // Being inside this branch at all already means `content` is not an
+      // array, and content's schema always requires one -- unlike a content
+      // ARRAY ITEM, where a small legitimate image block is real and must
+      // survive untouched (see scrubContentItem's own gate), there is no
+      // legitimate value this branch can hold, so fixing it costs nothing
+      // real. Record the rescue even when no bytes were involved
+      // (`SHAPE_RESCUE_BYTES`) so a shape-only fix stays visible in the log,
+      // and wrap the (possibly byte-scrubbed) value in a single text block:
+      // nowhere for a marker to violate, and the one shape the transport can
+      // always deliver.
+      if (scrubbed.stripped.length === 0) {
+        stripped.push({ path: '$', field: 'content', bytes: SHAPE_RESCUE_BYTES });
+      }
+      result.content = [textBlock(stringifyScrubbed(scrubbed.value))];
     }
 
     if (result.structuredContent !== undefined) {
       const scrubbed = scrubByteFields(result.structuredContent);
       if (scrubbed.stripped.length > 0) {
         stripped.push(...scrubbed.stripped);
+      }
+      if (isPlainObject(scrubbed.value)) {
         result.structuredContent = scrubbed.value;
+      } else {
+        // structuredContent's own schema (a record: `{[key: string]: unknown}`)
+        // requires a plain object, the same way content's schema requires an
+        // array -- and it can end up here two ways. Either scrubByteFields
+        // replaced the WHOLE value with a marker string because
+        // structuredContent itself carried the bytes (already reported above,
+        // in `stripped`), or structuredContent was never an object to begin
+        // with and had nothing to strip at all (nothing above to report,
+        // because there were no bytes -- but the shape is still wrong).
+        // Assigning either back would violate the schema for a reason that has
+        // nothing to do with the bytes this module exists to catch -- fails
+        // closed for `content` and fails open for `structuredContent` is not a
+        // choke point. Record the rescue even when no bytes were involved
+        // (`SHAPE_RESCUE_BYTES`) so a shape-only fix is still visible in the
+        // log rather than silent, drop the field -- nothing downstream needs
+        // an invalid `structuredContent` more than it needs a missing one --
+        // and give the marker the one home that's always valid: a text block
+        // in `content`.
+        if (scrubbed.stripped.length === 0) {
+          stripped.push({ path: '$', field: 'structuredContent', bytes: SHAPE_RESCUE_BYTES });
+        }
+        delete result.structuredContent;
+        const marker = textBlock(stringifyScrubbed(scrubbed.value));
+        if (Array.isArray(result.content)) {
+          result.content.push(marker);
+        } else {
+          result.content = [marker];
+        }
       }
     }
 
