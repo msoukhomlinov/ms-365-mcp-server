@@ -23,11 +23,8 @@ import {
   configureAttachmentProxy,
   resetAttachmentProxy,
 } from '../src/lib/attachment-proxy-runtime.js';
-import type {
-  AttachmentProxyClient,
-  ConvertRequest,
-  ConvertResult,
-} from '../src/lib/attachment-proxy.js';
+import { AttachmentProxyClient } from '../src/lib/attachment-proxy.js';
+import type { ConvertRequest, ConvertResult } from '../src/lib/attachment-proxy.js';
 import type GraphClient from '../src/graph-client.js';
 
 vi.mock('../src/logger.js', () => ({
@@ -67,6 +64,46 @@ function fakeGraphClient(): GraphClient {
       size: 195663,
     })),
   } as unknown as GraphClient;
+}
+
+/** The `uri` argument a `fetch` mock was actually handed, recovered from the JSON-RPC request body. */
+function uriFromRequestBody(init: unknown): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const body = JSON.parse(String((init as any)?.body ?? '{}'));
+  return body?.params?.arguments?.uri as string;
+}
+
+function jsonRpcResponse(message: unknown): Response {
+  return new Response(JSON.stringify(message), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+/**
+ * A REAL `AttachmentProxyClient`, talking to a `fetch` mock rather than to a
+ * stub of the client's own interface. That distinction is the point: a stub
+ * at the client's interface (as `stubProxy` above provides, correctly, for
+ * every test about the tool's own branching) hands back exactly the string
+ * the test author wrote and can never exercise `mapProxyError` /
+ * `interpretJsonRpcMessage` in `attachment-proxy.ts` -- which is where an
+ * untrusted proxy's text actually becomes this tool's `message`/`markdown`.
+ * Mocking only `fetch` forces every byte the assertions below see through
+ * that real derivation, the same way `attachment-proxy.test.ts` does for the
+ * client's own suite.
+ */
+function realProxyClient(buildMessage: (requestedUri: string) => unknown): {
+  client: AttachmentProxyClient;
+  requestedUris: string[];
+} {
+  const requestedUris: string[] = [];
+  const fetchImpl = (async (_input: unknown, init?: unknown) => {
+    const uri = uriFromRequestBody(init);
+    requestedUris.push(uri);
+    return jsonRpcResponse(buildMessage(uri));
+  }) as unknown as typeof fetch;
+  const client = new AttachmentProxyClient({ url: 'http://docglean:8080/mcp', fetchImpl });
+  return { client, requestedUris };
 }
 
 describe('read-document', () => {
@@ -202,5 +239,110 @@ describe('read-document', () => {
     expect(body.error).toBe('no_capacity');
     expect(body).toHaveProperty('name');
     expect(requests).toHaveLength(0);
+  });
+
+  it('redacts the live ticket url out of a real proxy error message', async () => {
+    // The real client, talking to a fetch mock whose error text echoes back
+    // the exact uri it was asked to convert -- an entirely ordinary shape
+    // ("could not fetch <uri>: 404"), not a hostile one. This is the case a
+    // stub-based test cannot prove: it exercises the real mapProxyError /
+    // interpretJsonRpcMessage derivation, not a literal a test author wrote.
+    const { client: proxy, requestedUris } = realProxyClient((uri) => {
+      const payload = {
+        code: 'fetch_failed',
+        message: `could not fetch ${uri}: upstream returned 404`,
+        detail: { status: 404 },
+      };
+      return {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(payload) }],
+          structuredContent: payload,
+          isError: true,
+        },
+      };
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    expect(requestedUris).toHaveLength(1);
+    const ticketUrl = requestedUris[0];
+    const ticketId = new URL(ticketUrl).searchParams.get('t')!;
+    expect(ticketId).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.text);
+    expect(body.error).toBe('fetch_failed');
+    // The whole point: neither the full signed URL nor the bare ticket id --
+    // the actual credential the redemption route checks -- survives into the
+    // tool's output, even though the proxy's own text carried both.
+    expect(body.message).not.toContain(ticketUrl);
+    expect(body.message).not.toContain(ticketId);
+    expect(result.text).not.toContain(ticketUrl);
+    expect(result.text).not.toContain(ticketId);
+    expect(body.message).toContain('<attachment url redacted>');
+  });
+
+  it('redacts a bare ticket id even when the surrounding url is mangled or truncated', async () => {
+    // A proxy that logs a parsed field rather than the raw request line would
+    // echo the id without ever reproducing the exact signed URL string --
+    // reordered query, dropped dgk/dgx/dgs, truncated at a delimiter. The id
+    // itself is the credential the redemption route actually checks
+    // (attachment-route.ts ignores dgk/dgx/dgs), so this has to be caught on
+    // its own, not only as part of an exact URL match.
+    const { client: proxy, requestedUris } = realProxyClient((uri) => {
+      const ticketId = new URL(uri).searchParams.get('t');
+      const payload = {
+        code: 'proxy_error',
+        message: `upstream 404 fetching /attachment (t=${ticketId}, dg* dropped by an intermediate proxy)`,
+        detail: {},
+      };
+      return {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(payload) }],
+          structuredContent: payload,
+          isError: true,
+        },
+      };
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    const ticketId = new URL(requestedUris[0]).searchParams.get('t')!;
+    expect(result.text).not.toContain(ticketId);
+    expect(result.text).toContain('<attachment url redacted>');
+  });
+
+  it('redacts an echoed ticket url out of a successful conversion, defensively', async () => {
+    // Nothing stops a proxy from putting the request it received into the
+    // markdown it returns, deliberately or by a debug echo left enabled --
+    // and the ticket is exactly as live a credential there as in an error.
+    const { client: proxy, requestedUris } = realProxyClient((uri) => {
+      const payload = { markdown: `# doc\n\nconverted from: ${uri}` };
+      return {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(payload) }],
+          structuredContent: payload,
+        },
+      };
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    expect(result.isError).toBe(false);
+    const ticketUrl = requestedUris[0];
+    const ticketId = new URL(ticketUrl).searchParams.get('t')!;
+    expect(result.text).not.toContain(ticketUrl);
+    expect(result.text).not.toContain(ticketId);
+    expect(result.text).toContain('<attachment url redacted>');
+    expect(result.text).toContain('# doc');
   });
 });

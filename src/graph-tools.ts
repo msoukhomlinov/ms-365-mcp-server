@@ -576,6 +576,45 @@ interface AttachmentFacts {
 
 const UNKNOWN_ATTACHMENT: AttachmentFacts = { name: null, contentType: null, size: null };
 
+/** Fixed text standing in for a redacted ticket URL or ticket id. */
+const REDACTED_ATTACHMENT_URL = '<attachment url redacted>';
+
+/**
+ * Strip a minted ticket's live credential out of proxy-supplied text before
+ * any of it can reach the model.
+ *
+ * The proxy is handed the signed ticket URL as its `uri` argument, and a
+ * generic converter's error text ordinarily echoes back the address it
+ * failed to fetch ("could not reach <uri>: 404") -- an entirely unremarkable
+ * failure shape, not a hostile one, and none of this server's own code
+ * chooses that text. Whatever the proxy sends back in `message` (or, in
+ * principle, in `markdown`) is otherwise returned to the caller verbatim, so
+ * without this the ticket URL -- carrying a live, redeemable credential --
+ * would land in the model's context exactly where this feature exists to
+ * keep it out.
+ *
+ * The full URL is stripped first (so a clean echo collapses to one
+ * placeholder instead of the id and the surrounding query both vanishing
+ * separately), then the bare ticket id is stripped on its own, because that
+ * id is the actual credential and the rest of the URL is not: the redemption
+ * route (`attachment-route.ts`) authorises solely on `t`, ignoring
+ * `dgk`/`dgx`/`dgs` entirely, so a URL missing every parameter except a live
+ * `t` is exactly as dangerous as the whole thing. Matching the id as a bare
+ * substring -- not only inside the full URL -- also catches a proxy that
+ * echoes the URL truncated at a delimiter, percent-encoded, or with its query
+ * reordered or mangled: percent-encoding only escapes characters outside
+ * `[A-Za-z0-9_-]`, and a ticket id is entirely within that set, so it
+ * survives every one of those transformations unchanged and a plain string
+ * search still finds it.
+ */
+function redactAttachmentSecrets(text: string, ticketId: string, ticketUrl: string): string {
+  return text
+    .split(ticketUrl)
+    .join(REDACTED_ATTACHMENT_URL)
+    .split(ticketId)
+    .join(REDACTED_ATTACHMENT_URL);
+}
+
 /**
  * One error shape for every read-document failure.
  *
@@ -1250,17 +1289,34 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         throw error;
       }
 
+      const ticketUrl = buildAttachmentUrl(minting.config, ticket.id);
       const result = await proxy.client.convertToMarkdown({
-        uri: buildAttachmentUrl(minting.config, ticket.id),
+        uri: ticketUrl,
         ...(typeof params.pages === 'string' ? { pages: params.pages } : {}),
         ...(typeof params.offset === 'number' ? { offset: params.offset } : {}),
         ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
       });
 
+      // Redacted on both branches: the proxy was handed the live ticket URL as
+      // its `uri` argument, and nothing stops it from echoing that URL (or
+      // just the ticket id) back inside EITHER a converted document's content
+      // or an error message. `result.code` is included too, defensively --
+      // today it is always one of CONTRACT_ERROR_CODES or the fixed literal
+      // 'proxy_error' (see attachment-proxy.ts's mapProxyError /
+      // interpretJsonRpcMessage), never proxy-chosen free text, so this redact
+      // is a no-op on the current contract rather than a gap it is closing.
       if (result.ok) {
-        return { content: [{ type: 'text', text: result.markdown }] };
+        return {
+          content: [
+            { type: 'text', text: redactAttachmentSecrets(result.markdown, ticket.id, ticketUrl) },
+          ],
+        };
       }
-      return readDocumentError(result.code, result.message, UNKNOWN_ATTACHMENT);
+      return readDocumentError(
+        redactAttachmentSecrets(result.code, ticket.id, ticketUrl),
+        redactAttachmentSecrets(result.message, ticket.id, ticketUrl),
+        UNKNOWN_ATTACHMENT
+      );
     },
   },
 ];
