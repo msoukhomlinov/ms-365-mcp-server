@@ -122,4 +122,37 @@ describe('decodeJsonRpcBody', () => {
     const body = `event: message\r\ndata: ${JSON.stringify(message)}`;
     expect(() => decodeJsonRpcBody('text/event-stream', body)).toThrow(/truncat/);
   });
+
+  /**
+   * SSE dispatch requires a genuine blank *line* — two consecutive line
+   * terminators — not merely a body that happens to end in one. `String.split`
+   * always appends a trailing `''` after a delimiter at the very end of the
+   * input, and that split artifact is byte-identical to the `''` a real blank
+   * line produces. A body that ends in exactly one `\n` (or one `\r\n`) after
+   * its last `data:` line is a connection that died right after the server's
+   * last line write — one terminator short of dispatch — and must be
+   * indistinguishable from that in name only, not in outcome: it has to throw
+   * the same distinct truncation error as a frame with no terminator at all,
+   * never the "no data frame" error (which would mean the throw fired for the
+   * wrong reason) and never a successful decode (which would mean the single
+   * trailing terminator was mistaken for a genuine dispatch).
+   */
+  it('throws on an LF-terminated frame that never reached its blank line', () => {
+    const body = `event: message\ndata: ${JSON.stringify(message)}\n`;
+    expect(() => decodeJsonRpcBody('text/event-stream', body)).toThrow(
+      /truncated before its terminating blank line/
+    );
+  });
+
+  it('throws on a CRLF-terminated frame that never reached its blank line', () => {
+    const body = `event: message\r\ndata: ${JSON.stringify(message)}\r\n`;
+    expect(() => decodeJsonRpcBody('text/event-stream', body)).toThrow(
+      /truncated before its terminating blank line/
+    );
+  });
+
+  it('decodes normally once that same CRLF frame reaches its actual blank line', () => {
+    const body = `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
+  });
 });

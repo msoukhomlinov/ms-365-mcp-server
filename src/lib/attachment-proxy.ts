@@ -73,10 +73,35 @@ export function toWireArguments(req: ConvertRequest): Record<string, unknown> {
  * partial accumulation as success would be a clean, well-formed, wrong answer
  * — the same failure class as the empty 200 of 2026-08-07 — so this throws
  * instead of degrading silently.
+ *
+ * SSE dispatch requires a genuine blank *line* — two consecutive terminators
+ * — not merely a string that happens to end in one. `String.split` always
+ * appends a trailing `''` when the input ends in a delimiter, and that
+ * artifact is byte-identical to the `''` a real blank line produces; a body
+ * that ends in exactly one `\r\n`/`\r`/`\n` would otherwise look dispatched
+ * when the connection simply died right after the server's last line write.
+ * The array `split` produces tells the two apart on its own, without a
+ * second, separately-fallible regex: a genuine blank line leaves *two*
+ * trailing `''` entries (the blank line itself, then its own boundary
+ * artifact), where a body that merely ends in one terminator leaves only
+ * one. (A regex re-checking the same thing, e.g. `/(?:\r\n|\r|\n){2}$/`,
+ * looks equivalent but is not: to satisfy an exact `{2}`, the engine may
+ * backtrack a single `\r\n` into a lone `\r` match plus a lone `\n` match,
+ * which reports a false "doubled terminator" for exactly the single-CRLF
+ * case this exists to catch — `split` never makes that substitution because
+ * it always prefers the `\r\n` alternative and never needs to backtrack to
+ * satisfy a rep count.) So when there's only the one artifact, it's dropped
+ * before scanning, so the last (unterminated) frame's data survives in
+ * `current` to the throw below instead of being mistaken for a dispatch.
  */
 function extractSseData(body: string): string | null {
+  const lines = body.split(/\r\n|\r|\n/);
+  const last = lines.length - 1;
+  if (lines[last] === '' && lines[last - 1] !== '') {
+    lines.pop();
+  }
   let current: string[] = [];
-  for (const line of body.split(/\r\n|\r|\n/)) {
+  for (const line of lines) {
     if (line === '') {
       const joined = current.join('\n');
       current = [];
