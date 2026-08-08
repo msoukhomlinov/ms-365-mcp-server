@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { registerGraphTools } from '../src/graph-tools.js';
 import { AttachmentTicketStore } from '../src/lib/attachment-tickets.js';
 import {
@@ -26,6 +28,7 @@ import {
 import { AttachmentProxyClient } from '../src/lib/attachment-proxy.js';
 import type { ConvertRequest, ConvertResult } from '../src/lib/attachment-proxy.js';
 import type GraphClient from '../src/graph-client.js';
+import logger from '../src/logger.js';
 
 vi.mock('../src/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), verbose: vi.fn() },
@@ -344,5 +347,230 @@ describe('read-document', () => {
     expect(result.text).not.toContain(ticketId);
     expect(result.text).toContain('<attachment url redacted>');
     expect(result.text).toContain('# doc');
+  });
+});
+
+/** A port nothing is listening on: bound to learn the number, then released. */
+async function reserveClosedPort(): Promise<number> {
+  const holder = await new Promise<Server>((resolve) => {
+    const s = createServer();
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const port = (holder.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => holder.close(() => resolve()));
+  return port;
+}
+
+describe('read-document failure handling', () => {
+  let store: AttachmentTicketStore;
+
+  async function connect(): Promise<Client> {
+    const server = new McpServer({ name: 'test', version: '1.0.0' });
+    registerGraphTools(
+      server,
+      fakeGraphClient(),
+      false,
+      '^read-document$',
+      false,
+      undefined,
+      false,
+      [],
+      undefined,
+      true,
+      true
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  async function call(client: Client, args: Record<string, unknown>): Promise<string> {
+    const result = (await client.callTool({ name: 'read-document', arguments: args })) as {
+      content: Array<{ text: string }>;
+    };
+    return result.content[0].text;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = new AttachmentTicketStore(120);
+    configureAttachmentMinting({ store, config: URL_CONFIG });
+  });
+
+  afterEach(() => {
+    resetAttachmentMinting();
+    resetAttachmentProxy();
+    vi.restoreAllMocks();
+  });
+
+  it('carries the real name, contentType and size on a refusal', async () => {
+    const { client: proxy } = stubProxy({
+      ok: false,
+      code: 'too_large',
+      message: 'document exceeds the configured size limit',
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
+
+    expect(body.error).toBe('too_large');
+    // The whole point of the envelope: the agent can still tell the user what
+    // it could not read.
+    expect(body.name).toBe('report.pdf');
+    expect(body.contentType).toBe('application/pdf');
+    expect(body.size).toBe(195663);
+  });
+
+  it('passes a code outside the contract through as proxy_error, verbatim', async () => {
+    const { client: proxy } = stubProxy({
+      ok: false,
+      code: 'ocr_backend_unavailable',
+      message: 'the OCR worker pool is not accepting work',
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
+
+    // Flattening this into conversion_failed would promise a vocabulary that is
+    // not ours -- the proxy contract names a code, not a code list.
+    expect(body.error).toBe('proxy_error');
+    expect(body.proxyCode).toBe('ocr_backend_unavailable');
+    expect(body.message).toBe('the OCR worker pool is not accepting work');
+  });
+
+  it('reports an unreachable proxy AND logs it at warn with the URL and elapsed ms', async () => {
+    const deadPort = await reserveClosedPort();
+    const url = `http://127.0.0.1:${deadPort}/mcp`;
+    // The real client against a real closed socket. Nothing is stubbed: the one
+    // code whose entire meaning is "the network failed" is not worth asserting
+    // against a stub that decided to say so.
+    configureAttachmentProxy({
+      client: new AttachmentProxyClient({ url, timeoutMs: 2000 }),
+      url,
+    });
+
+    const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
+
+    expect(body.error).toBe('proxy_unreachable');
+    expect(body.name).toBe('report.pdf');
+
+    const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    const line = warned.find((l) => l.includes('proxy'));
+    expect(line, 'no warn line naming the proxy was emitted').toBeDefined();
+    expect(line).toContain(url);
+    expect(line, 'the warn line must state elapsed time').toMatch(/\d+ms/);
+  });
+
+  it('retries an unreachable proxy once, with a FRESH ticket', async () => {
+    const deadPort = await reserveClosedPort();
+    const url = `http://127.0.0.1:${deadPort}/mcp`;
+    configureAttachmentProxy({
+      client: new AttachmentProxyClient({ url, timeoutMs: 2000 }),
+      url,
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    // Two attempts, two mints, two DIFFERENT ids. Reusing the ticket is the
+    // cheaper-looking mistake: a failed fetch still spends a redemption, and the
+    // proxy may have spent one or more before failing, so the retry could meet a
+    // 404 that has nothing to do with why the first attempt failed.
+    expect(mintSpy).toHaveBeenCalledTimes(2);
+    const ids = mintSpy.mock.results.map((r) => (r.value as { id: string }).id);
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
+  it('does not retry a refusal the proxy actually answered', async () => {
+    let calls = 0;
+    const client = {
+      convertToMarkdown: async () => {
+        calls++;
+        return { ok: false as const, code: 'password_required', message: 'encrypted PDF' };
+      },
+    } as unknown as AttachmentProxyClient;
+    configureAttachmentProxy({ client, url: 'http://docglean:8080/mcp' });
+
+    const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
+
+    expect(body.error).toBe('password_required');
+    // A proxy that answered is not a transient network failure. Retrying would
+    // double every conversion cost for an answer that will not change.
+    expect(calls).toBe(1);
+  });
+
+  it('redacts the SECOND ticket id when the retry succeeds and echoes it', async () => {
+    // The retry mints a fresh ticket distinct from the first (proved above).
+    // Redaction has to follow it: a naive implementation that redacts only
+    // once, at the end, against whatever ticket was minted last, happens to
+    // get this case right by coincidence -- but one that captured the FIRST
+    // ticket's id before the retry and redacted only that would leak the
+    // second ticket's id straight into the model's context on exactly the
+    // path this test exercises.
+    const requests: string[] = [];
+    let calls = 0;
+    const client = {
+      convertToMarkdown: async (req: ConvertRequest) => {
+        calls++;
+        requests.push(req.uri);
+        if (calls === 1) {
+          return { ok: false as const, code: 'proxy_unreachable', message: 'timeout' };
+        }
+        return { ok: true as const, markdown: `converted from: ${req.uri}` };
+      },
+    } as unknown as AttachmentProxyClient;
+    configureAttachmentProxy({ client, url: 'http://docglean:8080/mcp' });
+
+    const text = await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    expect(calls).toBe(2);
+    expect(requests[0]).not.toBe(requests[1]);
+    const secondTicketUrl = requests[1];
+    const secondTicketId = new URL(secondTicketUrl).searchParams.get('t')!;
+    expect(text).not.toContain(secondTicketUrl);
+    expect(text).not.toContain(secondTicketId);
+    expect(text).toContain('<attachment url redacted>');
+    expect(text).toContain('converted from:');
+  });
+
+  it('never lets a failed metadata probe replace the error the caller hit', async () => {
+    const { client: proxy } = stubProxy({
+      ok: false,
+      code: 'conversion_failed',
+      message: 'converter returned no text',
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const server = new McpServer({ name: 'test', version: '1.0.0' });
+    registerGraphTools(
+      server,
+      {
+        makeRequest: vi.fn(async () => {
+          throw new Error('Graph 404');
+        }),
+      } as unknown as GraphClient,
+      false,
+      '^read-document$',
+      false,
+      undefined,
+      false,
+      [],
+      undefined,
+      true,
+      true
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(clientTransport);
+
+    const body = JSON.parse(await call(client, { target: MAIL_ATTACHMENT }));
+
+    expect(body.error).toBe('conversion_failed');
+    expect(body.name).toBeNull();
+    expect(body.contentType).toBeNull();
+    expect(body.size).toBeNull();
   });
 });

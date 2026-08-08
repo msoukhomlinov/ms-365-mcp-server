@@ -648,6 +648,65 @@ function readDocumentError(
   };
 }
 
+/**
+ * Error codes this server promises.
+ *
+ * Anything the proxy says that is not in here is surfaced as `proxy_error` with
+ * the proxy's own code beside it, unaltered. That is the honest consequence of a
+ * generic converter contract: the contract names a code, not a code list, and
+ * flattening an unrecognised one into `conversion_failed` would state a
+ * vocabulary this server does not own -- and would erase the only string an
+ * operator could search the proxy's own source for.
+ */
+const CONTRACT_ERROR_CODES = new Set([
+  'unsupported_format',
+  'too_large',
+  'password_required',
+  'conversion_failed',
+  'fetch_failed',
+  'proxy_unreachable',
+  'invalid_target',
+  'no_capacity',
+]);
+
+/**
+ * Best-effort `name`/`contentType`/`size` for the error envelope.
+ *
+ * Probed only for mail and event attachments, and only on a failure path. Those
+ * are the only Graph resources carrying all three fields; asking a message or a
+ * photo for `$select=name,contentType,size` is a guaranteed 400, which would put
+ * a noisy Graph error in the log on every failure and buy nothing.
+ *
+ * Every failure here is swallowed. The caller is already holding a real error,
+ * and a probe that fails must never replace it -- "could not read the metadata
+ * of the document you could not read" is strictly less useful than the original
+ * refusal with three nulls beside it.
+ */
+async function describeAttachment(
+  target: string,
+  ctx: UtilityToolContext,
+  accessToken: string | undefined
+): Promise<AttachmentFacts> {
+  if (!MAIL_EVENT_ATTACHMENT_TARGET.test(target) || !target.endsWith('/$value')) {
+    return UNKNOWN_ATTACHMENT;
+  }
+  try {
+    const metadataPath = target.slice(0, -'/$value'.length);
+    const meta = (await ctx.graphClient.makeRequest(
+      `${metadataPath}?$select=name,contentType,size`,
+      { accessToken }
+    )) as Record<string, unknown> | null;
+    if (!meta || typeof meta !== 'object') return UNKNOWN_ATTACHMENT;
+    return {
+      name: typeof meta.name === 'string' ? meta.name : null,
+      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
+      size: typeof meta.size === 'number' ? meta.size : null,
+    };
+  } catch {
+    return UNKNOWN_ATTACHMENT;
+  }
+}
+
 export const UTILITY_TOOLS: readonly UtilityTool[] = [
   {
     name: 'parse-teams-url',
@@ -1279,43 +1338,110 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         return readDocumentError('identity_not_supported', accountModeError, UNKNOWN_ATTACHMENT);
       }
 
-      let ticket: { id: string; expiresAtMs: number };
+      // The server's own token, resolved once. In proxy mode identity always
+      // comes from the token cache -- the guard above refused every other mode --
+      // so this is the same identity the redemption route will use.
+      let accessToken: string | undefined;
       try {
-        ticket = minting.store.mint(target, accountParam);
-      } catch (error) {
-        if (error instanceof TicketStoreFullError) {
-          return readDocumentError('no_capacity', error.message, UNKNOWN_ATTACHMENT);
+        accessToken = await ctx.authManager?.getTokenForAccount(accountParam);
+      } catch {
+        // Left undefined: makeRequest resolves its own token, and a token
+        // problem will surface as the Graph error it is rather than here.
+        accessToken = undefined;
+      }
+
+      /**
+       * One attempt: one FRESH mint, one conversion.
+       *
+       * Fresh per attempt, not per call. A failed fetch still spends a
+       * redemption and the proxy may have spent one or more before failing, so
+       * a retry on the same ticket can meet a 404 that has nothing to do with
+       * why the first attempt failed. Minting server-side is what makes this
+       * affordable: the 3-redemption budget and the 120 s TTL stopped being
+       * agent-visible the moment the agent stopped holding the URL.
+       *
+       * Redaction happens here, per attempt, against THIS attempt's own
+       * ticket id and URL -- not once at the end against whichever ticket
+       * happened to be minted last. A retry mints a second, different ticket,
+       * so redacting the final outcome with only the second ticket's id would
+       * leave the first ticket's id exposed in a message the first attempt
+       * produced (moot today, since a proxy_unreachable message never carries
+       * a ticket, but this must hold for every future code, not only the ones
+       * observed so far).
+       */
+      const attempt = async (): Promise<
+        { ok: true; markdown: string } | { ok: false; code: string; message: string }
+      > => {
+        let ticket: { id: string; expiresAtMs: number };
+        try {
+          ticket = minting.store.mint(target, accountParam);
+        } catch (error) {
+          if (error instanceof TicketStoreFullError) {
+            return { ok: false, code: 'no_capacity', message: error.message };
+          }
+          throw error;
         }
-        throw error;
-      }
-
-      const ticketUrl = buildAttachmentUrl(minting.config, ticket.id);
-      const result = await proxy.client.convertToMarkdown({
-        uri: ticketUrl,
-        ...(typeof params.pages === 'string' ? { pages: params.pages } : {}),
-        ...(typeof params.offset === 'number' ? { offset: params.offset } : {}),
-        ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
-      });
-
-      // Redacted on both branches: the proxy was handed the live ticket URL as
-      // its `uri` argument, and nothing stops it from echoing that URL (or
-      // just the ticket id) back inside EITHER a converted document's content
-      // or an error message. `result.code` is included too, defensively --
-      // today it is always one of CONTRACT_ERROR_CODES or the fixed literal
-      // 'proxy_error' (see attachment-proxy.ts's mapProxyError /
-      // interpretJsonRpcMessage), never proxy-chosen free text, so this redact
-      // is a no-op on the current contract rather than a gap it is closing.
-      if (result.ok) {
+        const ticketUrl = buildAttachmentUrl(minting.config, ticket.id);
+        const startedAtMs = Date.now();
+        const outcome = await proxy.client.convertToMarkdown({
+          uri: ticketUrl,
+          ...(typeof params.pages === 'string' ? { pages: params.pages } : {}),
+          ...(typeof params.offset === 'number' ? { offset: params.offset } : {}),
+          ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
+        });
+        if (!outcome.ok && outcome.code === 'proxy_unreachable') {
+          // Logged as well as returned. A wedged proxy that appears only in tool
+          // output is read by a model once and by an operator never; this is the
+          // line that makes it visible in `docker logs m365-max-mcp`. The proxy
+          // ships a liveness healthcheck that never consults its own workers, so
+          // a wedged one still reports healthy -- exactly the shape of the
+          // 19-hour silent failure this stack has already seen.
+          logger.warn(
+            `Attachment proxy unreachable: ${proxy.url} did not answer after ` +
+              `${Date.now() - startedAtMs}ms (${outcome.message})`
+          );
+        }
+        // Redacted on both branches: the proxy was handed the live ticket URL as
+        // its `uri` argument, and nothing stops it from echoing that URL (or
+        // just the ticket id) back inside EITHER a converted document's content
+        // or an error message. `outcome.code` is included too, defensively --
+        // today it is always one of CONTRACT_ERROR_CODES or the fixed literal
+        // 'proxy_error' (see attachment-proxy.ts's mapProxyError /
+        // interpretJsonRpcMessage), never proxy-chosen free text, so this redact
+        // is a no-op on the current contract rather than a gap it is closing.
+        if (outcome.ok) {
+          return {
+            ok: true,
+            markdown: redactAttachmentSecrets(outcome.markdown, ticket.id, ticketUrl),
+          };
+        }
         return {
-          content: [
-            { type: 'text', text: redactAttachmentSecrets(result.markdown, ticket.id, ticketUrl) },
-          ],
+          ok: false,
+          code: redactAttachmentSecrets(outcome.code, ticket.id, ticketUrl),
+          message: redactAttachmentSecrets(outcome.message, ticket.id, ticketUrl),
         };
+      };
+
+      let outcome = await attempt();
+      // Exactly one retry, and only for the transport class. A proxy that
+      // ANSWERED (too_large, password_required, ...) will answer the same way
+      // again, so retrying would double the conversion cost for no new
+      // information; a connection that never landed might.
+      if (!outcome.ok && outcome.code === 'proxy_unreachable') {
+        outcome = await attempt();
       }
+
+      if (outcome.ok) {
+        return { content: [{ type: 'text', text: outcome.markdown }] };
+      }
+
+      const facts = await describeAttachment(target, ctx, accessToken);
+      const known = CONTRACT_ERROR_CODES.has(outcome.code);
       return readDocumentError(
-        redactAttachmentSecrets(result.code, ticket.id, ticketUrl),
-        redactAttachmentSecrets(result.message, ticket.id, ticketUrl),
-        UNKNOWN_ATTACHMENT
+        known ? outcome.code : 'proxy_error',
+        outcome.message,
+        facts,
+        known ? undefined : outcome.code
       );
     },
   },
