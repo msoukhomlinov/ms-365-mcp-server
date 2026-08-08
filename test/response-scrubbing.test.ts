@@ -8,9 +8,22 @@
  * tool that does not exist yet.
  *
  * read-document is the one exemption, and it is safe by construction: it returns
- * markdown the proxy produced, never bytes. Without the exemption a document
- * whose markdown happened to contain a long base64 block -- a code fence in a
- * technical PDF is enough -- would be silently mangled.
+ * markdown the proxy produced, never bytes.
+ *
+ * A note on what the exemption actually guards against, corrected after a
+ * mutation sweep found the original test fixture here was vacuous: a base64
+ * block sitting inside a markdown code fence -- `# Report\n\`\`\`\n<base64>\n\`\`\`\n`
+ * -- does NOT trip the scrubber's rule 2 on its own. Rule 2 requires the ENTIRE
+ * field to be valid base64 (only `\r`/`\n` are stripped before checking), and a
+ * heading plus fence markers are not base64 characters, so that shape survives
+ * whether or not the exemption exists -- proving nothing about it. The
+ * `read-document` fixture below is instead a BARE base64 string as the whole
+ * text field: exactly what rule 2 matches, so the only thing standing between
+ * it and the marker is `SCRUBBER_BYPASS_TOOLS`. The exemption is still real
+ * defense-in-depth (read-document's markdown could coincidentally contain some
+ * other run of text that happens to satisfy the shape rule, and it must never
+ * be mangled regardless), it just is not motivated by "a code fence is enough"
+ * the way the module comment used to imply.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -55,8 +68,16 @@ describe('installResponseScrubbing', () => {
       'read-document',
       'returns markdown',
       { target: z.string().optional() },
+      // Deliberately a BARE base64 string, not markdown wrapped around one --
+      // a heading and code fence around BIG_BASE64 would never trip rule 2 in
+      // the first place (the whole field has to be valid base64; `# Report`
+      // and the fence markers aren't), so a fixture shaped that way "survives"
+      // whether or not the bypass exists and proves nothing about the
+      // exemption. This shape is exactly what rule 2 matches, so the ONLY
+      // reason it survives is `SCRUBBER_BYPASS_TOOLS` -- see the mutation
+      // verification in the "read-document exemption" tests below.
       async () => ({
-        content: [{ type: 'text' as const, text: `# Report\n\n\`\`\`\n${BIG_BASE64}\n\`\`\`\n` }],
+        content: [{ type: 'text' as const, text: BIG_BASE64 }],
       })
     );
     server.tool('raw-text-tool', 'returns bare text', {}, async () => ({
@@ -100,9 +121,14 @@ describe('installResponseScrubbing', () => {
   });
 
   it('leaves read-document output exactly as the proxy produced it', async () => {
+    // The fixture is a bare BIG_BASE64 string -- exactly what rule 2 matches --
+    // so this is a genuine test of the exemption, not (as an earlier, markdown
+    // -wrapped version of this fixture was) a payload rule 2 could never have
+    // matched regardless of the bypass. See "the read-document exemption is
+    // load-bearing" below for the mutation proof.
     const client = await connect();
     const markdown = await text(client, 'read-document');
-    expect(markdown).toContain(BIG_BASE64);
+    expect(markdown).toBe(BIG_BASE64);
   });
 
   it('covers a bare non-JSON text body too', async () => {

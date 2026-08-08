@@ -53,9 +53,15 @@ import { scrubByteFields, type StrippedField } from './lib/response-scrubber.js'
 /**
  * Tools whose results are never scrubbed.
  *
- * read-document returns markdown the proxy produced. Scrubbing it would corrupt
- * a legitimate result -- a technical PDF with a base64 block inside a code fence
- * is enough -- to protect against bytes it structurally cannot contain.
+ * read-document returns markdown the proxy produced, never bytes -- so this is
+ * defense-in-depth, not a fix for something that happens routinely. A base64
+ * block sitting inside a markdown code fence does NOT actually trip rule 2 on
+ * its own (the heading and fence markers are not base64 characters, and rule 2
+ * requires the *entire* field to match); what this guards against is the rarer
+ * case where read-document's markdown coincidentally contains some run of text
+ * that, on its own, satisfies the shape rule. Scrubbing that would corrupt a
+ * legitimate result to protect against bytes read-document structurally cannot
+ * contain in the first place.
  */
 const SCRUBBER_BYPASS_TOOLS = new Set(['read-document']);
 
