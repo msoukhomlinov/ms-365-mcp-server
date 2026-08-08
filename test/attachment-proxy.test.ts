@@ -446,3 +446,48 @@ describe('AttachmentProxyClient transport failures', () => {
     }
   });
 });
+
+describe('AttachmentProxyClient authentication', () => {
+  const saved = process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN;
+    else process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = saved;
+  });
+
+  it('sends a bearer token when one is configured', async () => {
+    process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 's3cret';
+    const { impl, calls } = recordingFetch([sseResponse(okMessage('x'))]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    await client.convertToMarkdown({ uri: 'u' });
+
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer s3cret');
+  });
+
+  it('sends no Authorization header at all when none is configured', async () => {
+    delete process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN;
+    const { impl, calls } = recordingFetch([sseResponse(okMessage('x'))]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    await client.convertToMarkdown({ uri: 'u' });
+
+    // Absent, not empty: `Bearer ` is a credential a server may log as one.
+    expect('Authorization' in (calls[0].init.headers as Record<string, string>)).toBe(false);
+  });
+
+  it('reads the token per call, so a rotated env var is picked up without a restart', async () => {
+    process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 'first';
+    const { impl, calls } = recordingFetch([
+      sseResponse(okMessage('x')),
+      sseResponse(okMessage('y')),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    await client.convertToMarkdown({ uri: 'u' });
+    process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 'second';
+    await client.convertToMarkdown({ uri: 'u' });
+
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer first');
+    expect((calls[1].init.headers as Record<string, string>).Authorization).toBe('Bearer second');
+  });
+});

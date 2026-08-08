@@ -26,6 +26,17 @@ export const DEFAULT_PROXY_TIMEOUT_MS = 60_000;
 export const PROXY_TOOL_NAME = 'convert_to_markdown';
 
 /**
+ * Environment variable holding the proxy's bearer token, when it wants one.
+ *
+ * Read here rather than passed in because `AttachmentProxyOptions` is a fixed
+ * contract this section shares with its siblings, and a token is not a
+ * behaviour the caller chooses -- it is a fact about the endpoint. Read per
+ * call rather than in the constructor so a rotated token takes effect without
+ * a restart, and so a test can set it without rebuilding the client.
+ */
+export const PROXY_TOKEN_ENV = 'MS365_MCP_ATTACHMENT_PROXY_TOKEN';
+
+/**
  * The proxy-origin codes this server promises its own callers, from the spec's
  * error table. Everything else the proxy says is real but is not ours to
  * promise — a generic contract cannot adopt one implementation's vocabulary —
@@ -277,13 +288,18 @@ export class AttachmentProxyClient {
   }
 
   private buildHeaders(): Record<string, string> {
-    return {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       // Both, and not negotiable: a Streamable HTTP endpoint answers 406 to a
       // POST that does not accept the streaming form, because it chooses the
       // framing per response.
       Accept: 'application/json, text/event-stream',
     };
+    const token = process.env[PROXY_TOKEN_ENV];
+    // Empty-string-is-absent on purpose: an unset compose variable interpolates
+    // to "", and `Bearer ` is a credential shape a server may log as one.
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
   }
 
   async convertToMarkdown(req: ConvertRequest): Promise<ConvertResult> {
