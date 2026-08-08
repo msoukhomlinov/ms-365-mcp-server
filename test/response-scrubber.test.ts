@@ -238,3 +238,54 @@ describe('scrubByteFields: the base64 shape rule', () => {
     expect(result.stripped).toEqual([]);
   });
 });
+
+describe('scrubByteFields: hostile shapes', () => {
+  function nest(depth: number, leaf: unknown): unknown {
+    let node: unknown = leaf;
+    for (let i = 0; i < depth; i++) node = { child: node };
+    return node;
+  }
+
+  it('strips a payload nested within the depth cap', () => {
+    const result = scrubByteFields(nest(60, { contentBytes: 'QUJDRA==' }));
+    expect(result.stripped).toHaveLength(1);
+    expect(result.stripped[0].field).toBe('contentBytes');
+    expect(result.stripped[0].bytes).toBe(4);
+  });
+
+  it('replaces a subtree past the depth cap instead of recursing into it', () => {
+    const result = scrubByteFields(nest(200, { contentBytes: 'QUJDRA==' }));
+    expect(JSON.stringify(result.value)).toContain(
+      '<stripped: nesting deeper than 64 levels, use read-document>'
+    );
+    // Fails closed: the payload was never reached, and it never reaches a model.
+    expect(JSON.stringify(result.value)).not.toContain('QUJDRA==');
+    expect(result.stripped).toEqual([
+      { path: `$${'.child'.repeat(65)}`, field: 'child', bytes: 0 },
+    ]);
+  });
+
+  it('terminates on a cyclic object', () => {
+    const cyclic: Record<string, unknown> = { name: 'loop' };
+    cyclic.self = cyclic;
+    const result = scrubByteFields(cyclic);
+    // Both keys of the object reached at depth 65 are capped, in key order.
+    expect(result.stripped.map((s) => s.field)).toEqual(['name', 'self']);
+    expect(result.stripped.every((s) => s.bytes === 0)).toBe(true);
+    expect(JSON.stringify(result.value)).toContain('nesting deeper than 64 levels');
+  });
+
+  it('passes non-JSON values through untouched', () => {
+    const when = new Date('2026-08-08T00:00:00.000Z');
+    const input = { when, count: 3, ok: true, missing: null };
+    const result = scrubByteFields(input);
+    expect(result.value).toBe(input);
+    expect((result.value as { when: Date }).when).toBe(when);
+  });
+
+  it('scrubs a bare string handed in at the root', () => {
+    const result = scrubByteFields(base64OfLength(8192));
+    expect(result.value).toBe('<stripped: 6144 bytes, use read-document>');
+    expect(result.stripped).toEqual([{ path: '$', field: '$', bytes: 6144 }]);
+  });
+});

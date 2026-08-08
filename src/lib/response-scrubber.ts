@@ -38,6 +38,18 @@ export const BASE64_STRIP_THRESHOLD = 4096;
 const BYTE_FIELD_NAMES = new Set(['contentBytes']);
 
 /**
+ * How deep the walk goes before it stops descending and replaces the subtree.
+ *
+ * Two jobs in one mechanism. Real Graph payloads nest ~10 deep, so 64 is far
+ * past anything legitimate; hostile or malformed input that nests deeper is
+ * replaced rather than recursed into, which keeps the walk off the stack limit.
+ * A cyclic object -- `a.self = a` -- terminates here too, so cycles need no
+ * separate bookkeeping. Both cases fail *closed*: the subtree is replaced by a
+ * marker and reported, never passed through unexamined.
+ */
+const MAX_DEPTH = 64;
+
+/**
  * Standard base64, whole string. Not base64url: Graph's `contentBytes` is
  * standard, and `-`/`_` are what most identifiers and tokens in these payloads
  * are built from, so accepting them would widen rule 2 towards exactly the
@@ -55,7 +67,7 @@ export interface StrippedField {
   path: string;
   /** Just the key, e.g. `contentBytes` -- the part worth grepping logs for. */
   field: string;
-  /** Decoded size of the payload in bytes. */
+  /** Decoded size of the payload in bytes, or 0 for a depth-capped subtree. */
   bytes: number;
 }
 
@@ -69,6 +81,10 @@ export interface ScrubResult {
 /** What the model sees in place of the bytes. Names the tool that replaces it. */
 function byteMarker(bytes: number): string {
   return `<stripped: ${bytes} bytes, use read-document>`;
+}
+
+function depthMarker(): string {
+  return `<stripped: nesting deeper than ${MAX_DEPTH} levels, use read-document>`;
 }
 
 /**
@@ -127,7 +143,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function scrub(node: unknown, path: string, field: string, stripped: StrippedField[]): unknown {
+function scrub(
+  node: unknown,
+  path: string,
+  field: string,
+  stripped: StrippedField[],
+  depth: number
+): unknown {
+  if (depth > MAX_DEPTH) {
+    stripped.push({ path, field, bytes: 0 });
+    return depthMarker();
+  }
+
   if (typeof node === 'string') {
     const bytes = payloadBytes(field, node);
     if (bytes === null) return node;
@@ -138,7 +165,7 @@ function scrub(node: unknown, path: string, field: string, stripped: StrippedFie
   if (Array.isArray(node)) {
     let changed = false;
     const out = node.map((item, index) => {
-      const next = scrub(item, `${path}[${index}]`, String(index), stripped);
+      const next = scrub(item, `${path}[${index}]`, String(index), stripped, depth + 1);
       if (next !== item) changed = true;
       return next;
     });
@@ -149,7 +176,7 @@ function scrub(node: unknown, path: string, field: string, stripped: StrippedFie
     let changed = false;
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(node)) {
-      const next = scrub(item, `${path}.${key}`, key, stripped);
+      const next = scrub(item, `${path}.${key}`, key, stripped, depth + 1);
       if (next !== item) changed = true;
       out[key] = next;
     }
@@ -171,6 +198,6 @@ function scrub(node: unknown, path: string, field: string, stripped: StrippedFie
  */
 export function scrubByteFields(value: unknown): ScrubResult {
   const stripped: StrippedField[] = [];
-  const scrubbed = scrub(value, '$', '$', stripped);
+  const scrubbed = scrub(value, '$', '$', stripped, 0);
   return { value: scrubbed, stripped };
 }
