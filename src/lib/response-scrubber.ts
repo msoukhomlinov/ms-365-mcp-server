@@ -95,6 +95,16 @@ function scrub(node: unknown, path: string, field: string, stripped: StrippedFie
     return byteMarker(bytes);
   }
 
+  if (Array.isArray(node)) {
+    let changed = false;
+    const out = node.map((item, index) => {
+      const next = scrub(item, `${path}[${index}]`, String(index), stripped);
+      if (next !== item) changed = true;
+      return next;
+    });
+    return changed ? out : node;
+  }
+
   if (isPlainObject(node)) {
     let changed = false;
     const out: Record<string, unknown> = {};
@@ -107,7 +117,7 @@ function scrub(node: unknown, path: string, field: string, stripped: StrippedFie
   }
 
   // Numbers, booleans, null, undefined, and anything that is not a plain
-  // object (a Date, a class instance) are returned as they came.
+  // object or array (a Date, a class instance) are returned as they came.
   return node;
 }
 

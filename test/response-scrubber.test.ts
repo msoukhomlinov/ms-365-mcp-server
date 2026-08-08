@@ -46,3 +46,63 @@ describe('scrubByteFields: the contentBytes name rule', () => {
     expect(result.stripped).toEqual([{ path: '$.contentBytes', field: 'contentBytes', bytes: 11 }]);
   });
 });
+
+describe('scrubByteFields: nested objects and arrays', () => {
+  it('strips through nested object depth', () => {
+    const result = scrubByteFields({
+      value: { message: { attachment: { name: 'a.pdf', contentBytes: 'QUJDRA==' } } },
+    });
+    expect(result.value).toEqual({
+      value: {
+        message: {
+          attachment: { name: 'a.pdf', contentBytes: '<stripped: 4 bytes, use read-document>' },
+        },
+      },
+    });
+    expect(result.stripped).toEqual([
+      { path: '$.value.message.attachment.contentBytes', field: 'contentBytes', bytes: 4 },
+    ]);
+  });
+
+  it('strips every attachment in an array of attachments', () => {
+    const result = scrubByteFields({
+      value: [
+        { id: 'm1', attachments: [{ contentBytes: 'QUJDRA==' }, { contentBytes: 'RUZHSA==' }] },
+        { id: 'm2', attachments: [{ contentBytes: 'SUpLTA==' }] },
+      ],
+    });
+    expect(result.value).toEqual({
+      value: [
+        {
+          id: 'm1',
+          attachments: [
+            { contentBytes: '<stripped: 4 bytes, use read-document>' },
+            { contentBytes: '<stripped: 4 bytes, use read-document>' },
+          ],
+        },
+        { id: 'm2', attachments: [{ contentBytes: '<stripped: 4 bytes, use read-document>' }] },
+      ],
+    });
+  });
+
+  it('reports a path per strip that locates it inside the response', () => {
+    const result = scrubByteFields({
+      value: [
+        { id: 'm1', attachments: [{ contentBytes: 'QUJDRA==' }, { contentBytes: 'RUZHSA==' }] },
+        { id: 'm2', attachments: [{ contentBytes: 'SUpLTA==' }] },
+      ],
+    });
+    expect(result.stripped).toEqual([
+      { path: '$.value[0].attachments[0].contentBytes', field: 'contentBytes', bytes: 4 },
+      { path: '$.value[0].attachments[1].contentBytes', field: 'contentBytes', bytes: 4 },
+      { path: '$.value[1].attachments[0].contentBytes', field: 'contentBytes', bytes: 4 },
+    ]);
+  });
+
+  it('keeps untouched siblings by reference while replacing the payload', () => {
+    const clean = { id: 'm2', subject: 'no attachments' };
+    const input = { value: [{ id: 'm1', contentBytes: 'QUJDRA==' }, clean] };
+    const result = scrubByteFields(input) as { value: { value: unknown[] } };
+    expect(result.value.value[1]).toBe(clean);
+  });
+});
