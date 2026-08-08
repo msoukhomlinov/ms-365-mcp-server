@@ -1,3 +1,5 @@
+import logger from '../logger.js';
+
 /**
  * One stateless JSON-RPC call to a document-conversion proxy.
  *
@@ -247,6 +249,20 @@ export function interpretJsonRpcMessage(message: unknown, status: number): Conve
   return { ok: true, markdown };
 }
 
+/**
+ * The most specific sentence available about why a fetch failed.
+ *
+ * Node's fetch reports every transport failure as a bare `TypeError: fetch
+ * failed` and puts the real reason -- ECONNREFUSED, EAI_AGAIN, a TLS error --
+ * on `cause`. Reporting only the outer message tells an operator nothing about
+ * whether the proxy is down, misspelled, or unresolvable.
+ */
+function describeTransportFailure(error: unknown): string {
+  const base = error instanceof Error ? error.message : String(error);
+  const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+  return cause instanceof Error ? `${base}: ${cause.message}` : base;
+}
+
 export class AttachmentProxyClient {
   private readonly url: string;
   private readonly timeoutMs: number;
@@ -280,13 +296,47 @@ export class AttachmentProxyClient {
       params: { name: PROXY_TOOL_NAME, arguments: toWireArguments(req) },
     });
 
-    const response = await this.fetchImpl(this.url, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body,
-    });
-    const contentType = response.headers.get('content-type');
-    const text = await response.text();
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    let status: number;
+    let contentType: string | null;
+    let text: string;
+    try {
+      const response = await this.fetchImpl(this.url, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body,
+        signal: controller.signal,
+      });
+      status = response.status;
+      contentType = response.headers.get('content-type');
+      // Inside the guarded block on purpose. In SSE framing the body *is* the
+      // conversion: headers arrive immediately and the data frame arrives when
+      // the document is done, so a timeout that ended at the headers would
+      // never fire on the failure it exists for.
+      text = await response.text();
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      const aborted = error instanceof Error && error.name === 'AbortError';
+      const reason = aborted
+        ? `no response within ${this.timeoutMs} ms`
+        : describeTransportFailure(error);
+      // Warn, with the url and the elapsed time. `/healthz` on a converter is
+      // liveness and never consults its worker pool, so a wedged proxy reports
+      // healthy; this line is how that becomes visible in `docker logs`
+      // instead of only in tool output a model read once.
+      logger.warn(`[ATTACHMENT PROXY] unreachable: ${this.url} after ${elapsedMs} ms — ${reason}`);
+      return {
+        ok: false,
+        code: 'proxy_unreachable',
+        message: `the document proxy at ${this.url} did not answer: ${reason}`,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+
     let message: unknown;
     try {
       message = decodeJsonRpcBody(contentType, text);
@@ -297,9 +347,9 @@ export class AttachmentProxyClient {
       return {
         ok: false,
         code: 'proxy_error',
-        message: `the proxy answered ${response.status} with a body this client could not read as JSON-RPC`,
+        message: `the proxy answered ${status} with a body this client could not read as JSON-RPC`,
       };
     }
-    return interpretJsonRpcMessage(message, response.status);
+    return interpretJsonRpcMessage(message, status);
   }
 }

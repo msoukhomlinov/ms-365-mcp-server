@@ -283,3 +283,166 @@ describe('AttachmentProxyClient error mapping', () => {
     });
   });
 });
+
+import { afterEach } from 'vitest';
+import logger from '../src/logger.js';
+
+describe('AttachmentProxyClient transport failures', () => {
+  afterEach(() => {
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  it('codes a connection refusal as proxy_unreachable instead of throwing', async () => {
+    // Exactly what undici raises when nothing is listening: a TypeError whose
+    // cause carries the errno. The client must survive both layers.
+    const refused = new TypeError('fetch failed');
+    (refused as { cause?: unknown }).cause = Object.assign(
+      new Error('connect ECONNREFUSED 192.168.128.9:8080'),
+      { code: 'ECONNREFUSED' }
+    );
+    const impl = (async () => {
+      throw refused;
+    }) as typeof fetch;
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.code).toBe('proxy_unreachable');
+    expect(result.message).toContain('ECONNREFUSED');
+  });
+
+  it('logs a proxy_unreachable at warn level with the url and the elapsed time', async () => {
+    const impl = (async () => {
+      throw new TypeError('fetch failed');
+    }) as typeof fetch;
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    await client.convertToMarkdown({ uri: 'u' });
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const line = String(vi.mocked(logger.warn).mock.calls[0][0]);
+    expect(line).toContain('http://proxy:8080/mcp');
+    expect(line).toMatch(/\d+ ms/);
+  });
+
+  it('gives up at the timeout and codes it proxy_unreachable', async () => {
+    vi.useFakeTimers();
+    try {
+      // A proxy that accepted the connection and then went quiet -- the wedged
+      // worker case. The mock aborts when the client's signal fires, which is
+      // the only thing that can end this promise.
+      // eslint-disable-next-line no-undef
+      const impl = ((_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        })) as typeof fetch;
+      const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+      const pending = client.convertToMarkdown({ uri: 'u' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await pending;
+
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.code).toBe('proxy_unreachable');
+      expect(result.message).toContain('60000 ms');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('honours an explicit timeoutMs over the 60 s default', async () => {
+    vi.useFakeTimers();
+    try {
+      // eslint-disable-next-line no-undef
+      const impl = ((_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        })) as typeof fetch;
+      const client = new AttachmentProxyClient({
+        url: 'http://proxy:8080/mcp',
+        timeoutMs: 1500,
+        fetchImpl: impl,
+      });
+
+      const pending = client.convertToMarkdown({ uri: 'u' });
+      await vi.advanceTimersByTimeAsync(1500);
+
+      expect((await pending).ok).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not leave the timer armed after a fast success', async () => {
+    vi.useFakeTimers();
+    try {
+      const { impl } = recordingFetch([sseResponse(okMessage('# quick'))]);
+      const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+      expect(await client.convertToMarkdown({ uri: 'u' })).toEqual({
+        ok: true,
+        markdown: '# quick',
+      });
+      // A timer still pending here would keep a 60 s handle alive per call.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out on a stalled body even though the response headers arrived immediately', async () => {
+    // The property the whole task exists for: under SSE the body IS the
+    // conversion, so a client that only bounds the time-to-headers would
+    // never observe this failure. The mock resolves the outer fetch() call
+    // right away with a real, headers-bearing Response, then stalls its body
+    // read (`.text()`) until the abort fires -- proving the timer's abort
+    // signal reaches the body consumption step, not merely the connect step.
+    vi.useFakeTimers();
+    try {
+      let bodyAborted = false;
+      // eslint-disable-next-line no-undef
+      const impl = ((_input: RequestInfo | URL, init?: RequestInit) => {
+        const response = new Response('', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        });
+        const stalledText = new Promise<string>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            bodyAborted = true;
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        });
+        response.text = () => stalledText;
+        return Promise.resolve(response);
+      }) as typeof fetch;
+      const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+      const pending = client.convertToMarkdown({ uri: 'u' });
+      // The headers resolve on the same microtask turn; nothing here waits on
+      // real time, so this assertion would pass even with a headers-only
+      // timeout. It's the assertions after the advance that distinguish them.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await pending;
+
+      expect(bodyAborted).toBe(true);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.code).toBe('proxy_unreachable');
+      expect(result.message).toContain('60000 ms');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
