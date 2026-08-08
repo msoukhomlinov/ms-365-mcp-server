@@ -10,7 +10,12 @@
  * So: a real HTTP proxy that really dials the URL it is given, a real ticket
  * minted by the running server's own store, and a real redemption through the
  * real :3001 listener. The only stub is Graph's byte stream, which is the one
- * thing this test cannot own.
+ * thing this test cannot own -- and even that stub's PRIMARY fixture is
+ * `contentLength: null`, matching what Graph actually sends for a `/$value`
+ * fetch, so the null-length branch through `parseContentLengthHeader` and the
+ * attachment route's header guard is the one this test exercises by default,
+ * not a truthful-length shortcut around it. A secondary test covers the
+ * truthful-length case too, since Graph is not forbidden from ever sending one.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -64,7 +69,10 @@ function fakeAuthManager(): AuthManager {
 /**
  * A minimal stateless MCP proxy: one POST, no session handshake, and a
  * convert_to_markdown that ACTUALLY FETCHES the uri it was handed. Records every
- * uri and every pull-back status so the test can assert the loop closed.
+ * uri, every pull-back status and every pull-back `content-length` header so
+ * the test can assert the loop closed AND that the header the attachment route
+ * declared was never a lie -- `content-length: 0` on a non-empty body being
+ * the exact defect this whole feature exists to have caught.
  *
  * The response is shaped exactly like the real contract
  * (`AttachmentProxyClient.interpretJsonRpcMessage`, see test/attachment-proxy.test.ts's
@@ -75,7 +83,12 @@ function fakeAuthManager(): AuthManager {
  */
 function startFakeProxy(
   port: number,
-  seen: { uris: string[]; statuses: number[]; auth: (string | undefined)[] }
+  seen: {
+    uris: string[];
+    statuses: number[];
+    auth: (string | undefined)[];
+    contentLengths: (string | null)[];
+  }
 ): Promise<Server> {
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const chunks: Buffer[] = [];
@@ -91,6 +104,7 @@ function startFakeProxy(
 
     const pulled = await fetch(uri);
     seen.statuses.push(pulled.status);
+    seen.contentLengths.push(pulled.headers.get('content-length'));
     const text = await pulled.text();
     const markdown = `# report.pdf\n\n${text}\n`;
     const payload = { markdown };
@@ -123,21 +137,33 @@ describe('--attachment-proxy end to end', () => {
   const savedEnv = { ...process.env };
   let started: MicrosoftGraphServer[] = [];
   let proxy: Server | null = null;
-  let seen: { uris: string[]; statuses: number[]; auth: (string | undefined)[] };
+  let seen: {
+    uris: string[];
+    statuses: number[];
+    auth: (string | undefined)[];
+    contentLengths: (string | null)[];
+  };
   let mcpPort: number;
   let attachmentPort: number;
   let proxyPort: number;
 
-  beforeEach(async () => {
-    vi.clearAllMocks();
-    seen = { uris: [], statuses: [], auth: [] };
-    [mcpPort, attachmentPort, proxyPort] = await reserveFreePorts(3);
-
-    process.env.MS365_MCP_RATE_LIMIT_DISABLED = 'true';
-    process.env.MS365_MCP_ATTACHMENT_URL_KEY = 'shared-hmac-key';
-    process.env.MS365_MCP_ATTACHMENT_URL_BASE = `http://127.0.0.1:${attachmentPort}`;
-    process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 'proxy-bearer-token';
-
+  /**
+   * Re-stubs `downloadStream` with a given `contentLength`. Exposed as a
+   * function, not inlined, so a test can call it a second time to swap the
+   * fixture mid-test (see the "truthful length" case below) without touching
+   * anything else `beforeEach` set up.
+   *
+   * `null` is the DEFAULT and the one `beforeEach` installs on its own,
+   * because it is what real Graph actually sends for a `/$value` attachment
+   * fetch (see the docstring on `parseContentLengthHeader`,
+   * src/graph-client.ts:50-61: Graph does not send `content-length` on this
+   * endpoint at all). A fixture that always hands back a truthful positive
+   * number -- as this file originally did -- can never exercise the null
+   * branch that `parseContentLengthHeader` and the route's header guard
+   * (src/attachment-route.ts:120-126) exist for, which is exactly the
+   * 2026-08-07 shape recurring inside the test meant to catch it.
+   */
+  function stubDownloadStream(contentLength: number | null): void {
     vi.spyOn(GraphClient.prototype, 'downloadStream').mockImplementation(async () => ({
       body: new ReadableStream({
         start(controller) {
@@ -146,9 +172,22 @@ describe('--attachment-proxy end to end', () => {
         },
       }) as never,
       contentType: 'application/pdf',
-      contentLength: DOCUMENT_BYTES.length,
+      contentLength,
       contentDisposition: 'attachment; filename="report.pdf"',
     }));
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    seen = { uris: [], statuses: [], auth: [], contentLengths: [] };
+    [mcpPort, attachmentPort, proxyPort] = await reserveFreePorts(3);
+
+    process.env.MS365_MCP_RATE_LIMIT_DISABLED = 'true';
+    process.env.MS365_MCP_ATTACHMENT_URL_KEY = 'shared-hmac-key';
+    process.env.MS365_MCP_ATTACHMENT_URL_BASE = `http://127.0.0.1:${attachmentPort}`;
+    process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 'proxy-bearer-token';
+
+    stubDownloadStream(null);
 
     proxy = await startFakeProxy(proxyPort, seen);
 
@@ -204,7 +243,10 @@ describe('--attachment-proxy end to end', () => {
     return client;
   }
 
-  it('turns a Graph attachment path into markdown, through a real proxy and a real :3001 fetch', async () => {
+  it('turns a Graph attachment path into markdown, through a real proxy and a real :3001 fetch, with the length Graph actually sends', async () => {
+    // downloadStream is stubbed with contentLength: null by beforeEach -- the
+    // normal production shape for a /$value fetch, where Graph never sends a
+    // content-length header at all.
     const client = await agent();
     const result = (await client.callTool({
       name: 'read-document',
@@ -230,12 +272,41 @@ describe('--attachment-proxy end to end', () => {
     // The bearer credential rode along.
     expect(seen.auth[0]).toBe('Bearer proxy-bearer-token');
 
+    // The load-bearing assertion for this fixture: with no content-length
+    // from Graph, the route must OMIT the header rather than declare a lying
+    // one. It must never, under any circumstance, be the literal string '0'
+    // on a body that is not empty -- that is the exact 2026-08-07 defect.
+    expect(seen.contentLengths[0]).toBeNull();
+    expect(seen.contentLengths[0]).not.toBe('0');
+
     // Neither the minted ticket id nor the URL it rode in on leaked into the
     // tool's own output -- Task 14's redactAttachmentSecrets, proved end to end.
     const ticketId = uri.searchParams.get('t') ?? '';
     expect(result.content[0].text).not.toContain(ticketId);
     expect(result.content[0].text).not.toContain(seen.uris[0]);
     expect(result.content[0].text).not.toContain(String(attachmentPort));
+  });
+
+  it('turns a Graph attachment path into markdown when Graph does state a truthful length', async () => {
+    // The secondary fixture: Graph is not contractually forbidden from ever
+    // sending content-length, so the route's guard must also pass a truthful
+    // positive length through unchanged rather than only ever omitting it.
+    stubDownloadStream(DOCUMENT_BYTES.length);
+
+    const client = await agent();
+    const result = (await client.callTool({
+      name: 'read-document',
+      arguments: { target: MAIL_ATTACHMENT },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe(`# report.pdf\n\n${DOCUMENT_BYTES}\n`);
+    expect(seen.statuses).toEqual([200]);
+
+    // The declared length matches the real byte count exactly, and is never
+    // the empty-body lie.
+    expect(seen.contentLengths[0]).toBe(String(DOCUMENT_BYTES.length));
+    expect(seen.contentLengths[0]).not.toBe('0');
   });
 
   it('does not register the byte tools on the same server', async () => {
