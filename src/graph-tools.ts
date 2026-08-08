@@ -1616,6 +1616,45 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+/**
+ * Navigation properties whose expansion inlines base64 content into the parent
+ * resource.
+ *
+ * Property NAMES, not (tool, property) pairs. The same navigation property is
+ * expandable from every tool that reaches the same entity -- get-mail-message,
+ * list-mail-messages, the delta tools, graph-batch, execute-tool -- so a pair
+ * list would have to be re-derived every time an endpoint is added, and would be
+ * wrong the first time one was missed.
+ */
+const BYTE_INLINING_NAV_PROPERTIES = new Set(['attachments', 'hostedcontents']);
+
+/**
+ * The offending `$expand` entry, or null.
+ *
+ * Handles every spelling a caller can produce: `expand` and `$expand`, a string
+ * or an array of them, a comma-separated list inside one string, an OData nested
+ * option suffix (`attachments($select=name)`), a type-cast path segment
+ * (`attachments/microsoft.graph.fileAttachment`), and any casing.
+ *
+ * Splitting on `,` also splits inside a nested option list, which is fine for
+ * detection: the head token of `attachments($select=id,name)` is always in the
+ * first fragment, so a false negative cannot arise from the split.
+ */
+export function findByteInliningExpand(params: Record<string, unknown>): string | null {
+  const raw = params.$expand ?? params.expand;
+  if (raw === undefined || raw === null) return null;
+  const entries = Array.isArray(raw) ? raw : [raw];
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue;
+    for (const piece of entry.split(',')) {
+      const trimmed = piece.trim();
+      const head = trimmed.split('(')[0].split('/')[0].trim().toLowerCase();
+      if (BYTE_INLINING_NAV_PROPERTIES.has(head)) return trimmed;
+    }
+  }
+  return null;
+}
+
 async function executeGraphTool(
   tool: (typeof api.endpoints)[0],
   config: EndpointConfig | undefined,
@@ -1649,6 +1688,39 @@ async function executeGraphTool(
       ],
       isError: true,
     };
+  }
+
+  // Refused once, here, because this is where both paths land: the handler
+  // registerGraphTools installs on every tool, and discovery's execute-tool.
+  // Guarding the schema instead would cover 38 tools one at a time and miss the
+  // 39th.
+  if (getAttachmentProxy()) {
+    const blocked = findByteInliningExpand(params);
+    if (blocked) {
+      logger.warn(
+        `Refusing ${tool.alias}: expand "${blocked}" would inline attachment bytes (--attachment-proxy)`
+      );
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'expand_not_allowed',
+              tool: tool.alias,
+              expand: blocked,
+              message:
+                `Expanding "${blocked}" inlines the raw attachment bytes (base64 contentBytes) into this ` +
+                `response, and $select does not suppress them. This server runs with --attachment-proxy, where ` +
+                `no tool returns raw bytes. Call this tool again WITHOUT that expand value to get the message ` +
+                `or event itself; use list-mail-attachments (or the matching list tool) for each attachment's ` +
+                `id, name, contentType and size; and use read-document with the attachment's $value path to ` +
+                `read its content as markdown.`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
   const requestId = randomUUID();
