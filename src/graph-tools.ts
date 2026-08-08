@@ -1622,34 +1622,114 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
  *
  * Property NAMES, not (tool, property) pairs. The same navigation property is
  * expandable from every tool that reaches the same entity -- get-mail-message,
- * list-mail-messages, the delta tools, graph-batch, execute-tool -- so a pair
- * list would have to be re-derived every time an endpoint is added, and would be
- * wrong the first time one was missed.
+ * list-mail-messages, the delta tools, execute-tool -- so a pair list would have
+ * to be re-derived every time an endpoint is added, and would be wrong the first
+ * time one was missed.
+ *
+ * Known gap, left open for a scoped follow-up rather than widened here without
+ * its own review: `graph-batch` (POST `/$batch`) accepts arbitrary sub-request
+ * URLs, e.g. `{ url: "/me/messages/{id}?$expand=attachments" }`, and this guard
+ * only inspects the top-level `expand`/`$expand` parameters `findByteInliningExpand`
+ * is handed -- it does not parse batch sub-request URLs, so a batch payload can
+ * smuggle the same byte-inlining expand this guard exists to keep out.
+ * Suppressing a general-purpose batch tool is a capability decision, not a
+ * class-rule fix; see the identical gap disclosed on `isProxySuppressedGraphTool`
+ * above.
  */
 const BYTE_INLINING_NAV_PROPERTIES = new Set(['attachments', 'hostedcontents']);
 
 /**
- * The offending `$expand` entry, or null.
+ * Every occurrence of `expand=` (with or without a leading `$`, any casing)
+ * inside `text`, together with the value that follows it up to the matching
+ * unbalanced `)` or the end of the string.
  *
- * Handles every spelling a caller can produce: `expand` and `$expand`, a string
- * or an array of them, a comma-separated list inside one string, an OData nested
- * option suffix (`attachments($select=name)`), a type-cast path segment
- * (`attachments/microsoft.graph.fileAttachment`), and any casing.
+ * OData nests a sub-resource's own query options inside `(...)` after the
+ * navigation property, e.g. `instances($expand=attachments)` for a recurring
+ * event's expanded instances -- a real Graph pattern, and the reason the
+ * top-level head-token check in `findByteInliningExpand` alone is not enough:
+ * its head is `instances`, so `attachments` living inside the parens is never
+ * seen by a check that only looks before the first `(`.
+ *
+ * A manual balanced scan rather than a single regex, so that a captured value
+ * which itself contains `(...)` (deeper nesting, e.g. a doubly-nested
+ * `$expand`) does not get truncated at the first `)` -- that inner paren is
+ * consumed as part of the value, and the scan only stops at the `)` that
+ * closes the *enclosing* group. Combined with the recursive call in
+ * `scanForByteInliningHead`, this is what makes detection depth-independent:
+ * each extracted value is fed back through the same scan, which finds and
+ * extracts any `expand=` nested inside it, and so on.
+ */
+function extractNestedExpandValues(text: string): string[] {
+  const values: string[] = [];
+  const pattern = /\$?expand\s*=\s*/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    let depth = 0;
+    let end = start;
+    while (end < text.length) {
+      const ch = text[end];
+      if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        if (depth === 0) break;
+        depth--;
+      }
+      end++;
+    }
+    values.push(text.slice(start, end));
+  }
+  return values;
+}
+
+/**
+ * The offending token within one `expand` entry, or null.
+ *
+ * Handles every spelling a caller can produce: a comma-separated list inside
+ * one string, an OData nested option suffix (`attachments($select=name)`), a
+ * type-cast path segment (`attachments/microsoft.graph.fileAttachment`), any
+ * casing, surrounding whitespace, and -- via `extractNestedExpandValues` --
+ * a `$expand` nested inside another property's parenthesised options, at any
+ * nesting depth.
  *
  * Splitting on `,` also splits inside a nested option list, which is fine for
  * detection: the head token of `attachments($select=id,name)` is always in the
  * first fragment, so a false negative cannot arise from the split.
  */
+function scanForByteInliningHead(text: string): string | null {
+  for (const piece of text.split(',')) {
+    const trimmed = piece.trim();
+    if (!trimmed) continue;
+    const head = trimmed.split('(')[0].split('/')[0].trim().toLowerCase();
+    if (BYTE_INLINING_NAV_PROPERTIES.has(head)) return trimmed;
+  }
+  for (const nested of extractNestedExpandValues(text)) {
+    const found = scanForByteInliningHead(nested);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * The offending `$expand` entry, or null.
+ *
+ * Reads `$expand` and `expand` independently -- never with `??` -- and scans
+ * every entry found under EITHER key. `.passthrough()` on every tool's input
+ * schema (and `execute-tool`'s `z.record(z.any())` parameters) means a caller
+ * can hand this function both keys at once, e.g. `{ $expand: [], expand:
+ * ['attachments'] }`; picking one key over the other would let a present but
+ * empty `$expand` mask a harmful `expand`, or vice versa.
+ */
 export function findByteInliningExpand(params: Record<string, unknown>): string | null {
-  const raw = params.$expand ?? params.expand;
-  if (raw === undefined || raw === null) return null;
-  const entries = Array.isArray(raw) ? raw : [raw];
-  for (const entry of entries) {
-    if (typeof entry !== 'string') continue;
-    for (const piece of entry.split(',')) {
-      const trimmed = piece.trim();
-      const head = trimmed.split('(')[0].split('/')[0].trim().toLowerCase();
-      if (BYTE_INLINING_NAV_PROPERTIES.has(head)) return trimmed;
+  const rawValues = [params.$expand, params.expand].filter(
+    (raw) => raw !== undefined && raw !== null
+  );
+  for (const raw of rawValues) {
+    const entries = Array.isArray(raw) ? raw : [raw];
+    for (const entry of entries) {
+      if (typeof entry !== 'string') continue;
+      const found = scanForByteInliningHead(entry);
+      if (found) return found;
     }
   }
   return null;

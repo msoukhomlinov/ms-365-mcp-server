@@ -63,6 +63,54 @@ describe('findByteInliningExpand', () => {
     // A folder or a property that merely CONTAINS the word.
     expect(findByteInliningExpand({ expand: ['attachmentSessions'] })).toBeNull();
   });
+
+  it('checks $expand and expand independently, so a present-but-empty one cannot mask the other', () => {
+    // `.passthrough()` on every tool's input schema (and execute-tool's
+    // `z.record(z.any())`) means a caller can hand both spellings at once.
+    // `params.$expand ?? params.expand` would pick the empty array and never
+    // look at `expand`, letting `['attachments']` through unseen.
+    expect(findByteInliningExpand({ $expand: [], expand: ['attachments'] })).toBe('attachments');
+    expect(findByteInliningExpand({ $expand: ['attachments'], expand: [] })).toBe('attachments');
+    expect(findByteInliningExpand({ $expand: ['organizer'], expand: ['attachments'] })).toBe(
+      'attachments'
+    );
+  });
+
+  it("finds $expand nested inside another property's parenthesised options, at any depth", () => {
+    // A real Graph pattern: a recurring event's expanded instances, each
+    // expanding their own attachments. The outer head token is "instances",
+    // so a check that only looks before the first "(" never sees it.
+    expect(findByteInliningExpand({ expand: ['instances($expand=attachments)'] })).toBe(
+      'attachments'
+    );
+    // Two levels of nesting -- detection must not be hardcoded to depth 1.
+    expect(findByteInliningExpand({ expand: ['a($expand=b($expand=attachments))'] })).toBe(
+      'attachments'
+    );
+    // A nested expand that is itself harmless stays harmless.
+    expect(findByteInliningExpand({ expand: ['instances($expand=organizer)'] })).toBeNull();
+  });
+
+  it('does NOT see $expand smuggled inside a graph-batch sub-request URL -- a documented, accepted gap', () => {
+    // graph-batch's params carry no top-level `expand`/`$expand` key at all;
+    // the byte-inlining expand lives inside a sub-request URL string instead.
+    // This function only ever looks at params.$expand / params.expand, so it
+    // cannot see this without parsing every sub-request URL -- and the human
+    // has ruled that closing this is a capability decision (whether to
+    // restrict or parse a general-purpose batch tool), not a class-rule fix
+    // for this function. Pinned here so the gap is enforced, not just
+    // described in the docstring above BYTE_INLINING_NAV_PROPERTIES.
+    const batchParams = {
+      requests: [
+        {
+          id: '1',
+          method: 'GET',
+          url: '/me/messages/AAA?$expand=attachments',
+        },
+      ],
+    };
+    expect(findByteInliningExpand(batchParams)).toBeNull();
+  });
 });
 
 describe('the guard in executeGraphTool', () => {
