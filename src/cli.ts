@@ -52,6 +52,10 @@ program
     'Interface the --attachment-port listener binds (IPv4, IPv6 or hostname). Defaults to whatever --http bound, which with a wildcard --http means both ports answer on every interface — so a peer allowed onto the network to fetch attachments can also reach /mcp. Bind this to the address the fetcher uses and --http to a different one to make that unreachable rather than merely un-advertised. Requires --attachment-port. Equivalent env var: MS365_MCP_ATTACHMENT_HOST.'
   )
   .option(
+    '--attachment-proxy <url>',
+    "HTTP mode only. Route every document read through an MCP document-conversion proxy at this URL. Registers read-document (target, pages, offset, maxChars -> markdown) and UNREGISTERS download-bytes, get-download-url and get-mail-message-mime, so no tool on this server can return raw bytes to the model. Implies --enable-attachment-urls, because the proxy fetches the bytes back from this server's own attachment listener; MS365_MCP_ATTACHMENT_URL_BASE and MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) are therefore required too. The proxy must expose an MCP tool convert_to_markdown(uri, pages?, offset?, max_chars?) over stateless Streamable HTTP. Equivalent env var: MS365_MCP_ATTACHMENT_PROXY; bearer credential, if the proxy needs one, in MS365_MCP_ATTACHMENT_PROXY_TOKEN."
+  )
+  .option(
     '--enabled-tools <pattern>',
     'Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)'
   )
@@ -140,6 +144,15 @@ export interface CommandOptions {
    * halves of one decision are refused in one place.
    */
   attachmentHost?: string;
+  /**
+   * MCP endpoint of the document-conversion proxy. Validated in `parseArgs`
+   * rather than in `server.ts` -- unlike the port and host, this value is not
+   * "only meaningful together with" anything decided later: a string that is
+   * not an absolute http(s) URL is wrong on its own, and refusing it at parse
+   * time keeps the implication below (it turns --enable-attachment-urls on)
+   * from ever being applied on the strength of a typo.
+   */
+  attachmentProxy?: string;
   enabledTools?: string;
   allowedScopes?: string;
   extraScopes?: string;
@@ -169,6 +182,48 @@ export function parseArgs(): CommandOptions {
   program.parse();
   const options = program.opts();
 
+  // Resolved here, before --preset is expanded below, and that ordering is
+  // load-bearing rather than tidy. The preset pattern is computed FROM these
+  // flags, so a proxy URL that arrived through the environment has to be
+  // visible by the time that runs; otherwise `--preset mail,calendar,tasks,
+  // contacts` plus `MS365_MCP_ATTACHMENT_PROXY=...` produces a pattern with no
+  // get-download-url in it (the implication below never fires), leaving the
+  // minting machinery unreachable even though the URL base and key validated
+  // -- the exact "enabled, validated, unreachable" failure
+  // --enable-attachment-urls already shipped once.
+  if (
+    options.attachmentProxy === undefined &&
+    process.env.MS365_MCP_ATTACHMENT_PROXY !== undefined
+  ) {
+    options.attachmentProxy = process.env.MS365_MCP_ATTACHMENT_PROXY;
+  }
+
+  if (options.attachmentProxy !== undefined) {
+    const raw = String(options.attachmentProxy).trim();
+    const parsed = ((): URL | null => {
+      try {
+        return new URL(raw);
+      } catch {
+        return null;
+      }
+    })();
+    if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+      console.error(
+        `Error: --attachment-proxy / MS365_MCP_ATTACHMENT_PROXY must be an absolute http(s) URL ` +
+          `naming the proxy's MCP endpoint (e.g. http://docglean:8080/mcp). ` +
+          `Got ${JSON.stringify(raw)}.`
+      );
+      process.exit(1);
+    } else {
+      options.attachmentProxy = raw;
+      // Not a convenience. The proxy reads the document by fetching a signed,
+      // short-TTL URL this server mints and serves, so the minting machinery is
+      // how the proxy is fed -- making the operator type both flags would only
+      // create a configuration where one is set and the other is not.
+      options.enableAttachmentUrls = true;
+    }
+  }
+
   if (options.listPresets) {
     const presets = listPresets();
     console.log(JSON.stringify({ presets }, null, 2));
@@ -184,6 +239,7 @@ export function parseArgs(): CommandOptions {
       // tool to act through. See FLAG_UNIVERSAL_UTILITY_TOOLS in tool-categories.ts.
       options.enabledTools = getCombinedPresetPattern(presetNames, {
         attachmentUrls: Boolean(options.enableAttachmentUrls),
+        attachmentProxy: Boolean(options.attachmentProxy),
       });
 
       const requiresOrgMode = presetNames.some((preset: string) => presetRequiresOrgMode(preset));

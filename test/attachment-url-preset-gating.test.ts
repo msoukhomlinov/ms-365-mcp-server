@@ -33,6 +33,7 @@ import {
   getCategoryPattern,
   getCombinedPresetPattern,
   TOOL_CATEGORIES,
+  type PresetToolOptions,
 } from '../src/tool-categories.js';
 import {
   MINTABLE_TARGET_PATTERNS,
@@ -71,6 +72,10 @@ const NAMED_PRESETS = Object.keys(TOOL_CATEGORIES).filter((name) => name !== 'al
 const UTILITY_NAMES = UTILITY_TOOLS.map((utility) => utility.name);
 const ALL_TOOL_NAMES = [...new Set([...endpoints.map((e) => e.toolName), ...UTILITY_NAMES])];
 const FLAG_UNIVERSAL_NAMES = Object.keys(FLAG_UNIVERSAL_UTILITY_TOOLS);
+// Every distinct gate key any flag-universal tool answers to. Derived, not listed, for the same
+// reason FLAG_SERVED_PRESETS below is derived: a third gate must join this automatically, or the
+// loops that iterate it silently stop covering it.
+const ALL_GATE_KEYS = [...new Set(Object.values(FLAG_UNIVERSAL_UTILITY_TOOLS))].sort();
 
 /** Presets this preset filter would let through, over the whole tool set. */
 function toolsMatching(pattern: string | RegExp): string[] {
@@ -80,6 +85,18 @@ function toolsMatching(pattern: string | RegExp): string[] {
 
 function presetContains(preset: string, tool: string, attachmentUrls: boolean): boolean {
   const pattern = getCategoryPattern(preset, { attachmentUrls });
+  expect(pattern, `no pattern for preset ${preset}`).toBeDefined();
+  return new RegExp(pattern!.source, 'i').test(tool);
+}
+
+/**
+ * Preset membership under an explicit gate combination, rather than the single hard-coded
+ * `attachmentUrls` boolean `presetContains` takes. Lets a test ask "is this tool visible under
+ * exactly these gates" for ANY key in `PresetToolOptions`, not just the one that existed when
+ * `presetContains` was written.
+ */
+function presetContainsUnderGates(preset: string, tool: string, gates: PresetToolOptions): boolean {
+  const pattern = getCategoryPattern(preset, gates);
   expect(pattern, `no pattern for preset ${preset}`).toBeDefined();
   return new RegExp(pattern!.source, 'i').test(tool);
 }
@@ -113,7 +130,13 @@ describe('presets the attachment-URL flag serves (derived from the mint targets)
   it.each(FLAG_UNIVERSAL_NAMES)(
     '%s is registered in every preset whose resources the flag serves',
     (tool) => {
-      const missing = FLAG_SERVED_PRESETS.filter((preset) => !presetContains(preset, tool, true));
+      // Each tool answers to its OWN declared gate, looked up from the same table the
+      // implementation reads -- not to a hard-coded `attachmentUrls`, which was only ever
+      // correct because it used to be the only gate in the table.
+      const gate = FLAG_UNIVERSAL_UTILITY_TOOLS[tool];
+      const missing = FLAG_SERVED_PRESETS.filter(
+        (preset) => !presetContainsUnderGates(preset, tool, { [gate]: true })
+      );
       expect(missing, `${tool} missing from flag-served presets`).toEqual([]);
     }
   );
@@ -121,8 +144,11 @@ describe('presets the attachment-URL flag serves (derived from the mint targets)
   // The catch-all the enumerated version cannot be: a mint target has no preset of its own (event
   // attachments have no endpoint in endpoints.json at all, and the reproduction that found this bug
   // used --preset ...,calendar), and any preset added later starts out unlisted everywhere.
-  it.each(FLAG_UNIVERSAL_NAMES)('%s is in every named preset once the flag is on', (tool) => {
-    const missing = NAMED_PRESETS.filter((preset) => !presetContains(preset, tool, true));
+  it.each(FLAG_UNIVERSAL_NAMES)('%s is in every named preset once its own gate is on', (tool) => {
+    const gate = FLAG_UNIVERSAL_UTILITY_TOOLS[tool];
+    const missing = NAMED_PRESETS.filter(
+      (preset) => !presetContainsUnderGates(preset, tool, { [gate]: true })
+    );
     expect(missing, `${tool} missing from presets`).toEqual([]);
   });
 
@@ -176,14 +202,26 @@ describe('the flag adds tools, and only tools it has to', () => {
     }
   });
 
-  it('adds nothing but the flag-universal tools to any preset', () => {
+  // Generalised over every gate key, not just `attachmentUrls`: turning on ONE gate must add
+  // exactly the tools that name IT in FLAG_UNIVERSAL_UTILITY_TOOLS, and nothing gated by a
+  // different key. This is the property that actually needs proving once a second gate exists --
+  // a tool answers to its own key and no other. It has teeth against cross-contamination in the
+  // gate-filtering mechanism itself: if `presetPattern` ever stopped checking each tool's own
+  // `flag` and instead lit up every flag-universal tool whenever ANY gate was on, the `added` list
+  // below would include a tool absent from `expected`, and this test would fail -- confirmed by
+  // temporarily replacing that filter with `.filter(() => Object.values(options).some(Boolean))`
+  // and watching this case fail before reverting it.
+  it.each(ALL_GATE_KEYS)('turning on %s adds only the tools it gates, to any preset', (gateKey) => {
     for (const preset of NAMED_PRESETS) {
       const off = new Set(toolsMatching(getCategoryPattern(preset, {})!));
-      const added = toolsMatching(getCategoryPattern(preset, { attachmentUrls: true })!).filter(
+      const added = toolsMatching(getCategoryPattern(preset, { [gateKey]: true })!).filter(
         (name) => !off.has(name)
       );
-      expect(added.sort(), `${preset} gained unexpected tools`).toEqual(
-        FLAG_UNIVERSAL_NAMES.filter((name) => !off.has(name)).sort()
+      const expected = FLAG_UNIVERSAL_NAMES.filter(
+        (name) => FLAG_UNIVERSAL_UTILITY_TOOLS[name] === gateKey && !off.has(name)
+      );
+      expect(added.sort(), `${preset} gained unexpected tools under {${gateKey}: true}`).toEqual(
+        expected.sort()
       );
     }
   });
