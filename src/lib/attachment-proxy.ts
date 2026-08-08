@@ -55,3 +55,49 @@ export function toWireArguments(req: ConvertRequest): Record<string, unknown> {
   if (req.maxChars !== undefined) args.max_chars = req.maxChars;
   return args;
 }
+
+/**
+ * The data payload of the first SSE event that carries one, or null.
+ *
+ * Written against the framing rather than against one server's output: comment
+ * frames (`: ping - …`) are skipped, `event:`/`id:`/`retry:` lines are ignored,
+ * a frame whose data is empty (mcp's resumability priming event) is passed
+ * over rather than parsed as JSON, and multiple `data:` lines in one frame are
+ * joined with newlines as the SSE spec requires. CRLF, CR and LF all separate
+ * lines, because sse_starlette defaults to CRLF and other servers do not.
+ */
+function extractSseData(body: string): string | null {
+  let current: string[] = [];
+  for (const line of body.split(/\r\n|\r|\n/)) {
+    if (line === '') {
+      const joined = current.join('\n');
+      current = [];
+      if (joined !== '') return joined;
+      continue;
+    }
+    if (line.startsWith(':') || !line.startsWith('data:')) continue;
+    const value = line.slice('data:'.length);
+    current.push(value.startsWith(' ') ? value.slice(1) : value);
+  }
+  // A stream that ended without a trailing blank line still has one event in it.
+  const trailing = current.join('\n');
+  return trailing === '' ? null : trailing;
+}
+
+/**
+ * Parse a Streamable HTTP response body into its JSON-RPC message.
+ *
+ * The transport picks the framing, not the caller: `text/event-stream` when the
+ * server streams (the default, and what the live proxy does) and
+ * `application/json` when it is in JSON-response mode. Handling only one of the
+ * two is exactly the class of defect that served every attachment as an empty
+ * 200 on 2026-08-07 — a well-formed response the client could not read.
+ */
+export function decodeJsonRpcBody(contentType: string | null, body: string): unknown {
+  const isSse = (contentType ?? '').toLowerCase().includes('text/event-stream');
+  const payload = isSse ? extractSseData(body) : body;
+  if (payload === null) {
+    throw new Error('the proxy sent an event stream with no data frame in it');
+  }
+  return JSON.parse(payload);
+}

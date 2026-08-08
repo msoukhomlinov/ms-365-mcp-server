@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toWireArguments } from '../src/lib/attachment-proxy.js';
+import { toWireArguments, decodeJsonRpcBody } from '../src/lib/attachment-proxy.js';
 
 /**
  * The TS interface is camelCase and the wire is snake_case. A `maxChars` that
@@ -34,5 +34,59 @@ describe('toWireArguments', () => {
 
   it('never invents an auth_profile', () => {
     expect('auth_profile' in toWireArguments({ uri: 'u' })).toBe(false);
+  });
+});
+
+/**
+ * Streamable HTTP answers a POST either as `application/json` or as an SSE
+ * stream, and the live proxy answers with SSE (mcp's `streamable_http_app`
+ * builds an `EventSourceResponse` unless `json_response=True`). sse_starlette
+ * frames with CRLF, names the event `message`, and interleaves `: ping - …`
+ * comment frames every 15 s — which a 60 s conversion will see.
+ */
+describe('decodeJsonRpcBody', () => {
+  const message = { jsonrpc: '2.0', id: 1, result: { structuredContent: { markdown: '# hi' } } };
+
+  it('reads the JSON-RPC message out of a text/event-stream frame', () => {
+    const body = `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream; charset=utf-8', body)).toEqual(message);
+  });
+
+  it('reads the same message out of a plain application/json body', () => {
+    expect(decodeJsonRpcBody('application/json', JSON.stringify(message))).toEqual(message);
+  });
+
+  it('skips the keep-alive comment frames a slow conversion interleaves', () => {
+    const body =
+      `: ping - 2026-08-08 07:00:00.000000+00:00\r\n\r\n` +
+      `: ping - 2026-08-08 07:00:15.000000+00:00\r\n\r\n` +
+      `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
+  });
+
+  it('skips a priming frame that carries an id and empty data', () => {
+    const body =
+      `id: 0\r\ndata: \r\n\r\n` + `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
+  });
+
+  it('joins a multi-line data payload the way the SSE spec says to', () => {
+    const body = 'event: message\ndata: {"jsonrpc":"2.0",\ndata: "id":1}\n\n';
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual({ jsonrpc: '2.0', id: 1 });
+  });
+
+  it('accepts LF-only framing as well as CRLF', () => {
+    const body = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
+  });
+
+  it('throws rather than returning undefined when a stream carries no data', () => {
+    expect(() => decodeJsonRpcBody('text/event-stream', ': ping - x\r\n\r\n')).toThrow(
+      /no data frame/
+    );
+  });
+
+  it('treats an absent content-type as JSON rather than guessing SSE', () => {
+    expect(decodeJsonRpcBody(null, JSON.stringify(message))).toEqual(message);
   });
 });
