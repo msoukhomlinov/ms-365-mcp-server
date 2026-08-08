@@ -23,6 +23,20 @@ export const DEFAULT_PROXY_TIMEOUT_MS = 60_000;
 /** The one tool the contract requires of any `--attachment-proxy` target. */
 export const PROXY_TOOL_NAME = 'convert_to_markdown';
 
+/**
+ * The proxy-origin codes this server promises its own callers, from the spec's
+ * error table. Everything else the proxy says is real but is not ours to
+ * promise — a generic contract cannot adopt one implementation's vocabulary —
+ * so it arrives as `proxy_error` with the raw code preserved verbatim.
+ */
+export const CONTRACT_ERROR_CODES: ReadonlySet<string> = new Set([
+  'unsupported_format',
+  'too_large',
+  'password_required',
+  'conversion_failed',
+  'fetch_failed',
+]);
+
 export interface AttachmentProxyOptions {
   /** Full endpoint URL including the MCP path, e.g. `http://docglean:8080/mcp`. */
   url: string;
@@ -143,16 +157,73 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * The coded payload out of the text channel, for a proxy that does not send
+ * `structuredContent`. The contract says "an error object carrying a string
+ * code", not "on this particular channel".
+ */
+function parseTextContent(result: Record<string, unknown>): Record<string, unknown> | null {
+  const content = Array.isArray(result.content) ? result.content : [];
+  for (const block of content) {
+    const record = asRecord(block);
+    if (!record || typeof record.text !== 'string') continue;
+    try {
+      const parsed = asRecord(JSON.parse(record.text));
+      if (parsed) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function mapProxyError(payload: Record<string, unknown> | null): ConvertResult {
+  const rawMessage =
+    typeof payload?.message === 'string'
+      ? payload.message
+      : 'the proxy reported an error with no message';
+  const detail = asRecord(payload?.detail);
+  const status =
+    detail && typeof detail.status === 'number' ? ` (upstream status ${detail.status})` : '';
+  const rawCode = typeof payload?.code === 'string' ? payload.code : '';
+
+  if (rawCode === '') {
+    return {
+      ok: false,
+      code: 'proxy_error',
+      message: `the proxy reported an error with no code: ${rawMessage}${status}`,
+    };
+  }
+  if (CONTRACT_ERROR_CODES.has(rawCode)) {
+    return { ok: false, code: rawCode, message: `${rawMessage}${status}` };
+  }
+  // Verbatim, and first: the raw code has to survive a log truncation and a
+  // grep, which it does not if it is buried mid-sentence.
+  return { ok: false, code: 'proxy_error', message: `${rawCode}: ${rawMessage}${status}` };
+}
+
+/**
  * Turn one JSON-RPC message into a `ConvertResult`.
  *
- * `isError` is absent on success — mcp serialises with `exclude_unset`, so
- * "absent or false" is the success test and only an explicit `true` is a
- * failure. Error mapping arrives in the next task; for now anything that is
- * not a readable markdown result is a `proxy_error`, which fails loud rather
- * than handing the model a blank document.
+ * `isError` is absent on success — mcp serialises with `exclude_unset` — so
+ * "absent" and "false" both read as success and only an explicit `true`
+ * triggers error mapping; `result.isError === true` is that exact test, not
+ * an inference from the shape of `structuredContent`.
  */
 export function interpretJsonRpcMessage(message: unknown, status: number): ConvertResult {
   const envelope = asRecord(message);
+  const rpcError = asRecord(envelope?.error);
+  if (rpcError) {
+    // Transport- or dispatcher-level refusal: auth, an unserved method, a
+    // malformed envelope. The proxy answered, so it is not `proxy_unreachable`.
+    return {
+      ok: false,
+      code: 'proxy_error',
+      message: `the proxy refused the call (HTTP ${status}, JSON-RPC ${String(
+        rpcError.code
+      )}): ${String(rpcError.message ?? '')}`,
+    };
+  }
+
   const result = asRecord(envelope?.result);
   if (!result) {
     return {
@@ -161,8 +232,11 @@ export function interpretJsonRpcMessage(message: unknown, status: number): Conve
       message: `the proxy answered ${status} with no JSON-RPC result`,
     };
   }
-  const structured = asRecord(result.structuredContent);
-  const markdown = structured?.markdown;
+
+  const payload = asRecord(result.structuredContent) ?? parseTextContent(result);
+  if (result.isError === true) return mapProxyError(payload);
+
+  const markdown = payload?.markdown;
   if (typeof markdown !== 'string') {
     return {
       ok: false,
@@ -213,6 +287,19 @@ export class AttachmentProxyClient {
     });
     const contentType = response.headers.get('content-type');
     const text = await response.text();
-    return interpretJsonRpcMessage(decodeJsonRpcBody(contentType, text), response.status);
+    let message: unknown;
+    try {
+      message = decodeJsonRpcBody(contentType, text);
+    } catch {
+      // A gateway's HTML, a truncated stream, a proxy that answered in prose.
+      // The body is deliberately not quoted: it is upstream text this server
+      // has not audited, and it would land in the model's context.
+      return {
+        ok: false,
+        code: 'proxy_error',
+        message: `the proxy answered ${response.status} with a body this client could not read as JSON-RPC`,
+      };
+    }
+    return interpretJsonRpcMessage(message, response.status);
   }
 }

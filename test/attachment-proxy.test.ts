@@ -146,3 +146,140 @@ describe('AttachmentProxyClient.convertToMarkdown', () => {
     });
   });
 });
+
+/** A coded tool error as `_error_result` puts it on the wire: both channels, isError true. */
+export function errorMessage(code: string, message: string, detail: Record<string, unknown> = {}) {
+  const payload = { code, message, detail };
+  return {
+    jsonrpc: '2.0',
+    id: 1,
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      structuredContent: payload,
+      isError: true,
+    },
+  };
+}
+
+describe('AttachmentProxyClient error mapping', () => {
+  it('passes a contract code through unchanged', async () => {
+    const { impl } = recordingFetch([
+      sseResponse(errorMessage('unsupported_format', 'This server cannot convert 7z archives.')),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    expect(await client.convertToMarkdown({ uri: 'u' })).toEqual({
+      ok: false,
+      code: 'unsupported_format',
+      message: 'This server cannot convert 7z archives.',
+    });
+  });
+
+  it('passes an unknown proxy code through as proxy_error with the raw code intact', async () => {
+    // The proxy's own vocabulary is not ours to promise. `busy` is real and is
+    // outside the spec's table; flattening it to conversion_failed would tell
+    // the agent "report this" when the right answer is "try again".
+    const { impl } = recordingFetch([
+      sseResponse(errorMessage('busy', 'Every conversion worker is checked out.')),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.code).toBe('proxy_error');
+    // Verbatim and first, so it survives truncation and greps cleanly.
+    expect(result.message.startsWith('busy: ')).toBe(true);
+    expect(result.message).toContain('Every conversion worker is checked out.');
+  });
+
+  it('carries the upstream status on a fetch_failed', async () => {
+    const { impl } = recordingFetch([
+      sseResponse(
+        errorMessage('fetch_failed', 'The document could not be fetched.', { status: 404 })
+      ),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result).toEqual({
+      ok: false,
+      code: 'fetch_failed',
+      message: 'The document could not be fetched. (upstream status 404)',
+    });
+  });
+
+  it('recovers the code from the text channel when structuredContent is absent', async () => {
+    // A conforming proxy that is not this one may put the payload only in the
+    // text block. The code still has to survive.
+    const payload = { code: 'too_large', message: 'The document exceeds the size limit.' };
+    const { impl } = recordingFetch([
+      sseResponse({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true },
+      }),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    expect(await client.convertToMarkdown({ uri: 'u' })).toEqual({
+      ok: false,
+      code: 'too_large',
+      message: 'The document exceeds the size limit.',
+    });
+  });
+
+  it('codes an error that arrives with no code at all', async () => {
+    const { impl } = recordingFetch([
+      sseResponse({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'text', text: 'exploded' }], isError: true },
+      }),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result).toEqual({
+      ok: false,
+      code: 'proxy_error',
+      message: expect.stringContaining('no code'),
+    });
+  });
+
+  it('maps a JSON-RPC envelope error to proxy_error rather than pretending it converted', async () => {
+    // What a 401 or an unserved method looks like: an error member on the
+    // envelope, no result at all.
+    const { impl } = recordingFetch([
+      jsonResponse(
+        { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Unauthorized' } },
+        401
+      ),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.code).toBe('proxy_error');
+    expect(result.message).toContain('-32600');
+    expect(result.message).toContain('Unauthorized');
+  });
+
+  it('codes a body it cannot read at all instead of throwing at the caller', async () => {
+    const { impl } = recordingFetch([
+      new Response('<html>502 Bad Gateway</html>', {
+        status: 502,
+        headers: { 'content-type': 'text/html' },
+      }),
+    ]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    const result = await client.convertToMarkdown({ uri: 'u' });
+    expect(result).toEqual({
+      ok: false,
+      code: 'proxy_error',
+      message: expect.stringContaining('502'),
+    });
+  });
+});
