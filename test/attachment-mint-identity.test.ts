@@ -149,7 +149,7 @@ describe('download guidance stays true in both deployment modes', () => {
     const tool = UTILITY_TOOLS.find((t) => t.name === 'get-download-url')!;
     expect(tool.description).toContain('--enable-attachment-urls');
     expect(tool.description).toContain('HTTP mode only');
-    expect(tool.description).toContain('singleUse: true');
+    expect(tool.description).toContain('singleUse: false');
     // The identity guard that attachment-mint-identity pins above.
     expect(tool.description).toMatch(/OAuth, OBO, or bearer mode/);
     expect(tool.description).toMatch(/refused/i);
