@@ -6,7 +6,11 @@ import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
 import { describePathParam } from './lib/path-params.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
-import { buildAttachmentUrl, TicketStoreFullError } from './lib/attachment-tickets.js';
+import {
+  buildAttachmentUrl,
+  MAX_REDEMPTIONS,
+  TicketStoreFullError,
+} from './lib/attachment-tickets.js';
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
@@ -528,8 +532,25 @@ async function mintDownloadUrl(
         text: JSON.stringify({
           downloadUrl: buildAttachmentUrl(minting.config, ticket.id),
           expiresAt: new Date(ticket.expiresAtMs).toISOString(),
-          singleUse: true,
-          note: 'Served by this server, not by Microsoft Graph. Valid for one fetch until it expires.',
+          maxFetches: MAX_REDEMPTIONS,
+          // Stated as an explicit false rather than dropped. The field used to
+          // say `true`, and both the agent skills written against this tool and
+          // any model that learned the old shape look for it; an absent field
+          // reads as "unknown, assume the old rule", while `false` contradicts
+          // it outright.
+          singleUse: false,
+          note:
+            `Served by this server, not by Microsoft Graph. This URL accepts up to ${MAX_REDEMPTIONS} ` +
+            `fetches until expiresAt -- enough to probe a document and then convert it, with one ` +
+            `attempt to spare. Every fetch counts, including one that fails, so reuse this same URL ` +
+            `for a retry or a continuation instead of minting another.`,
+          // The recovery an agent could not previously work out: a converter
+          // reports its own `fetch_failed`/404 with nothing to say whether the
+          // URL is retryable, dead, or was never valid.
+          onFetchFailure:
+            `Fetch the same downloadUrl again -- a failed fetch does not invalidate it. Only a 404 ` +
+            `means it is finished (all ${MAX_REDEMPTIONS} fetches used, or expiresAt passed); call ` +
+            `get-download-url again for a fresh URL in that case, and only in that case.`,
         }),
       },
     ],
@@ -822,7 +843,8 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     // "drive/SharePoint file content" has to stay in the opening sentence or this
     // tool stops owning the "drive"/"sharepoint" download queries.
     description:
-      "Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content: always available for drive/SharePoint file content, and for other byte endpoints only when this server was started with --enable-attachment-urls. The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. For a drive/SharePoint item the URL is Graph's own @microsoft.graph.downloadUrl and needs no flag; returns { downloadUrl, name?, size?, contentType? }. Mail and event attachments (/messages/{id}/attachments/{id}/$value), meeting recordings, and other authenticated /$value byte endpoints have no such link from Graph, so with --enable-attachment-urls (HTTP mode only) this server mints and serves one itself, returning { downloadUrl, expiresAt, singleUse: true, note } — valid for one fetch until it expires. Without the flag those targets fail with an error saying they do not expose a pre-authenticated download URL; fall back to download-bytes. Minting is also refused whenever this request's Graph identity came from the caller rather than from the server's own token cache (OAuth, OBO, or bearer mode), because the minted URL is redeemed later with no Authorization header and would fetch the bytes under a different identity than the one that asked; in those modes use download-bytes.",
+      "Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content: always available for drive/SharePoint file content, and for other byte endpoints only when this server was started with --enable-attachment-urls. The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. For a drive/SharePoint item the URL is Graph's own @microsoft.graph.downloadUrl and needs no flag; returns { downloadUrl, name?, size?, contentType? }. Mail and event attachments (/messages/{id}/attachments/{id}/$value), meeting recordings, and other authenticated /$value byte endpoints have no such link from Graph, so with --enable-attachment-urls (HTTP mode only) this server mints and serves one itself, returning { downloadUrl, expiresAt, maxFetches, singleUse: false, note, onFetchFailure } — good for up to " +
+      `${MAX_REDEMPTIONS} fetches until expiresAt, NOT one. Hand the same URL to a document converter more than once: probing a document and then converting it works, as does a pagination continuation. Every fetch counts, a failed one included, so when a fetch fails retry that same URL rather than minting another; only a 404 means it is finished (fetches used up, or expired) and only then mint again. Without the flag those targets fail with an error saying they do not expose a pre-authenticated download URL; fall back to download-bytes. Minting is also refused whenever this request's Graph identity came from the caller rather than from the server's own token cache (OAuth, OBO, or bearer mode), because the minted URL is redeemed later with no Authorization header and would fetch the bytes under a different identity than the one that asked; in those modes use download-bytes.`,
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {

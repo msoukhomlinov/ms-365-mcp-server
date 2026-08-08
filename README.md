@@ -655,10 +655,25 @@ URL of its own, `get-download-url` mints one this server serves:
 GET /attachment?t=<ticket>&dgk=<key-id>&dgx=<expiry>&dgs=<signature>
 ```
 
-The ticket is 32 bytes of CSPRNG output, **single-use**, memory-only, and expires after
+The ticket is 32 bytes of CSPRNG output, memory-only, and expires after
 `MS365_MCP_ATTACHMENT_URL_TTL_S` seconds. Redeeming it streams the Graph bytes with this
 server's own token; the fetcher sends no Authorization header and holds no Microsoft
 credential.
+
+It is good for **up to 3 fetches** inside that TTL, not one. Single-use was the original
+grant and was too small for the flow: a converter that probes a document and then converts
+it fetches the URL twice, every pagination continuation is another fetch, and a Graph 5xx
+spent the only redemption while delivering no bytes — leaving the caller a dead URL and a
+`fetch_failed` with nothing to say the two were connected. What bounds a leaked URL is the
+product of a short TTL and a small finite count, and three fetches in two minutes is the
+same order of exposure as one.
+
+Every fetch counts, whether or not it produced bytes, so the advertised count is exactly
+true and a permanently failing target cannot be re-fetched without limit. Redemptions are
+also **mutually exclusive**: a ticket held by an in-flight request refuses every other
+request with the same 404 an unknown ticket gets, so one ticket never streams twice at
+once. Unknown, exhausted, expired and in-flight are deliberately indistinguishable — a
+distinguishable refusal would confirm a guessed ticket id.
 
 **This grants no authority the calling agent did not already have.** Every target that can
 be minted is one `download-bytes` would fetch for the same caller on the same account. The
