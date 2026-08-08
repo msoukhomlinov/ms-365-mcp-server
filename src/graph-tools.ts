@@ -1141,14 +1141,19 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       return schema;
     },
     // Filled in by the next task. Until then the tool exists so registration can
-    // be gated and tested on its own; it answers honestly rather than pretending.
+    // be gated and tested on its own. The error names ITS OWN state (not wired up
+    // in this build), not a state that cannot occur here: read-document is only
+    // ever registered once --attachment-proxy configured a proxy, so "no proxy is
+    // configured" would be false in the one configuration where a caller can
+    // reach this at all.
     execute: async () => ({
       content: [
         {
           type: 'text',
           text: JSON.stringify({
-            error: 'proxy_unreachable',
-            message: 'No document proxy is configured on this server.',
+            error: 'not_implemented',
+            message:
+              'read-document is registered but its conversion path is not wired up in this build yet.',
             name: null,
             contentType: null,
             size: null,
@@ -1161,19 +1166,36 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
 ];
 
 /**
- * Does this Graph endpoint tool hand the model raw bytes?
+ * Is this a GET whose Graph path ends in `/$value`?
  *
- * A class rule rather than a name list, because a name list is the same
- * story-shaped guard one level down: it covers the tool someone thought of, and
- * upstream is free to add another. `/$value` is Graph's own spelling for "the
- * raw representation of this resource", so a GET ending there returns bytes by
- * construction. Today that selects exactly `get-mail-message-mime`; the only
- * other `$value` endpoint in endpoints.json is a PUT (upload-my-profile-photo),
- * which writes bytes rather than returning them and is correctly left alone.
+ * Narrower than "does this tool return raw bytes to the model" -- deliberately
+ * so; read that broader claim off this function at your peril. `/$value` is
+ * Graph's own spelling for "the raw representation of this resource", so a GET
+ * ending there returns bytes by construction, and a class rule over that shape
+ * (rather than a name list, which is the same story-shaped guard one level
+ * down) covers a future endpoint upstream adds with no edit here. Today it
+ * selects exactly `get-mail-message-mime`; the only other `$value` endpoint in
+ * endpoints.json is a PUT (upload-my-profile-photo), which writes bytes rather
+ * than returning them and is correctly left alone.
  *
- * This one genuinely cannot be left to the response scrubber. get-mail-message-mime
- * declares `acceptType: "text/plain"` and returns RFC 5322 source: not base64,
- * so neither scrubber rule matches, while every attachment rides inline.
+ * It does NOT cover every raw-byte read this server exposes, and callers must
+ * not treat "suppressed by this rule" as "the only bytes left." Known gaps,
+ * left open for a scoped follow-up rather than widened here without its own
+ * review:
+ *  - `graph-batch` (POST `/$batch`) accepts arbitrary sub-requests and can
+ *    smuggle a GET against any suppressed `/$value` path -- including
+ *    `/me/messages/{id}/$value` -- as a batched sub-request, returning the
+ *    same bytes this function exists to keep out. Suppressing a
+ *    general-purpose batch tool is a capability decision, not a class-rule fix.
+ *  - `get-meeting-recording-content` (video), `get-meeting-transcript-content`
+ *    (text/vtt), `get-onenote-page-content`, and
+ *    `get-sharepoint-site-onenote-page-content` are raw-byte/text reads whose
+ *    paths do not end in `/$value`, so this rule does not see them.
+ *
+ * get-mail-message-mime genuinely cannot be left to the response scrubber: it
+ * declares `acceptType: "text/plain"` and returns RFC 5322 source, not base64,
+ * so neither scrubber rule matches, while every attachment rides inline. The
+ * same is true of a batched read of the same path via `graph-batch`.
  */
 export function isProxySuppressedGraphTool(
   method: string,
