@@ -32,6 +32,11 @@ import { isAllowedRedirectUri, parseAllowlist } from './lib/redirect-uri-validat
 import { loadAttachmentUrlConfig, ATTACHMENT_ROUTE } from './lib/attachment-url-config.js';
 import { AttachmentTicketStore } from './lib/attachment-tickets.js';
 import { configureAttachmentMinting } from './lib/attachment-minting.js';
+import { AttachmentProxyClient, PROXY_TOKEN_ENV } from './lib/attachment-proxy.js';
+import {
+  ATTACHMENT_PROXY_TIMEOUT_MS,
+  configureAttachmentProxy,
+} from './lib/attachment-proxy-runtime.js';
 import { createAttachmentHandler } from './attachment-route.js';
 import type { CommandOptions } from './cli.ts';
 import { getSecrets, type AppSecrets } from './secrets.js';
@@ -1093,6 +1098,35 @@ class MicrosoftGraphServer {
         const ticketStore = new AttachmentTicketStore(attachmentConfig.ttlSeconds);
         configureAttachmentMinting({ store: ticketStore, config: attachmentConfig });
 
+        // The document proxy, when one was configured. Built here rather than in
+        // createMcpServer because it belongs with the listener it feeds: the URL
+        // this client hands the proxy is minted by the store two lines above and
+        // redeemed on the route mounted below, and all three have to exist or
+        // none of them should.
+        if (this.attachmentProxyActive) {
+          const proxyUrl = String(this.options.attachmentProxy);
+          // The bearer credential is NOT injected here. `AttachmentProxyClient`
+          // reads `PROXY_TOKEN_ENV` itself, per call (Task 10). Wrapping
+          // `fetchImpl` to add the header as well would set both `Authorization`
+          // (from the client) and `authorization` (from the wrapper); `Headers`
+          // lowercases and joins same-named entries, so the proxy would receive
+          // a single `Bearer x, Bearer x` and answer 401. One owner only.
+          configureAttachmentProxy({
+            client: new AttachmentProxyClient({
+              url: proxyUrl,
+              timeoutMs: ATTACHMENT_PROXY_TIMEOUT_MS,
+            }),
+            url: proxyUrl,
+          });
+          logger.info(
+            `  - Document proxy: ${proxyUrl} (read-document only; download-bytes, ` +
+              `get-download-url and get-mail-message-mime are NOT registered` +
+              `${process.env[PROXY_TOKEN_ENV] ? ', bearer credential set' : ', no bearer credential set'})`
+          );
+        } else {
+          configureAttachmentProxy(null);
+        }
+
         // Where the route goes.
         //
         // Without --attachment-port it goes on the MCP app, which is what this
@@ -1182,6 +1216,7 @@ class MicrosoftGraphServer {
         }
       } else {
         configureAttachmentMinting(null);
+        configureAttachmentProxy(null);
       }
 
       // Health check endpoint

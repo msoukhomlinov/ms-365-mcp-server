@@ -6,6 +6,7 @@ import GraphClient from './graph-client.js';
 import { isDestructiveOperation } from './lib/destructive-ops.js';
 import { describePathParam } from './lib/path-params.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
+import { getAttachmentProxy } from './lib/attachment-proxy-runtime.js';
 import {
   buildAttachmentUrl,
   MAX_REDEMPTIONS,
@@ -563,6 +564,48 @@ async function mintDownloadUrl(
         }),
       },
     ],
+  };
+}
+
+/** The three facts every read-document failure carries, known or not. */
+interface AttachmentFacts {
+  name: string | null;
+  contentType: string | null;
+  size: number | null;
+}
+
+const UNKNOWN_ATTACHMENT: AttachmentFacts = { name: null, contentType: null, size: null };
+
+/**
+ * One error shape for every read-document failure.
+ *
+ * `name`/`contentType`/`size` are always present, null included. An agent that
+ * cannot read a document can still tell the user what it saw -- "a 195 KB PDF
+ * called report.pdf that the converter refused" is an answer; "an error" is not.
+ * Present-and-null rather than omitted, because an absent key reads to a model
+ * as "not applicable" instead of "not known".
+ */
+function readDocumentError(
+  code: string,
+  message: string,
+  attachment: AttachmentFacts,
+  proxyCode?: string
+): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          error: code,
+          ...(proxyCode ? { proxyCode } : {}),
+          message,
+          name: attachment.name,
+          contentType: attachment.contentType,
+          size: attachment.size,
+        }),
+      },
+    ],
+    isError: true,
   };
 }
 
@@ -1140,28 +1183,85 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       return schema;
     },
-    // Filled in by the next task. Until then the tool exists so registration can
-    // be gated and tested on its own. The error names ITS OWN state (not wired up
-    // in this build), not a state that cannot occur here: read-document is only
-    // ever registered once --attachment-proxy configured a proxy, so "no proxy is
-    // configured" would be false in the one configuration where a caller can
-    // reach this at all.
-    execute: async () => ({
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            error: 'not_implemented',
-            message:
-              'read-document is registered but its conversion path is not wired up in this build yet.',
-            name: null,
-            contentType: null,
-            size: null,
-          }),
-        },
-      ],
-      isError: true,
-    }),
+    execute: async (params, ctx) => {
+      const target = params.target;
+      if (typeof target !== 'string' || target.length === 0) {
+        return readDocumentError(
+          'invalid_target',
+          'target is required and must be a non-empty relative Microsoft Graph path starting with "/".',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      const proxy = getAttachmentProxy();
+      const minting = getAttachmentMinting();
+      if (!proxy || !minting) {
+        return readDocumentError(
+          'proxy_unreachable',
+          'This server has no document proxy configured, so no document can be read. It must be started with --attachment-proxy and --http.',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      // Validated against the same patterns get-download-url mints for, and for
+      // the same reason: a ticket grants an authenticated GET of exactly one
+      // Graph path with this server's own token, so the set of paths a ticket
+      // can name is the whole of what the capability is worth. One list, one
+      // answer to "what can this feature reach".
+      if (!target.startsWith('/') || !MINTABLE_TARGET_PATTERNS.some((p) => p.test(target))) {
+        return readDocumentError(
+          'invalid_target',
+          `target must be a relative Microsoft Graph byte path this server can mint for: a mail or event attachment ` +
+            `(/me/messages/{message-id}/attachments/{attachment-id}/$value), a meeting recording, or any other ` +
+            `authenticated /$value endpoint (/me/messages/{message-id}/$value for the raw message). Absolute URLs ` +
+            `are not accepted. Got ${JSON.stringify(target)}.`,
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      const accountParam = params.account as string | undefined;
+
+      // The identity guard get-download-url already carries, restated because
+      // read-document mints too. Both halves matter: isOAuthModeEnabled() is
+      // false in plain bearer mode and in --obo, both of which still run inside
+      // a request context holding the CALLER's token, while a redeemed ticket
+      // is fetched with the SERVER's. Minting there would let a caller ask under
+      // one identity and have the bytes read under another.
+      if (ctx.authManager?.isOAuthModeEnabled() || getRequestTokens()) {
+        return readDocumentError(
+          'identity_not_supported',
+          'read-document is unavailable when Graph identity comes from the request (OAuth, OBO, or bearer mode): the minted URL is redeemed later with no Authorization header, so the document would be fetched as a different identity than the one that asked for it.',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      const accountModeError = await checkAccountParamInBearerMode(accountParam, ctx.authManager);
+      if (accountModeError) {
+        return readDocumentError('identity_not_supported', accountModeError, UNKNOWN_ATTACHMENT);
+      }
+
+      let ticket: { id: string; expiresAtMs: number };
+      try {
+        ticket = minting.store.mint(target, accountParam);
+      } catch (error) {
+        if (error instanceof TicketStoreFullError) {
+          return readDocumentError('no_capacity', error.message, UNKNOWN_ATTACHMENT);
+        }
+        throw error;
+      }
+
+      const result = await proxy.client.convertToMarkdown({
+        uri: buildAttachmentUrl(minting.config, ticket.id),
+        ...(typeof params.pages === 'string' ? { pages: params.pages } : {}),
+        ...(typeof params.offset === 'number' ? { offset: params.offset } : {}),
+        ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
+      });
+
+      if (result.ok) {
+        return { content: [{ type: 'text', text: result.markdown }] };
+      }
+      return readDocumentError(result.code, result.message, UNKNOWN_ATTACHMENT);
+    },
   },
 ];
 
