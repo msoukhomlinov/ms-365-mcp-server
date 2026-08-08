@@ -135,3 +135,84 @@ export function decodeJsonRpcBody(contentType: string | null, body: string): unk
   }
   return JSON.parse(payload);
 }
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Turn one JSON-RPC message into a `ConvertResult`.
+ *
+ * `isError` is absent on success — mcp serialises with `exclude_unset`, so
+ * "absent or false" is the success test and only an explicit `true` is a
+ * failure. Error mapping arrives in the next task; for now anything that is
+ * not a readable markdown result is a `proxy_error`, which fails loud rather
+ * than handing the model a blank document.
+ */
+export function interpretJsonRpcMessage(message: unknown, status: number): ConvertResult {
+  const envelope = asRecord(message);
+  const result = asRecord(envelope?.result);
+  if (!result) {
+    return {
+      ok: false,
+      code: 'proxy_error',
+      message: `the proxy answered ${status} with no JSON-RPC result`,
+    };
+  }
+  const structured = asRecord(result.structuredContent);
+  const markdown = structured?.markdown;
+  if (typeof markdown !== 'string') {
+    return {
+      ok: false,
+      code: 'proxy_error',
+      message: `the proxy answered ${status} with a result carrying no markdown field`,
+    };
+  }
+  return { ok: true, markdown };
+}
+
+export class AttachmentProxyClient {
+  private readonly url: string;
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(opts: AttachmentProxyOptions) {
+    this.url = opts.url;
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_PROXY_TIMEOUT_MS;
+    // Bound to globalThis rather than captured bare: an unbound `fetch`
+    // reference throws "Illegal invocation" on some runtimes.
+    this.fetchImpl = opts.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
+  }
+
+  private buildHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      // Both, and not negotiable: a Streamable HTTP endpoint answers 406 to a
+      // POST that does not accept the streaming form, because it chooses the
+      // framing per response.
+      Accept: 'application/json, text/event-stream',
+    };
+  }
+
+  async convertToMarkdown(req: ConvertRequest): Promise<ConvertResult> {
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      // A fixed id is correct here and not laziness: one request per
+      // connection, no session, nothing to correlate against.
+      id: 1,
+      method: 'tools/call',
+      params: { name: PROXY_TOOL_NAME, arguments: toWireArguments(req) },
+    });
+
+    const response = await this.fetchImpl(this.url, {
+      method: 'POST',
+      headers: this.buildHeaders(),
+      body,
+    });
+    const contentType = response.headers.get('content-type');
+    const text = await response.text();
+    return interpretJsonRpcMessage(decodeJsonRpcBody(contentType, text), response.status);
+  }
+}
