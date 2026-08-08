@@ -440,27 +440,49 @@ describe('read-document failure handling', () => {
     expect(body.message).toBe('the OCR worker pool is not accepting work');
   });
 
-  it('reports an unreachable proxy AND logs it at warn with the URL and elapsed ms', async () => {
+  it('reports an unreachable proxy AND logs it at warn with the URL and elapsed ms -- exactly once per attempt, never twice', async () => {
     const deadPort = await reserveClosedPort();
     const url = `http://127.0.0.1:${deadPort}/mcp`;
     // The real client against a real closed socket. Nothing is stubbed: the one
     // code whose entire meaning is "the network failed" is not worth asserting
     // against a stub that decided to say so.
-    configureAttachmentProxy({
-      client: new AttachmentProxyClient({ url, timeoutMs: 2000 }),
-      url,
-    });
+    const proxyClient = new AttachmentProxyClient({ url, timeoutMs: 2000 });
+    // A dead port stays dead for the retry too, so this call legitimately makes
+    // TWO attempts (see 'retries an unreachable proxy once' below) and this spy
+    // is how the assertions distinguish "one warn per attempt" -- correct --
+    // from "one warn per attempt per layer" -- the regression this test exists
+    // to catch -- without hard-coding a count that would be wrong the moment a
+    // retry is involved.
+    const convertSpy = vi.spyOn(proxyClient, 'convertToMarkdown');
+    configureAttachmentProxy({ client: proxyClient, url });
 
     const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
 
     expect(body.error).toBe('proxy_unreachable');
     expect(body.name).toBe('report.pdf');
 
-    const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
-    const line = warned.find((l) => l.includes('proxy'));
-    expect(line, 'no warn line naming the proxy was emitted').toBeDefined();
-    expect(line).toContain(url);
-    expect(line, 'the warn line must state elapsed time').toMatch(/\d+ms/);
+    // Case-insensitive on purpose. `AttachmentProxyClient` used to log the
+    // identical condition itself, spelled "[ATTACHMENT PROXY]" in capitals; a
+    // case-sensitive `l.includes('proxy')` (the previous version of this
+    // assertion) never saw that line and so never caught the duplication. The
+    // client now logs at debug, not warn (see attachment-proxy.ts and its own
+    // "logs a proxy_unreachable at DEBUG level (not warn)" test), so nothing
+    // it emits should appear here at all.
+    const allWarns = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    const matching = allWarns.filter((l) => /proxy/i.test(l));
+    // One WARN per attempt actually made -- not one per attempt per layer.
+    // A future re-introduction of the client's own warn would make this
+    // fail: convertSpy.mock.calls.length stays 2 (the retry is unaffected),
+    // but matching.length would jump to 4.
+    expect(matching).toHaveLength(convertSpy.mock.calls.length);
+    // No two of those lines are identical text, which a duplicate emitter
+    // (the same condition logged twice by two layers with the same wording)
+    // would produce.
+    expect(new Set(matching).size).toBe(matching.length);
+    for (const line of matching) {
+      expect(line).toContain(url);
+      expect(line, 'the warn line must state elapsed time').toMatch(/\d+ms/);
+    }
   });
 
   it('retries an unreachable proxy once, with a FRESH ticket', async () => {

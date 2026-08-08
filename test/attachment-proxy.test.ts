@@ -289,7 +289,7 @@ import logger from '../src/logger.js';
 
 describe('AttachmentProxyClient transport failures', () => {
   afterEach(() => {
-    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.debug).mockClear();
   });
 
   it('codes a connection refusal as proxy_unreachable instead of throwing', async () => {
@@ -312,7 +312,13 @@ describe('AttachmentProxyClient transport failures', () => {
     expect(result.message).toContain('ECONNREFUSED');
   });
 
-  it('logs a proxy_unreachable at warn level with the url and the elapsed time', async () => {
+  it('logs a proxy_unreachable at DEBUG level (not warn) with the url and the elapsed time', async () => {
+    // Downgraded from warn: `read-document` in graph-tools.ts is the layer that
+    // knows the attempt number and owns the operator-facing WARN now (worded
+    // "attempt 1 of 2" / "still unreachable after retry"). A warn at both
+    // layers would double every real failure into two differently-worded WARN
+    // lines from two clocks -- see attachment-proxy-read-document.test.ts's
+    // "logs exactly one WARN" assertion for the layer that must NOT also warn.
     const impl = (async () => {
       throw new TypeError('fetch failed');
     }) as typeof fetch;
@@ -320,8 +326,9 @@ describe('AttachmentProxyClient transport failures', () => {
 
     await client.convertToMarkdown({ uri: 'u' });
 
-    expect(logger.warn).toHaveBeenCalledTimes(1);
-    const line = String(vi.mocked(logger.warn).mock.calls[0][0]);
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    const line = String(vi.mocked(logger.debug).mock.calls[0][0]);
     expect(line).toContain('http://proxy:8080/mcp');
     expect(line).toMatch(/\d+ ms/);
   });

@@ -339,11 +339,20 @@ export class AttachmentProxyClient {
       const reason = aborted
         ? `no response within ${this.timeoutMs} ms`
         : describeTransportFailure(error);
-      // Warn, with the url and the elapsed time. `/healthz` on a converter is
-      // liveness and never consults its worker pool, so a wedged proxy reports
-      // healthy; this line is how that becomes visible in `docker logs`
-      // instead of only in tool output a model read once.
-      logger.warn(`[ATTACHMENT PROXY] unreachable: ${this.url} after ${elapsedMs} ms — ${reason}`);
+      // Debug, not warn. This client does not retry and has no notion of an
+      // "attempt" -- `read-document` in graph-tools.ts does, and it is the one
+      // WARN an operator should see per call, worded with attempt context
+      // ("attempt 1 of 2" vs "still unreachable after retry"). A warn at both
+      // layers means a single wedged proxy produces two lines with two clocks
+      // and two wordings per attempt (four across a retry) for what should be
+      // one clear signal -- worse for the exact failure this exists to catch
+      // (a service that ran 500s for 19 hours while its container reported
+      // healthy) than a single line would be. Do NOT restore this to warn:
+      // the caller owns that signal now. Kept at debug rather than dropped --
+      // this is a standalone unit with its own tests, and its detail (the raw
+      // transport reason before the caller's retry framing) is worth having
+      // available without needing a WARN's severity to justify existing.
+      logger.debug(`[ATTACHMENT PROXY] unreachable: ${this.url} after ${elapsedMs} ms — ${reason}`);
       return {
         ok: false,
         code: 'proxy_unreachable',

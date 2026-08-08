@@ -1369,9 +1369,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
        * a ticket, but this must hold for every future code, not only the ones
        * observed so far).
        */
-      const attempt = async (): Promise<
-        { ok: true; markdown: string } | { ok: false; code: string; message: string }
-      > => {
+      // Exactly one retry: two attempts, numbered for the warn line below.
+      const MAX_ATTEMPTS = 2;
+
+      const attempt = async (
+        attemptNumber: number
+      ): Promise<{ ok: true; markdown: string } | { ok: false; code: string; message: string }> => {
         let ticket: { id: string; expiresAtMs: number };
         try {
           ticket = minting.store.mint(target, accountParam);
@@ -1390,14 +1393,22 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
         });
         if (!outcome.ok && outcome.code === 'proxy_unreachable') {
-          // Logged as well as returned. A wedged proxy that appears only in tool
-          // output is read by a model once and by an operator never; this is the
-          // line that makes it visible in `docker logs m365-max-mcp`. The proxy
-          // ships a liveness healthcheck that never consults its own workers, so
-          // a wedged one still reports healthy -- exactly the shape of the
-          // 19-hour silent failure this stack has already seen.
+          // The ONE warn for this failure, deliberately not duplicated by the
+          // client (`AttachmentProxyClient` logs the same condition at debug,
+          // not warn -- see attachment-proxy.ts). Only this layer knows the
+          // attempt number, and "attempt 1 of 2" versus "still unreachable
+          // after retry" is exactly what tells an operator a blip from a
+          // wedge in `docker logs m365-max-mcp`. The proxy ships a liveness
+          // healthcheck that never consults its own workers, so a wedged one
+          // still reports healthy -- exactly the shape of the 19-hour silent
+          // failure this stack has already seen, and a signal worth keeping
+          // singular and unambiguous rather than doubling it across layers.
+          const attemptNote =
+            attemptNumber >= MAX_ATTEMPTS
+              ? `attempt ${attemptNumber} of ${MAX_ATTEMPTS}, still unreachable after retry`
+              : `attempt ${attemptNumber} of ${MAX_ATTEMPTS}`;
           logger.warn(
-            `Attachment proxy unreachable: ${proxy.url} did not answer after ` +
+            `Attachment proxy unreachable (${attemptNote}): ${proxy.url} did not answer after ` +
               `${Date.now() - startedAtMs}ms (${outcome.message})`
           );
         }
@@ -1422,13 +1433,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         };
       };
 
-      let outcome = await attempt();
+      let outcome = await attempt(1);
       // Exactly one retry, and only for the transport class. A proxy that
       // ANSWERED (too_large, password_required, ...) will answer the same way
       // again, so retrying would double the conversion cost for no new
       // information; a connection that never landed might.
       if (!outcome.ok && outcome.code === 'proxy_unreachable') {
-        outcome = await attempt();
+        outcome = await attempt(2);
       }
 
       if (outcome.ok) {
