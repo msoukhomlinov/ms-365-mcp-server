@@ -129,13 +129,16 @@ describe('presets the attachment-URL flag serves (derived from the mint targets)
 
   // Both loops below derive `gate` from FLAG_UNIVERSAL_UTILITY_TOOLS -- the same table
   // `presetPattern` reads to decide membership. That makes them powerless against a tool
-  // being mis-keyed (e.g. `read-document` pointing at `attachmentUrls` by mistake): test
-  // and production would agree with each other regardless, since both read the identical
-  // string. What they DO catch is a tool being unlisted, or a filtering bug that stops
-  // consulting each tool's own key. The literal-string anchor that keeps `get-download-url`
-  // pinned to `'attachmentUrls'` specifically -- and so keeps THAT tool's membership rules
-  // from being tautological -- is `'the mail-focused preset set carries get-download-url
-  // only with the flag'` below; see the comment there.
+  // being mis-keyed (e.g. `read-document` pointing at `attachmentUrls` instead of its own
+  // `attachmentProxy`): test and production would agree with each other regardless, since
+  // both read the identical string. What they DO catch is a tool being unlisted, or a
+  // filtering bug that stops consulting each tool's own key. The literal-string anchor that
+  // keeps `get-download-url` pinned to `'attachmentUrls'` specifically -- and so keeps THAT
+  // tool's membership rules from being tautological -- is `'the mail-focused preset set
+  // carries get-download-url only with the flag'` below; see the comment there. The same
+  // anchor for `read-document` against `'attachmentProxy'` lives in
+  // `test/attachment-proxy-config.test.ts`, which pins that literal key directly rather than
+  // reading it back out of this table.
   it.each(FLAG_UNIVERSAL_NAMES)(
     '%s is registered in every preset whose resources the flag serves',
     (tool) => {
@@ -224,20 +227,15 @@ describe('the flag adds tools, and only tools it has to', () => {
   // different key. This is the property that actually needs proving once a second gate exists --
   // a tool answers to its own key and no other.
   //
-  // Cross-contamination teeth (e.g. `presetPattern` stopping checking each tool's own `flag` and
-  // instead lighting up every flag-universal tool whenever ANY gate was on) were verified by
-  // temporarily replacing that filter with `.filter(() => Object.values(options).some(Boolean))`
-  // and watching `it.each(ALL_GATE_KEYS)` fail -- but that was against the two-entry table this
-  // task's brief originally specified (`get-download-url -> attachmentUrls`,
-  // `read-document -> attachmentProxy`). This task's ruling removed the second entry before
-  // `read-document` existed, so as delivered here `ALL_GATE_KEYS` has exactly one member and
-  // `it.each` runs a single case: there is no second gate left to prove exclusivity against, and
-  // the same mutation against THIS commit no longer fails it. That gap is real, not hidden -- the
-  // byte-for-byte-unchanged check in `test/attachment-proxy-config.test.ts` is what currently
-  // catches an `attachmentProxy`-shaped version of this bug class (any tool leaking through under
-  // a gate that isn't its own), precisely because that test does not depend on a second table
-  // entry existing. Once a later task adds one, re-run the mutation against this loop; it becomes
-  // genuinely falsifiable again the moment `ALL_GATE_KEYS.length > 1`.
+  // `FLAG_UNIVERSAL_UTILITY_TOOLS` now has its second entry (`read-document -> attachmentProxy`,
+  // added together with the tool itself), so `ALL_GATE_KEYS` has two members and `it.each` runs
+  // two real cases -- this loop is genuinely falsifiable for cross-gate leakage for the first
+  // time. Verified directly: temporarily replacing `presetPattern`'s flag-universal filter with
+  // `.filter(() => Object.values(options).some(Boolean))` (so any gate lights up every
+  // flag-universal tool, not just its own) makes this `it.each(ALL_GATE_KEYS)` fail on both cases
+  // -- `attachmentUrls: true` now also adds `read-document`, and `attachmentProxy: true` now also
+  // adds `get-download-url`, to every named preset. Reverted immediately after confirming the
+  // failure; see task-13-report.md for the exact output.
   it.each(ALL_GATE_KEYS)('turning on %s adds only the tools it gates, to any preset', (gateKey) => {
     for (const preset of NAMED_PRESETS) {
       const off = new Set(toolsMatching(getCategoryPattern(preset, {})!));

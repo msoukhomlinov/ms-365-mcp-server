@@ -112,11 +112,12 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
 // validated the URL base and key, served the route, and registered no tool that could mint.
 export const FLAG_UNIVERSAL_UTILITY_TOOLS: Record<string, keyof PresetToolOptions> = {
   'get-download-url': 'attachmentUrls',
-  // read-document (the tool --attachment-proxy exists to serve) is deliberately NOT mapped here
-  // yet: that tool does not exist until the task that registers it. Adding the name now would
-  // create the exact failure this table exists to prevent, just aimed at itself -- a preset could
-  // claim a tool no build of the server actually has. The mapping entry and the tool it gates are
-  // added together, in the same change, once the tool exists.
+  // read-document reads any Microsoft 365 document -- mail/event attachments, drive/SharePoint
+  // files, raw message MIME -- so under --attachment-proxy it belongs in every preset for the
+  // same reason download-bytes is universal unconditionally: a list of presets would silently
+  // miss an app and every future one. The tool and this mapping entry land together, in the same
+  // change, so a preset can never claim a tool no build of the server actually has.
+  'read-document': 'attachmentProxy',
 };
 
 /**
@@ -126,12 +127,7 @@ export const FLAG_UNIVERSAL_UTILITY_TOOLS: Record<string, keyof PresetToolOption
 export interface PresetToolOptions {
   /** --enable-attachment-urls: get-download-url can mint URLs for any authenticated byte endpoint. */
   attachmentUrls?: boolean;
-  /**
-   * --attachment-proxy. Declared here so the CLI can validate and thread the flag through ahead of
-   * the tool it will gate; it does not yet appear as a value in FLAG_UNIVERSAL_UTILITY_TOOLS, so it
-   * currently widens no preset. Deliberately present-but-inert, not dead: a field on an options
-   * type is not a claim that a tool exists, the way a FLAG_UNIVERSAL_UTILITY_TOOLS entry would be.
-   */
+  /** --attachment-proxy: read-document joins every preset, in place of the three byte tools it suppresses. */
   attachmentProxy?: boolean;
 }
 

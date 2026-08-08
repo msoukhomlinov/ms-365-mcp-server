@@ -229,6 +229,22 @@ class MicrosoftGraphServer {
    */
   private httpServers: HttpServer[] = [];
 
+  /**
+   * Is proxy mode actually in force?
+   *
+   * HTTP mode is part of the answer, not a separate check: the proxy reads a
+   * document by dialling this server's attachment listener, and stdio has none.
+   * A stdio run with the flag is therefore plain upstream behaviour plus one
+   * warning, rather than a server with every byte tool removed and nothing put
+   * in their place -- which would be a mailbox with no readable attachments.
+   *
+   * One definition, because createMcpServer and start() both need it and a
+   * second copy is how a warning comes to describe a server that does not exist.
+   */
+  private get attachmentProxyActive(): boolean {
+    return Boolean(this.options.attachmentProxy) && Boolean(this.options.http);
+  }
+
   // Two-leg PKCE: stores client's code_challenge and server's code_verifier, keyed by OAuth state
   private pkceStore: Map<
     string,
@@ -282,7 +298,8 @@ class MicrosoftGraphServer {
         this.options.enabledTools,
         this.options.allowedScopes,
         Boolean(this.options.http),
-        Boolean(this.options.enableAttachmentUrls)
+        Boolean(this.options.enableAttachmentUrls),
+        this.attachmentProxyActive
       );
     } else {
       registerGraphTools(
@@ -295,7 +312,8 @@ class MicrosoftGraphServer {
         this.multiAccount,
         this.accountNames,
         this.options.allowedScopes,
-        Boolean(this.options.http)
+        Boolean(this.options.http),
+        this.attachmentProxyActive
       );
     }
 
@@ -400,6 +418,14 @@ class MicrosoftGraphServer {
       );
     }
 
+    if (this.options.attachmentProxy && !this.options.http) {
+      logger.warn(
+        '--attachment-proxy has no effect in stdio mode and is being ignored: the proxy reads a ' +
+          "document by fetching a URL from this server's attachment listener, and stdio has none. " +
+          'Every byte tool stays registered. Start with --http to use it.'
+      );
+    }
+
     // A flag that is set, validated and unreachable is worse than one that is off: the operator
     // reads their own command line, sees the route serving and the key loaded, and concludes the
     // feature works. get-download-url is the ONLY tool that mints, so if the active tool filter
@@ -410,6 +436,7 @@ class MicrosoftGraphServer {
     // because it asks the same selector registration asks instead of re-deriving the answer.
     if (
       this.options.enableAttachmentUrls &&
+      !this.attachmentProxyActive &&
       !utilityToolWillRegister('get-download-url', {
         readOnly: Boolean(this.options.readOnly),
         httpMode: Boolean(this.options.http),
@@ -423,6 +450,28 @@ class MicrosoftGraphServer {
           `(--enabled-tools / ENABLED_TOOLS = ${JSON.stringify(this.options.enabledTools ?? null)}) ` +
           'excludes it. Add get-download-url to the filter, drop the filter, or remove ' +
           '--enable-attachment-urls.'
+      );
+    }
+
+    // Same warning, one tool over. Under --attachment-proxy read-document is the
+    // only readable path to any document, and a filter that drops it leaves a
+    // server whose byte tools are gone and whose replacement never registered.
+    if (
+      this.attachmentProxyActive &&
+      !utilityToolWillRegister('read-document', {
+        readOnly: Boolean(this.options.readOnly),
+        httpMode: true,
+        enabledTools: this.options.enabledTools,
+        attachmentProxy: true,
+      })
+    ) {
+      logger.warn(
+        '--attachment-proxy is set but read-document is NOT registered, so no document on this ' +
+          'server can be read at all: download-bytes, get-download-url and get-mail-message-mime ' +
+          'are suppressed and nothing replaced them. The active tool filter ' +
+          `(--enabled-tools / ENABLED_TOOLS = ${JSON.stringify(this.options.enabledTools ?? null)}) ` +
+          'excludes it. Add read-document to the filter, drop the filter, or remove ' +
+          '--attachment-proxy.'
       );
     }
 

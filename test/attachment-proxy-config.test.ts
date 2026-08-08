@@ -2,13 +2,14 @@
  * `--attachment-proxy`: the flag, the environment variable, and the two things
  * it has to imply.
  *
- * This task deliberately stops short of the tool the flag exists to serve.
- * `read-document` is registered, and mapped into `FLAG_UNIVERSAL_UTILITY_TOOLS`, by a later
- * task that adds the mapping entry and the tool together, in the same change -- so a preset can
- * never claim a tool that no build of the server actually has. Until then `attachmentProxy` is a
- * real field on `PresetToolOptions` that gates nothing, and the tests below prove exactly that:
- * the flag, the implication, and the preset-pattern plumbing all work, while the preset contents
- * stay byte-for-byte what they were before this flag existed.
+ * `read-document` is now registered and mapped into `FLAG_UNIVERSAL_UTILITY_TOOLS`
+ * (`attachmentProxy` -> `read-document`), added together with the tool in the same change so a
+ * preset can never claim a tool that no build of the server actually has. The tests below prove
+ * the flag, the implication, and the preset-pattern plumbing all work, and that the ONLY preset
+ * change the flag makes is adding read-document -- everything else stays byte-for-byte what it
+ * was before this flag existed. The registration-layer proof (the three byte tools actually
+ * disappearing, not just the pattern gaining a name) lives in
+ * `test/attachment-proxy-registration.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getCategoryPattern, TOOL_CATEGORIES } from '../src/tool-categories.js';
@@ -108,31 +109,38 @@ describe('--attachment-proxy / MS365_MCP_ATTACHMENT_PROXY', () => {
     // The ordering bug this guards against: if the env var were read after the
     // --preset block runs, the enableAttachmentUrls implication below would not
     // be visible yet, and this pattern would come back without get-download-url
-    // in it -- exactly the "enabled, validated, unreachable" failure
-    // --enable-attachment-urls already shipped once. get-download-url is the
-    // real, already-gated tool this implication actually reaches today;
-    // read-document is not (see the file header).
+    // (or, now, read-document) in it -- exactly the "enabled, validated,
+    // unreachable" failure --enable-attachment-urls already shipped once.
     process.env.MS365_MCP_ATTACHMENT_PROXY = 'http://docglean:8080/mcp';
     commanderMocks.mockCommand.opts.mockReturnValue({ preset: 'mail,calendar,tasks,contacts' });
     const options = parseArgs();
     expect(new RegExp(options.enabledTools as string).test('get-download-url')).toBe(true);
+    expect(new RegExp(options.enabledTools as string).test('read-document')).toBe(true);
   });
 });
 
-describe('attachmentProxy is on PresetToolOptions but gates nothing yet', () => {
+describe('attachmentProxy widens every preset by exactly one tool: read-document', () => {
   // The other half of the invariant this whole feature exists to hold: not just
-  // "unset changes nothing," but "present and even set to true changes nothing
-  // right now," because no FLAG_UNIVERSAL_UTILITY_TOOLS entry answers to this
-  // key yet. A test proving that matters as much as one proving the eventual
-  // gated case works -- and once a later task adds the mapping entry together
-  // with the tool it gates, this exact test is what will need to change, which
-  // is the point: the change becomes visible instead of silent.
+  // "unset changes nothing," but "set changes exactly the one thing it is
+  // supposed to and nothing else." read-document is now mapped into
+  // FLAG_UNIVERSAL_UTILITY_TOOLS (added together with the tool itself, in the
+  // same change, so a preset can never claim a tool no build of the server
+  // actually has) -- this used to assert byte-for-byte equality before that
+  // mapping existed; the failure this file's header describes is what made this
+  // block's premise change, not a regression.
   it.each(Object.keys(TOOL_CATEGORIES).filter((name) => name !== 'all'))(
-    'attachmentProxy leaves preset %s byte-for-byte unchanged',
+    'attachmentProxy adds read-document to preset %s and changes nothing else',
     (preset) => {
       const off = getCategoryPattern(preset, {})!;
       const on = getCategoryPattern(preset, { attachmentProxy: true })!;
-      expect(on.source).toBe(off.source);
+      const namesOf = (pattern: RegExp) =>
+        new Set(
+          pattern.source
+            .replace(/^\^\(\?:/, '')
+            .replace(/\)\$$/, '')
+            .split('|')
+        );
+      expect(namesOf(on)).toEqual(new Set([...namesOf(off), 'read-document']));
     }
   );
 });

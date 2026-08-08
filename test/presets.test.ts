@@ -3,6 +3,8 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import {
+  FLAG_UNIVERSAL_UTILITY_TOOLS,
+  getCategoryPattern,
   getCombinedPresetPattern,
   presetRequiresOrgMode,
   TOOL_CATEGORIES,
@@ -127,9 +129,19 @@ describe('utility tools in presets', () => {
   // Regression guard: utility tools (download-bytes, get-download-url, parse-teams-url) live in
   // code, not endpoints.json, and used to belong to no preset - so any --preset filter stripped
   // them. A newly added utility tool without preset membership fails this test.
-  it('every utility tool is reachable from at least one named preset', () => {
+  //
+  // Checked under each tool's OWN gate (via FLAG_UNIVERSAL_UTILITY_TOOLS), not the unflagged view:
+  // a tool that is proxyOnly (registers ONLY under its gate, e.g. read-document under
+  // --attachment-proxy) has no unflagged reach at all by design, which is a different fact than
+  // "belongs to no preset" -- collapsing the two would make this test fail on every future tool
+  // shaped like read-document, for the one property that was never broken.
+  it('every utility tool is reachable from at least one named preset under its own gate', () => {
     for (const util of UTILITY_TOOLS) {
-      const reachable = namedPresets.some((preset) => inPreset(preset, util.name));
+      const gate = FLAG_UNIVERSAL_UTILITY_TOOLS[util.name];
+      const options = gate ? { [gate]: true } : {};
+      const reachable = namedPresets.some((preset) =>
+        getCategoryPattern(preset, options)!.test(util.name)
+      );
       expect(reachable, `utility tool ${util.name} is in no preset`).toBe(true);
     }
   });

@@ -378,6 +378,15 @@ interface UtilityTool {
   // registered in stdio mode — never in HTTP/OAuth mode, where a remote client
   // must not be able to write arbitrary files onto the host.
   stdioOnly?: boolean;
+  // Registered ONLY under --attachment-proxy. Without a configured proxy the
+  // tool has nothing to call, so registering it would advertise a capability
+  // that answers an error to every invocation.
+  proxyOnly?: boolean;
+  // Puts raw resource bytes into the model's context, so NOT registered under
+  // --attachment-proxy. download-bytes-to-file is deliberately unmarked: its
+  // bytes go to a local file and never to the model, and it is stdio-only
+  // anyway, which proxy mode never is.
+  bytesToModel?: boolean;
 }
 
 interface DisabledToolScope {
@@ -596,6 +605,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context. That preference always holds for drive/SharePoint files; for mail and event attachments, meeting recordings, and other /$value byte endpoints, get-download-url can only return a URL when the server runs with --enable-attachment-urls, so use this tool when it refuses.',
     readOnlyHint: true,
     openWorldHint: true,
+    bytesToModel: true,
     buildSchema: (ctx) => {
       const schema: Record<string, z.ZodTypeAny> = {
         target: z
@@ -847,6 +857,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       `${MAX_REDEMPTIONS} fetches until expiresAt, NOT one. Hand the same URL to a document converter more than once: probing a document and then converting it works, as does a pagination continuation. Every fetch counts, a failed one included, so when a fetch fails retry that same URL rather than minting another; only a 404 means it is finished (fetches used up, or expired) and only then mint again. Without the flag those targets fail with an error saying they do not expose a pre-authenticated download URL; fall back to download-bytes. Minting is also refused whenever this request's Graph identity came from the caller rather than from the server's own token cache (OAuth, OBO, or bearer mode), because the minted URL is redeemed later with no Authorization header and would fetch the bytes under a different identity than the one that asked; in those modes use download-bytes.`,
     readOnlyHint: true,
     openWorldHint: true,
+    bytesToModel: true,
     buildSchema: (ctx) => {
       const schema: Record<string, z.ZodTypeAny> = {
         target: z
@@ -1081,7 +1092,95 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
     },
   },
+  {
+    name: 'read-document',
+    method: 'POST',
+    path: 'tool:read-document',
+    searchKeywords:
+      'read attachment read document convert to markdown pdf docx xlsx pptx eml msg extract text from attachment open attachment',
+    description:
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. This is the ONLY way to read the content of anything inside Microsoft 365 on this server. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    proxyOnly: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Relative Microsoft Graph byte path starting with "/". ' +
+              '/me/messages/{message-id}/attachments/{attachment-id}/$value (mail attachment; list-mail-attachments returns the ids); ' +
+              '/me/events/{event-id}/attachments/{attachment-id}/$value (event attachment); ' +
+              '/me/messages/{message-id}/$value (the whole message as RFC 5322 source); ' +
+              '/drives/{drive-id}/items/{driveItem-id}/content (drive or SharePoint file). ' +
+              'Absolute URLs are not accepted.'
+          ),
+        pages: z
+          .string()
+          .optional()
+          .describe(
+            'Page selection for paged formats, e.g. "1-5" or "2,4,9". Omit for the whole document.'
+          ),
+        offset: z
+          .number()
+          .optional()
+          .describe('Character offset to resume from, for continuing a long read.'),
+        maxChars: z
+          .number()
+          .optional()
+          .describe('Maximum characters of markdown to return in this call.'),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    // Filled in by the next task. Until then the tool exists so registration can
+    // be gated and tested on its own; it answers honestly rather than pretending.
+    execute: async () => ({
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'proxy_unreachable',
+            message: 'No document proxy is configured on this server.',
+            name: null,
+            contentType: null,
+            size: null,
+          }),
+        },
+      ],
+      isError: true,
+    }),
+  },
 ];
+
+/**
+ * Does this Graph endpoint tool hand the model raw bytes?
+ *
+ * A class rule rather than a name list, because a name list is the same
+ * story-shaped guard one level down: it covers the tool someone thought of, and
+ * upstream is free to add another. `/$value` is Graph's own spelling for "the
+ * raw representation of this resource", so a GET ending there returns bytes by
+ * construction. Today that selects exactly `get-mail-message-mime`; the only
+ * other `$value` endpoint in endpoints.json is a PUT (upload-my-profile-photo),
+ * which writes bytes rather than returning them and is correctly left alone.
+ *
+ * This one genuinely cannot be left to the response scrubber. get-mail-message-mime
+ * declares `acceptType: "text/plain"` and returns RFC 5322 source: not base64,
+ * so neither scrubber rule matches, while every attachment rides inline.
+ */
+export function isProxySuppressedGraphTool(
+  method: string,
+  pathPattern: string | undefined
+): boolean {
+  return method.toUpperCase() === 'GET' && /\/\$value$/.test(pathPattern ?? '');
+}
 
 /** Every gate that can keep a utility tool out of the registered set. */
 export interface UtilityToolGates {
@@ -1089,6 +1188,8 @@ export interface UtilityToolGates {
   httpMode?: boolean;
   /** Raw --enabled-tools / --preset pattern. An uncompilable pattern is ignored, as at registration. */
   enabledTools?: string;
+  /** --attachment-proxy: byte-returning tools out, read-document in. */
+  attachmentProxy?: boolean;
 }
 
 function compileToolFilter(pattern?: string): RegExp | undefined {
@@ -1117,6 +1218,8 @@ export function selectUtilityTools(gates: UtilityToolGates): UtilityTool[] {
   return UTILITY_TOOLS.filter((utility) => {
     if (gates.readOnly && !utility.readOnlyHint) return false;
     if (gates.httpMode && utility.stdioOnly) return false;
+    if (gates.attachmentProxy && utility.bytesToModel) return false;
+    if (!gates.attachmentProxy && utility.proxyOnly) return false;
     if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) return false;
     return true;
   });
@@ -1773,7 +1876,8 @@ export function registerGraphTools(
   multiAccount: boolean = false,
   accountNames: string[] = [],
   allowedScopesValue?: string,
-  httpMode: boolean = false
+  httpMode: boolean = false,
+  attachmentProxy: boolean = false
 ): number {
   let enabledToolsRegex: RegExp | undefined;
   if (enabledToolsPattern) {
@@ -1795,6 +1899,12 @@ export function registerGraphTools(
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
     if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
       logger.info(`Skipping work account tool ${tool.alias} - not in org mode`);
+      skippedCount++;
+      continue;
+    }
+
+    if (attachmentProxy && isProxySuppressedGraphTool(tool.method, endpointConfig?.pathPattern)) {
+      logger.info(`Skipping raw-byte tool ${tool.alias} - --attachment-proxy is set`);
       skippedCount++;
       continue;
     }
@@ -2016,6 +2126,7 @@ export function registerGraphTools(
     readOnly,
     httpMode,
     enabledTools: enabledToolsPattern,
+    attachmentProxy,
   })) {
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
@@ -2040,7 +2151,8 @@ export function buildToolsRegistry(
   orgMode: boolean,
   enabledToolsRegex?: RegExp,
   allowedScopesValue?: string,
-  disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = []
+  disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = [],
+  attachmentProxy: boolean = false
 ): Map<string, { tool: (typeof api.endpoints)[0]; config: EndpointConfig | undefined }> {
   const toolsMap = new Map<
     string,
@@ -2052,6 +2164,10 @@ export function buildToolsRegistry(
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
 
     if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+      continue;
+    }
+
+    if (attachmentProxy && isProxySuppressedGraphTool(tool.method, endpointConfig?.pathPattern)) {
       continue;
     }
 
@@ -2193,7 +2309,8 @@ export function registerDiscoveryTools(
   enabledTools?: string,
   allowedScopesValue?: string,
   httpMode: boolean = false,
-  attachmentUrls: boolean = false
+  attachmentUrls: boolean = false,
+  attachmentProxy: boolean = false
 ): void {
   let enabledToolsRegex: RegExp | undefined;
   if (enabledTools) {
@@ -2213,14 +2330,15 @@ export function registerDiscoveryTools(
     orgMode,
     enabledToolsRegex,
     allowedScopesValue,
-    disabledByAllowedScopes
+    disabledByAllowedScopes,
+    attachmentProxy
   );
   if (disabledByAllowedScopes.length > 0) {
     logger.info(
       `Discovery mode: allowed scopes disabled ${disabledByAllowedScopes.length} Graph tools: ${formatDisabledToolsForLog(disabledByAllowedScopes)}`
     );
   }
-  const utilityTools = selectUtilityTools({ readOnly, httpMode, enabledTools });
+  const utilityTools = selectUtilityTools({ readOnly, httpMode, enabledTools, attachmentProxy });
   const searchIndex = buildDiscoverySearchIndex(toolsRegistry, utilityTools);
   const totalCount = toolsRegistry.size + utilityTools.length;
   logger.info(
@@ -2289,7 +2407,7 @@ export function registerDiscoveryTools(
       // them would hide a tool this server did register under that category — the same staleness
       // that made get-download-url unreachable, one layer up.
       const categoryPattern = category
-        ? getCategoryPattern(category, { attachmentUrls })
+        ? getCategoryPattern(category, { attachmentUrls, attachmentProxy })
         : undefined;
       const categoryFilter = (name: string) => !categoryPattern || categoryPattern.test(name);
 
