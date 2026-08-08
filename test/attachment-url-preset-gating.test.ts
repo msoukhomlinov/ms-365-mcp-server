@@ -127,6 +127,15 @@ describe('presets the attachment-URL flag serves (derived from the mint targets)
     expect(FLAG_SERVED_PRESETS).toContain('teams');
   });
 
+  // Both loops below derive `gate` from FLAG_UNIVERSAL_UTILITY_TOOLS -- the same table
+  // `presetPattern` reads to decide membership. That makes them powerless against a tool
+  // being mis-keyed (e.g. `read-document` pointing at `attachmentUrls` by mistake): test
+  // and production would agree with each other regardless, since both read the identical
+  // string. What they DO catch is a tool being unlisted, or a filtering bug that stops
+  // consulting each tool's own key. The literal-string anchor that keeps `get-download-url`
+  // pinned to `'attachmentUrls'` specifically -- and so keeps THAT tool's membership rules
+  // from being tautological -- is `'the mail-focused preset set carries get-download-url
+  // only with the flag'` below; see the comment there.
   it.each(FLAG_UNIVERSAL_NAMES)(
     '%s is registered in every preset whose resources the flag serves',
     (tool) => {
@@ -182,6 +191,14 @@ describe('presets the attachment-URL flag serves (derived from the mint targets)
   });
 
   // The reproduction, exactly: the mail-focused preset set that was deployed with the flag.
+  //
+  // LOAD-BEARING beyond the reproduction: this is the only place in the file that pins
+  // `get-download-url` to the literal string `'attachmentUrls'` rather than looking the key
+  // up from FLAG_UNIVERSAL_UTILITY_TOOLS. The generalised loops above derive each tool's gate
+  // from that same table, so they cannot tell a correctly-keyed tool from a mis-keyed one --
+  // this test is what still can, for this one tool. Do not delete or weaken it as "redundant
+  // with the generalised version"; it is what keeps the generalised version from being
+  // tautological for get-download-url specifically.
   it('the mail-focused preset set carries get-download-url only with the flag', () => {
     const presets = ['mail', 'calendar', 'tasks', 'contacts'];
     expect(toolsMatching(getCombinedPresetPattern(presets, { attachmentUrls: true }))).toContain(
@@ -205,12 +222,22 @@ describe('the flag adds tools, and only tools it has to', () => {
   // Generalised over every gate key, not just `attachmentUrls`: turning on ONE gate must add
   // exactly the tools that name IT in FLAG_UNIVERSAL_UTILITY_TOOLS, and nothing gated by a
   // different key. This is the property that actually needs proving once a second gate exists --
-  // a tool answers to its own key and no other. It has teeth against cross-contamination in the
-  // gate-filtering mechanism itself: if `presetPattern` ever stopped checking each tool's own
-  // `flag` and instead lit up every flag-universal tool whenever ANY gate was on, the `added` list
-  // below would include a tool absent from `expected`, and this test would fail -- confirmed by
+  // a tool answers to its own key and no other.
+  //
+  // Cross-contamination teeth (e.g. `presetPattern` stopping checking each tool's own `flag` and
+  // instead lighting up every flag-universal tool whenever ANY gate was on) were verified by
   // temporarily replacing that filter with `.filter(() => Object.values(options).some(Boolean))`
-  // and watching this case fail before reverting it.
+  // and watching `it.each(ALL_GATE_KEYS)` fail -- but that was against the two-entry table this
+  // task's brief originally specified (`get-download-url -> attachmentUrls`,
+  // `read-document -> attachmentProxy`). This task's ruling removed the second entry before
+  // `read-document` existed, so as delivered here `ALL_GATE_KEYS` has exactly one member and
+  // `it.each` runs a single case: there is no second gate left to prove exclusivity against, and
+  // the same mutation against THIS commit no longer fails it. That gap is real, not hidden -- the
+  // byte-for-byte-unchanged check in `test/attachment-proxy-config.test.ts` is what currently
+  // catches an `attachmentProxy`-shaped version of this bug class (any tool leaking through under
+  // a gate that isn't its own), precisely because that test does not depend on a second table
+  // entry existing. Once a later task adds one, re-run the mutation against this loop; it becomes
+  // genuinely falsifiable again the moment `ALL_GATE_KEYS.length > 1`.
   it.each(ALL_GATE_KEYS)('turning on %s adds only the tools it gates, to any preset', (gateKey) => {
     for (const preset of NAMED_PRESETS) {
       const off = new Set(toolsMatching(getCategoryPattern(preset, {})!));
