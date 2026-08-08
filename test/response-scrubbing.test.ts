@@ -135,3 +135,87 @@ describe('installResponseScrubbing', () => {
     expect(() => installResponseScrubbing(bare)).toThrow(/tools\/call/);
   });
 });
+
+describe('installResponseScrubbing -- unconventional content shapes', () => {
+  // The real low-level `Server` (what `server.server` actually is) wraps its
+  // *own* `tools/call` handler registration in a second layer: it re-validates
+  // whatever that handler returns against CallToolResultSchema, which requires
+  // `content` to be an array, before the result goes anywhere. That is useful
+  // defense in depth in this deployment's exact configuration, but it means a
+  // handler retrieved from a real, fully-wired `McpServer` can't tell us
+  // whether *this module's own logic* handled an unconventional shape, or
+  // whether an unrelated downstream check simply rejected the whole call
+  // first. A double that stands in for the low-level server -- a
+  // `_requestHandlers` map plus a `setRequestHandler` that just writes into
+  // it, no schema validation on either side -- isolates exactly what
+  // `installResponseScrubbing` itself does with the `original` handler's
+  // result, which is the actual thing under test here.
+  type RawHandler = (request: unknown, extra: unknown) => Promise<unknown>;
+
+  function installOverOriginal(original: RawHandler): RawHandler {
+    const handlers = new Map<string, RawHandler>();
+    handlers.set('tools/call', original);
+    const fakeLowLevelServer = {
+      _requestHandlers: handlers,
+      setRequestHandler: (_schema: unknown, handler: RawHandler) => {
+        handlers.set('tools/call', handler);
+      },
+    };
+    const fakeServer = { server: fakeLowLevelServer } as unknown as McpServer;
+    installResponseScrubbing(fakeServer);
+    return handlers.get('tools/call')!;
+  }
+
+  const fakeRequest = { params: { name: 'weird-tool' } };
+
+  it('scrubs a bare-string content body instead of iterating its characters', async () => {
+    // Pre-fix: `for (const item of result.content ?? [])` over a string
+    // iterates its *characters*. None of them is `{ type: 'text' }`, so the
+    // loop does nothing and the payload survives untouched -- silently, with
+    // no log line. This is the bug under review. Post-fix, `content` was never
+    // a valid array, so the scrubbed value is wrapped in one -- the transport
+    // still requires that shape regardless of what this module does.
+    const handler = installOverOriginal(async () => ({ content: BIG_BASE64 }));
+    const result = (await handler(fakeRequest, {})) as { content: Array<{ text: string }> };
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(JSON.stringify(result.content)).not.toContain(BIG_BASE64);
+    expect(result.content[0].text).toContain('stripped');
+  });
+
+  it('scrubs content given as a single object instead of an array of blocks', async () => {
+    // Pre-fix: `for...of` over a non-array plain object throws (objects are
+    // not iterable), so this shape fails a different way than the bare string
+    // does, but it is still not scrubbed.
+    const handler = installOverOriginal(async () => ({ content: { data: BIG_BASE64 } }));
+    const result = (await handler(fakeRequest, {})) as { content: Array<{ text: string }> };
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(JSON.stringify(result.content)).not.toContain(BIG_BASE64);
+    expect(result.content[0].text).toContain('stripped');
+  });
+
+  it('scrubs a non-text content block (an image block with base64 in `data`)', async () => {
+    // Pre-fix: `if (item?.type !== 'text' ...) continue;` skips this block
+    // whole -- an image/audio/resource block's bytes live in `data` or
+    // `resource.blob`, never `text`, so it walked straight past the only
+    // per-item rule that existed. Post-fix, the block is converted to a text
+    // block: a marker is not valid base64, and an image block's `data` must
+    // be, so leaving it in place would make the block violate its own schema.
+    const handler = installOverOriginal(async () => ({
+      content: [{ type: 'image', data: BIG_BASE64, mimeType: 'image/png' }],
+    }));
+    const result = (await handler(fakeRequest, {})) as { content: Array<Record<string, unknown>> };
+    const serialized = JSON.stringify(result.content);
+    expect(serialized).not.toContain(BIG_BASE64);
+    expect(serialized).toContain('stripped');
+  });
+
+  it('does not throw when content is absent, or the whole result is not an object', async () => {
+    await expect(installOverOriginal(async () => ({}))(fakeRequest, {})).resolves.toEqual({});
+    await expect(
+      installOverOriginal(async () => undefined)(fakeRequest, {})
+    ).resolves.toBeUndefined();
+    await expect(installOverOriginal(async () => 'just a string')(fakeRequest, {})).resolves.toBe(
+      'just a string'
+    );
+  });
+});
