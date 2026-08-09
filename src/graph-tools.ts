@@ -524,12 +524,15 @@ async function mintDownloadUrl(
   }
 
   // Probed once, before minting: the ticket needs to carry whatever this
-  // server already knows about the target's Content-Type (see
+  // server already knows about the target's Content-Type -- see
   // `probeMailEventAttachment`'s docstring for why the redemption route needs
-  // it and can't always trust Graph's own `/$value` response header), and a
-  // referenceAttachment has to be refused here rather than minted -- it names
-  // a link with no bytes behind it, so a "download URL" for it would be a URL
-  // that can never usefully be fetched.
+  // it and can't always trust Graph's own `/$value` response header, and for
+  // why a referenceAttachment (a link, no bytes) is NOT specially refused
+  // here despite being exactly the kind of target a "download URL" can never
+  // usefully serve: no verified way exists to detect it from this probe's
+  // response, and a refusal keyed on an unverifiable field is worse than no
+  // refusal at all. It falls through to the ordinary mint-and-fetch path and
+  // gets whatever error Graph's `/$value` produces for it.
   let accessToken: string | undefined;
   try {
     accessToken = await authManager?.getTokenForAccount(accountParam);
@@ -537,26 +540,6 @@ async function mintDownloadUrl(
     accessToken = undefined;
   }
   const probe = await probeMailEventAttachment(target, { graphClient }, accessToken);
-  if (probe.isReferenceAttachment) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            error: 'reference_attachment',
-            message:
-              'This is a reference (link) attachment, not a file: Microsoft Graph stores no bytes for ' +
-              'it in this mailbox, only a link to where the real content lives. There is nothing for a ' +
-              'download URL to serve.',
-            name: probe.name,
-            contentType: probe.contentType,
-            size: probe.size,
-          }),
-        },
-      ],
-      isError: true,
-    };
-  }
 
   let ticket: { id: string; expiresAtMs: number };
   try {
@@ -709,49 +692,9 @@ const CONTRACT_ERROR_CODES = new Set([
 ]);
 
 /**
- * Result of probing a mail/event attachment's metadata before deciding
- * whether -- and how -- to mint a ticket for its bytes.
- */
-interface AttachmentProbe extends AttachmentFacts {
-  /**
-   * True when Graph's own metadata identifies this as a `referenceAttachment`
-   * -- a link, with no bytes stored in this mailbox at all. `/$value` on one
-   * of these is not "a document this server failed to convert"; it is not a
-   * document at all, and the caller above must refuse before minting rather
-   * than spend a ticket and a proxy round trip finding that out the hard way.
-   */
-  isReferenceAttachment: boolean;
-}
-
-const UNKNOWN_PROBE: AttachmentProbe = { ...UNKNOWN_ATTACHMENT, isReferenceAttachment: false };
-
-/**
- * Graph's `@odata.type` annotation, IF present, for the `referenceAttachment`
- * subtype -- a link, with no bytes stored in this mailbox.
- *
- * **This is read defensively, not relied on.** No registered tool in this
- * server's endpoints.json reaches a GET on the single attachment resource
- * this probe queries (`/me/messages/{id}/attachments/{id}` has only a DELETE
- * entry there) -- only `list-mail-attachments`' COLLECTION endpoint is
- * registered, and every tool-facing response (this one included) is stripped
- * of every `@odata.*` key by `graph-client.ts`'s `formatJsonResponse` before
- * it reaches a caller. So whether Graph actually volunteers `@odata.type` on
- * EITHER shape has never been observed live by this project, through the MCP
- * tool interface, by anyone -- this probe's own call bypasses that stripper
- * (it uses `makeRequest` directly, not `graphRequest`), so it WOULD see the
- * annotation if Graph sends it, but that is exactly the part nothing has
- * verified. If Graph never sends it, this check is a no-op: `isReferenceAttachment`
- * stays `false`, and behaviour for that (unconfirmed) case is unchanged from
- * before this fix. Costed as free-if-wrong rather than promoted to something
- * this server's tests or docs claim is proven.
- */
-const REFERENCE_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.referenceAttachment';
-
-/**
  * `name`/`contentType`/`size` for a mail or event attachment, from Graph's own
- * metadata -- plus whether it is a reference (link) attachment -- read at mint
- * time so the ticket can carry a useful Content-Type hint and, for a
- * reference attachment, so the caller can refuse before minting anything.
+ * metadata, read at mint time so the ticket can carry a useful Content-Type
+ * hint.
  *
  * Probed only for mail and event attachments ending in `/$value`. Those are
  * the only Graph resources carrying all three base fields; asking a message
@@ -760,35 +703,60 @@ const REFERENCE_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.referenceAttachment';
  *
  * `contentType` is used EXACTLY as Graph's metadata states it, with no
  * inference layered on top. An earlier version of this probe additionally
- * defaulted a null `contentType` to `message/rfc822` whenever `@odata.type`
- * read `#microsoft.graph.itemAttachment` -- Microsoft's own documented
- * contract for that subtype's `/$value`. That default is REMOVED: per the
- * `@odata.type` docstring above, this project has no live evidence `@odata.type`
- * is ever populated in this probe's response, and a gate keyed on a field
- * Graph may never return is not a fix, it is a false promise a mocked test
- * would happily pass. The mechanism this probe actually relies on is
- * verified instead: probing the exact live itemAttachment a prior report
- * named ("Sartre and de Beauvoir, Six Lectures at the RH", a nested forwarded
- * message, 23,317 bytes) shows Graph populating `contentType` directly as
- * `"message/rfc822"` -- no inference needed, just read the field. A
- * DIFFERENT itemAttachment probed live in the same mailbox ("Katusha") shows
- * `contentType: null` instead; that case is simply not improved by this
- * probe -- the route's stream-Content-Type fallback is what still applies to
- * it, exactly as it did before this fix.
+ * defaulted a null `contentType` to `message/rfc822` whenever an `@odata.type`
+ * annotation on the same response read `#microsoft.graph.itemAttachment` --
+ * Microsoft's own documented contract for that subtype's `/$value`. That
+ * default, and a sibling one that refused a `referenceAttachment` before
+ * minting by the same `@odata.type` check, are BOTH REMOVED, for the same
+ * reason: this probe calls `ctx.graphClient.makeRequest` directly, which does
+ * NOT run `graph-client.ts`'s `removeODataProps` stripper (that only runs
+ * inside `formatJsonResponse`, which only `graphRequest` calls) -- so
+ * stripping is not why `@odata.type` is unavailable here, contrary to an
+ * earlier version of this comment. The real reason is narrower and just as
+ * fatal: no tool in `endpoints.json` performs a GET on the single attachment
+ * resource this probe queries at all (`/me/messages/{id}/attachments/{id}`
+ * has only a DELETE entry there), and no live `referenceAttachment` specimen
+ * was ever found in the target mailbox despite a broad search. So whether
+ * Graph volunteers `@odata.type` on this exact request has never been
+ * observed, by anyone, through the MCP tool interface -- and neither has any
+ * OTHER base-type-safe field that would discriminate a `referenceAttachment`
+ * from a `fileAttachment`/`itemAttachment`: Graph's OData validation rejects
+ * `$select` of any subtype-specific property (`contentId`, `sourceUrl`, ...)
+ * against this resource's declared abstract type (verified live: requesting
+ * `contentId` 400s with "Could not find a property named 'contentId' on type
+ * 'microsoft.graph.attachment'"), and the same rejection applies to
+ * `sourceUrl` by the identical mechanism -- both are properties of a concrete
+ * subtype, requested against the abstract base type's declared shape, which
+ * is what $select validates against regardless of the concrete runtime type.
+ * A gate that cannot be shown to ever fire is not a fix, it is a false
+ * promise a mocked test would happily pass -- see the project's own prior
+ * lesson on an unscrubbable bypass-list fixture. An honest absence beats it:
+ * a `referenceAttachment` target falls through to the ordinary mint-and-fetch
+ * path and gets whatever error Graph's `/$value` produces for it, same as
+ * before this whole feature existed.
  *
- * Every failure here is swallowed into `UNKNOWN_PROBE`. A probe that fails
- * must never block or replace anything downstream -- minting proceeds with no
- * hint (today's behaviour), and on the error path the caller is already
- * holding a real error that "could not read the metadata of the document you
- * could not read" would only obscure.
+ * The mechanism this probe DOES rely on is verified: probing the exact live
+ * itemAttachment a prior report named ("Sartre and de Beauvoir, Six Lectures
+ * at the RH", a nested forwarded message, 23,317 bytes) shows Graph
+ * populating `contentType` directly as `"message/rfc822"` -- no inference
+ * needed, just read the field. A DIFFERENT itemAttachment probed live in the
+ * same mailbox ("Katusha") shows `contentType: null` instead; that case is
+ * simply not improved by this probe -- the route's stream-Content-Type
+ * fallback is what still applies to it, exactly as it did before this fix.
+ *
+ * Every failure here is swallowed into `UNKNOWN_ATTACHMENT`. A probe that
+ * fails must never block or replace anything downstream -- minting proceeds
+ * with no hint (today's behaviour), and on the error path the caller is
+ * already holding a real error that "could not read the metadata of the
+ * document you could not read" would only obscure.
  */
 async function probeMailEventAttachment(
   target: string,
   ctx: { graphClient: Pick<GraphClient, 'makeRequest'> },
   accessToken: string | undefined
-): Promise<AttachmentProbe> {
+): Promise<AttachmentFacts> {
   if (!MAIL_EVENT_ATTACHMENT_TARGET.test(target) || !target.endsWith('/$value')) {
-    return UNKNOWN_PROBE;
+    return UNKNOWN_ATTACHMENT;
   }
   try {
     const metadataPath = target.slice(0, -'/$value'.length);
@@ -796,17 +764,14 @@ async function probeMailEventAttachment(
       `${metadataPath}?$select=name,contentType,size`,
       { accessToken }
     )) as Record<string, unknown> | null;
-    if (!meta || typeof meta !== 'object') return UNKNOWN_PROBE;
-    const odataType =
-      typeof meta['@odata.type'] === 'string' ? (meta['@odata.type'] as string) : null;
+    if (!meta || typeof meta !== 'object') return UNKNOWN_ATTACHMENT;
     return {
       name: typeof meta.name === 'string' ? meta.name : null,
       size: typeof meta.size === 'number' ? meta.size : null,
-      isReferenceAttachment: odataType === REFERENCE_ATTACHMENT_ODATA_TYPE,
       contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
     };
   } catch {
-    return UNKNOWN_PROBE;
+    return UNKNOWN_ATTACHMENT;
   }
 }
 
@@ -1461,19 +1426,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // Probed ONCE, before any minting, and reused for every attempt below
       // AND for the failure envelope if every attempt fails -- one Graph call
       // per read-document invocation rather than one per attempt or a second
-      // one on failure. This is also the only place that can refuse a
-      // referenceAttachment before spending a ticket and a proxy round trip
-      // on a conversion that cannot succeed (it names a link, not bytes).
+      // one on failure. A referenceAttachment (a link, no bytes) is NOT
+      // specially refused here -- see probeMailEventAttachment's docstring
+      // for why no verified way exists to detect one from this probe's
+      // response. It falls through to the attempt loop below and gets
+      // whatever error the proxy's own fetch of Graph's `/$value` produces.
       const probe = await probeMailEventAttachment(target, ctx, accessToken);
-      if (probe.isReferenceAttachment) {
-        return readDocumentError(
-          'reference_attachment',
-          'This is a reference (link) attachment, not a file: Microsoft Graph stores no bytes for it ' +
-            'in this mailbox, only a link to where the real content lives. There is nothing here to ' +
-            'convert.',
-          { name: probe.name, contentType: probe.contentType, size: probe.size }
-        );
-      }
 
       /**
        * One attempt: one FRESH mint, one conversion.

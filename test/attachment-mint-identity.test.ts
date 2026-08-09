@@ -177,7 +177,14 @@ describe('get-download-url carries the same content-type probe read-document doe
     expect(lease.probedName).toBe('Katusha');
   });
 
-  it('refuses a reference attachment before minting a ticket (mocked -- @odata.type presence here is UNVERIFIED live, see graph-tools.ts)', async () => {
+  it('does NOT special-case a reference-attachment-shaped probe response -- mints a ticket like anything else', async () => {
+    // Mirrors read-document's equivalent test: an earlier version of this
+    // probe tried to refuse a referenceAttachment before minting, keyed on
+    // @odata.type. That detection is removed (see probeMailEventAttachment's
+    // docstring in graph-tools.ts for why it could never be shown to fire),
+    // so this fixture -- supplying every field a plausible detector might
+    // key on -- must still mint normally. Reintroducing detection on ANY of
+    // these fields breaks this test.
     const graphClient = {
       makeRequest: async () => ({
         name: 'Shared design doc',
@@ -191,12 +198,11 @@ describe('get-download-url carries the same content-type probe read-document doe
 
     const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx(graphClient));
 
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy();
     const body = parse(result as never);
-    expect(body.error).toBe('reference_attachment');
-    expect(body.downloadUrl).toBeUndefined();
-    expect(mintSpy).not.toHaveBeenCalled();
-    expect(store.size()).toBe(0);
+    expect(body.downloadUrl).toMatch(/^http:\/\/m365:3000\/attachment\?/);
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    expect(store.size()).toBe(1);
   });
 });
 

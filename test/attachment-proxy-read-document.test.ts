@@ -478,25 +478,25 @@ describe('read-document mints with the content-type it already knows', () => {
     expect(probe?.name).toBe('Katusha');
   });
 
-  it('refuses a reference attachment before minting anything, with a clear error', async () => {
-    // A referenceAttachment carries no bytes at all -- it is a link. Fetching
-    // its /$value would either error confusingly or return something that is
-    // not the linked file, so this must be refused up front rather than
-    // spending a ticket and a proxy round trip on a conversion that cannot
-    // succeed.
+  it('does NOT special-case a reference-attachment-shaped probe response -- mints and fetches like anything else', async () => {
+    // A referenceAttachment carries no bytes at all -- it is a link -- and an
+    // earlier version of this probe tried to refuse one before minting,
+    // keyed on an `@odata.type` annotation. That detection is REMOVED: no
+    // tool in endpoints.json performs a GET on the single attachment
+    // resource this probe queries at all, no live referenceAttachment
+    // specimen was ever found despite a broad search, and Graph's OData
+    // validation rejects $select of any subtype-specific property (verified
+    // live for `contentId`; `sourceUrl` is rejected by the identical
+    // mechanism) -- so there was never a way to prove the detection could
+    // fire. See probeMailEventAttachment's docstring in graph-tools.ts.
     //
-    // UNVERIFIED LIVE: no referenceAttachment specimen was ever found in the
-    // target mailbox despite a broad search (see the content-type report),
-    // and this detection depends on the same @odata.type annotation the
-    // itemAttachment default above turned out NOT to be able to rely on --
-    // no registered tool reaches the single-entity GET this probe calls, so
-    // whether Graph actually sends @odata.type here has never been observed
-    // live. This mocked test proves the WIRING (refuse-before-mint, given the
-    // annotation) is correct; it does not prove the annotation arrives in
-    // production. If it never does, this refusal simply never fires and
-    // behaviour for that (unconfirmed) case is unchanged from before this fix
-    // -- see probeMailEventAttachment's docstring in graph-tools.ts.
-    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'never reached' });
+    // This test is the inverse of the one that used to live here: it proves
+    // the ABSENCE of special-casing is real, not assumed. If detection is
+    // reintroduced keyed on any field in this fixture -- @odata.type,
+    // sourceUrl, or otherwise -- this test fails (mint would not be called,
+    // or the proxy never dialled). That is the point: the fixture below
+    // supplies every field a plausible detector might key on, on purpose.
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'converted anyway' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
     const graphClient = graphClientReturning({
       name: 'Shared design doc',
@@ -509,15 +509,11 @@ describe('read-document mints with the content-type it already knows', () => {
 
     const result = await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
 
-    expect(result.isError).toBe(true);
-    const body = JSON.parse(result.text);
-    // Actionable, not a bare "conversion failed": names what this actually is.
-    expect(body.error).toBe('reference_attachment');
-    expect(body.message).toMatch(/reference|link/i);
-    expect(body.name).toBe('Shared design doc');
-    expect(mintSpy).not.toHaveBeenCalled();
-    expect(requests).toHaveLength(0);
-    expect(store.size()).toBe(0);
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe('converted anyway');
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    expect(requests).toHaveLength(1);
+    expect(store.size()).toBe(1);
   });
 
   it('keeps minting usable when the probe itself fails, defaulting to no information', async () => {
