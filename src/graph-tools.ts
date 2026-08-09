@@ -453,11 +453,50 @@ const MEETING_RECORDING_TARGETS = [
 ];
 const VALUE_BYTE_TARGET = /\/\$value$/;
 
+// Family membership, not a mint decision. This drives preset derivation too
+// (attachment-url-preset-gating.test.ts applies it to endpoints.json's base
+// -- never `/$value`-suffixed -- path patterns to answer "which presets
+// contain a resource this flag was built for"), which is exactly why
+// MAIL_EVENT_ATTACHMENT_TARGET stays broad enough to match the attachment
+// resource family without requiring `/$value`. Do NOT use `.some()` over this
+// array as a security gate on a caller-supplied target -- use
+// `isMintableTarget()` below, which pairs that same family match with the
+// suffix requirement the family match alone cannot express.
 export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
   MAIL_EVENT_ATTACHMENT_TARGET,
   ...MEETING_RECORDING_TARGETS,
   VALUE_BYTE_TARGET,
 ];
+
+/**
+ * Whether `target` is a Graph byte resource this server can actually mint a
+ * ticket for -- the real security gate, as opposed to iterating
+ * `MINTABLE_TARGET_PATTERNS` directly with `.some()`.
+ *
+ * A target that matches the mail/event attachment FAMILY but does not end in
+ * `/$value` names that attachment's *metadata* resource, not its bytes: for a
+ * fileAttachment, Graph's metadata response carries `contentBytes` as base64
+ * JSON. Minting a ticket for it would stream that metadata blob -- bytes and
+ * all -- out through the redemption route in attachment-route.ts, which has
+ * no response scrubber (streaming raw bytes with no MCP envelope is the whole
+ * point of a ticket). `describeAttachment` below has always paired the family
+ * match with this same suffix requirement; every other minting decision must
+ * too, or the scrubber that exists specifically to keep `contentBytes` out of
+ * the model's context has a hole a caller can drive straight through.
+ *
+ * The other two families (meeting recordings, generic `/$value` endpoints)
+ * are already correctly end-anchored in their own patterns, so a plain
+ * `.some()` over them is safe.
+ */
+export function isMintableTarget(target: string): boolean {
+  if (MAIL_EVENT_ATTACHMENT_TARGET.test(target)) {
+    return target.endsWith('/$value');
+  }
+  return (
+    MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(target)) ||
+    VALUE_BYTE_TARGET.test(target)
+  );
+}
 
 /**
  * Mint a server-served download URL for a Graph byte resource Graph itself
@@ -1070,7 +1109,11 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // only from base64 contentBytes or the authenticated /$value endpoint (use download-bytes).
       // Match only real Graph mail/calendar attachment resources so driveItem path addressing
       // with folders named messages/events/attachments is not falsely rejected.
-      if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart)) {
+      //
+      // Paired with the /$value suffix, not just the family match: without it, pathPart names
+      // the attachment's metadata resource (contentBytes and all), not its bytes -- see
+      // isMintableTarget's docstring above for why minting that would defeat the scrubber.
+      if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart) && pathPart.endsWith('/$value')) {
         const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
         if (minted) return minted;
         return {
@@ -1301,12 +1344,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         );
       }
 
-      // Validated against the same patterns get-download-url mints for, and for
-      // the same reason: a ticket grants an authenticated GET of exactly one
-      // Graph path with this server's own token, so the set of paths a ticket
-      // can name is the whole of what the capability is worth. One list, one
-      // answer to "what can this feature reach".
-      if (!target.startsWith('/') || !MINTABLE_TARGET_PATTERNS.some((p) => p.test(target))) {
+      // Validated against the same resource families get-download-url mints for, and for the
+      // same reason: a ticket grants an authenticated GET of exactly one Graph path with this
+      // server's own token, so the set of paths a ticket can name is the whole of what the
+      // capability is worth. `isMintableTarget` is the actual gate (see its docstring) rather
+      // than a raw `MINTABLE_TARGET_PATTERNS.some()`, precisely because that family list alone
+      // would accept a mail/event attachment target missing its required /$value suffix.
+      if (!target.startsWith('/') || !isMintableTarget(target)) {
         return readDocumentError(
           'invalid_target',
           `target must be a relative Microsoft Graph byte path this server can mint for: a mail or event attachment ` +

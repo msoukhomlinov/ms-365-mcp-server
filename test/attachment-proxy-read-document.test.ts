@@ -208,6 +208,23 @@ describe('read-document', () => {
     expect(JSON.parse(result.text).error).toBe('invalid_target');
   });
 
+  it('refuses a mail attachment target missing its required /$value suffix as invalid_target', async () => {
+    // The mail/event attachment FAMILY pattern alone matches this (no /$value
+    // required); without the paired suffix check this names the attachment's
+    // metadata resource -- contentBytes and all -- rather than its bytes, and
+    // minting a ticket for it would stream that metadata straight through the
+    // scrubber-free redemption route.
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'never reached' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await call(await connect(), { target: '/me/messages/AAA/attachments/BBB' });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.text).error).toBe('invalid_target');
+    expect(store.size()).toBe(0);
+    expect(requests).toHaveLength(0);
+  });
+
   it('mints a fresh ticket on every call rather than reusing one', async () => {
     const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'ok' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
