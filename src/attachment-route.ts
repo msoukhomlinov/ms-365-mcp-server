@@ -51,6 +51,146 @@ function refuse(res: Response): void {
   res.status(404).type('text/plain').send(NOT_FOUND_BODY);
 }
 
+/**
+ * Content-Type values that name no real format.
+ *
+ * `application/octet-stream` is `graph-client.ts`'s own fallback when Graph's
+ * `/$value` response carries no `content-type` header at all -- so by the
+ * time it reaches here it is indistinguishable from "Graph genuinely said
+ * this", and either way a generic subtype matches nothing in a converter's
+ * format table. `application/binary` is the same shape from a different
+ * source (some older Exchange/Outlook clients write it into an attachment's
+ * own stored MIME type when they had nothing better). The empty string is
+ * defensive -- `downloadStream` should never hand back `''`, since it already
+ * ORs against the same fallback, but treating it as generic rather than
+ * "specific and empty" costs nothing and closes off a future refactor
+ * removing that OR from silently reintroducing an unroutable header.
+ * Parameters (`; charset=...`) are stripped before comparing, the same way
+ * `isBinaryContentType` in graph-client.ts does it.
+ */
+const GENERIC_CONTENT_TYPES = new Set(['application/octet-stream', 'application/binary', '']);
+
+function isGenericContentType(contentType: string): boolean {
+  return GENERIC_CONTENT_TYPES.has(contentType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * Every character Node's own `http.OutgoingMessage.setHeader` accepts in a
+ * header VALUE: horizontal tab, the printable ASCII range, and the raw Latin-1
+ * supplement (0x80-0xFF) -- HTTP header values are historically ISO-8859-1,
+ * not UTF-8, so Node does not reject bytes in that range even though they are
+ * not ASCII. Anything else, including every code point past U+00FF, makes
+ * `setHeader` throw `ERR_INVALID_CHAR` synchronously (verified directly
+ * against a real `http.OutgoingMessage` in this file's test suite). A field
+ * this route reads from Graph's OWN metadata JSON -- `name`, `contentType` --
+ * is not constrained to this set at the source the way `stream.contentType`
+ * and `stream.contentDisposition` are (those already passed through an actual
+ * HTTP response header when Graph sent them, which could not have carried an
+ * invalid byte in the first place), so anything probed has to be checked
+ * before it reaches `setHeader`.
+ */
+const HEADER_SAFE_CHAR = /^[\t\x20-\x7e\x80-\xff]*$/;
+
+/**
+ * True when `contentType` can be set as a header value without Node throwing.
+ * There is no RFC 5987-style fallback for Content-Type the way there is for a
+ * filename: a MIME type is defined to be an ASCII token (RFC 6838), so a
+ * probed value outside the header-safe range is not a real content-type
+ * Graph would have produced -- it is unusable metadata, and the caller falls
+ * back to the stream's own type (which is always header-safe already) rather
+ * than transliterating something that was never going to be a valid MIME
+ * type regardless.
+ */
+function isHeaderSafeContentType(contentType: string): boolean {
+  return HEADER_SAFE_CHAR.test(contentType);
+}
+
+/**
+ * Strip the characters that would let a name escape a quoted-string
+ * parameter (`"`, and its escape character `\`) or, combined with anything
+ * outside `HEADER_SAFE_CHAR`, inject a second header via CR/LF. Used both for
+ * the ASCII-safe `filename=` fallback and, implicitly, made irrelevant for
+ * `filename*=` -- `encodeURIComponent` percent-encodes `"` and `\` on its own,
+ * so the extended form never needs this step.
+ */
+function quotedStringSafe(value: string): string {
+  return value.replace(/[\r\n"\\]/g, '');
+}
+
+/**
+ * An ASCII/Latin-1-safe stand-in for `name`, for the mandatory `filename=`
+ * parameter RFC 6266 requires alongside any `filename*=` extension (a client
+ * that does not understand the extended form falls back to this one, so it
+ * has to be usable on its own, not empty).
+ *
+ * Drops every character `HEADER_SAFE_CHAR` would reject, plus the
+ * quoted-string-breaking ones `quotedStringSafe` handles. When nothing
+ * printable survives -- a name that is entirely outside Latin-1, e.g. an
+ * all-CJK filename -- recovers at least the extension if the original name
+ * has an ASCII one, which is exactly the signal docglean's own
+ * extension-based format resolver would use; falls back to the bare
+ * `attachment` disposition's own filename convention otherwise.
+ */
+function asciiSafeFilenameFallback(name: string): string {
+  const safe = quotedStringSafe(name)
+    .replace(/[^\t\x20-\x7e\x80-\xff]/g, '')
+    .trim();
+  const extension = /(\.[A-Za-z0-9]{1,10})$/.exec(name)?.[1] ?? '';
+  // If what survived is nothing, or is nothing MORE than the extension itself
+  // (every character of the actual name was outside the safe range), a bare
+  // extension like `.pdf` is a worse fallback than a named one: it reads as a
+  // hidden file with no name, not as "a PDF this server could not label".
+  if (safe && safe !== extension) return safe;
+  return extension ? `attachment${extension}` : safe || 'attachment';
+}
+
+/**
+ * Percent-encode `str` per RFC 5987's `attr-char` grammar for use in an
+ * `ext-value` (the `filename*=UTF-8''<this>` form).
+ *
+ * `encodeURIComponent` alone is not sufficient: it leaves `' ( ) *` unescaped
+ * because they are "unreserved" for a URI component, but none of the four is
+ * in `attr-char` (`ALPHA / DIGIT / "!" / "#" / "$" / "&" / "+" / "-" / "." /
+ * "^" / "_" / "`" / "|" / "~"`), so a name containing any of them would
+ * produce a value that fails RFC 5987's grammar even though it looks
+ * plausible. `"` and `\` ARE covered by plain `encodeURIComponent` already
+ * (neither is in its unreserved set), so `filename*=` needs no separate
+ * quoted-string handling the way `filename=` does.
+ */
+function encodeRfc5987ValueChars(str: string): string {
+  return encodeURIComponent(str).replace(
+    /['()*]/g,
+    (char) => '%' + char.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
+
+/**
+ * A `Content-Disposition` header naming `name`, or the bare `attachment`
+ * fallback when there is no name to give. `name` is untrusted -- it is
+ * Graph's own attachment metadata, not this server's choice -- and, unlike
+ * `stream.contentDisposition`, never passed through an actual HTTP header at
+ * its source, so it can contain anything, including characters Node's own
+ * `setHeader` rejects outright (see `HEADER_SAFE_CHAR`).
+ *
+ * Always emits an ASCII/Latin-1-safe `filename=` (RFC 6266 requires one
+ * regardless, as the fallback for a client that ignores the extended form),
+ * and additionally emits `filename*=UTF-8''<percent-encoded>` -- carrying the
+ * real name -- whenever `name` contains anything outside that safe range.
+ * Emitting only the extended form, or only a naively-encoded one, are both
+ * real mistakes this function avoids on purpose: RFC 6266/5987 clients expect
+ * both parameters together, and a bare `encodeURIComponent` swap would
+ * produce a value invalid under RFC 5987's narrower `attr-char` set.
+ */
+function contentDispositionFor(name: string | null): string {
+  if (!name) return 'attachment';
+  const fallback = asciiSafeFilenameFallback(name);
+  let value = `attachment; filename="${fallback}"`;
+  if (!HEADER_SAFE_CHAR.test(name)) {
+    value += `; filename*=UTF-8''${encodeRfc5987ValueChars(name)}`;
+  }
+  return value;
+}
+
 export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
   return async (req: Request, res: Response): Promise<void> => {
     const raw = req.query[TICKET_PARAM];
@@ -108,7 +248,25 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       }
 
       res.status(200);
-      res.setHeader('content-type', stream.contentType);
+      // Precedence: a SPECIFIC Content-Type on THIS fetch's own response wins,
+      // because it is what Graph is answering right now; the ticket's probed
+      // type (learned from Graph's attachment metadata at mint time, see
+      // `probeMailEventAttachment` in graph-tools.ts) is used only when the
+      // stream itself carries nothing useful. Authoritative metadata beats a
+      // generic default, but a specific response header beats a probe that
+      // may be stale -- the probe ran once, at mint time; this fetch is
+      // happening now and may be a retry against a target whose Graph-side
+      // state has moved on.
+      const probedContentType =
+        lease.probedContentType && isHeaderSafeContentType(lease.probedContentType)
+          ? lease.probedContentType
+          : null;
+      res.setHeader(
+        'content-type',
+        isGenericContentType(stream.contentType) && probedContentType
+          ? probedContentType
+          : stream.contentType
+      );
       // Only declare a length that is a real, positive count of bytes. A
       // `content-length: 0` on a body we are about to stream is never correct
       // here: Node ends the response after zero bytes, the pipeline below then
@@ -124,11 +282,19 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       ) {
         res.setHeader('content-length', String(stream.contentLength));
       }
-      // Graph's own filename when it gave one. `attachment` either way: this
-      // endpoint serves untrusted bytes from a mailbox, and a browser that
-      // wandered onto the URL must not render an inline text/html attachment as
-      // a page on this origin.
-      res.setHeader('content-disposition', stream.contentDisposition ?? 'attachment');
+      // Graph's own filename when it gave one. Falling back to the ticket's
+      // probed name (rather than the bare `attachment` default) hands
+      // docglean a second, cheaper axis for free: its own format resolver
+      // also reads an extension off Content-Disposition's filename, so a
+      // real name can recover a correct route even when neither Content-Type
+      // is specific. `attachment` either way, never `inline`: this endpoint
+      // serves untrusted bytes from a mailbox, and a browser that wandered
+      // onto the URL must not render an inline text/html attachment as a page
+      // on this origin.
+      res.setHeader(
+        'content-disposition',
+        stream.contentDisposition ?? contentDispositionFor(lease.probedName)
+      );
       res.setHeader('cache-control', 'no-store');
       res.setHeader('x-content-type-options', 'nosniff');
 
