@@ -350,6 +350,203 @@ describe('read-document', () => {
   });
 });
 
+/**
+ * The confirmed live defect and its fix: docglean does not sniff format, so
+ * `read-document` converting correctly for every attachment kind depends on
+ * `attachment-route.ts` serving a usable Content-Type -- and the only lever
+ * this server has over that, for a mail/event attachment, is what it learned
+ * about the target BEFORE minting. These tests pin what gets learned and
+ * carried, not the route's precedence itself (that is
+ * `attachment-route-content-type.test.ts`).
+ */
+describe('read-document mints with the content-type it already knows', () => {
+  let store: AttachmentTicketStore;
+
+  async function connect(graphClient: GraphClient): Promise<Client> {
+    const server = new McpServer({ name: 'test', version: '1.0.0' });
+    registerGraphTools(
+      server,
+      graphClient,
+      false,
+      '^read-document$',
+      false,
+      undefined,
+      false,
+      [],
+      undefined,
+      true,
+      true
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  async function call(
+    client: Client,
+    args: Record<string, unknown>
+  ): Promise<{ isError: boolean; text: string }> {
+    const result = (await client.callTool({ name: 'read-document', arguments: args })) as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+    return { isError: Boolean(result.isError), text: result.content[0].text };
+  }
+
+  function graphClientReturning(meta: Record<string, unknown> | null): GraphClient {
+    return { makeRequest: async () => meta } as unknown as GraphClient;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = new AttachmentTicketStore(120);
+    configureAttachmentMinting({ store, config: URL_CONFIG });
+  });
+
+  afterEach(() => {
+    resetAttachmentMinting();
+    resetAttachmentProxy();
+    vi.restoreAllMocks();
+  });
+
+  it('passes a specific probed content-type from Graph metadata into the mint', async () => {
+    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = graphClientReturning({
+      name: 'report.pdf',
+      contentType: 'application/pdf',
+      size: 195663,
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    const probe = mintSpy.mock.calls[0]?.[3];
+    expect(probe?.contentType).toBe('application/pdf');
+    expect(probe?.name).toBe('report.pdf');
+  });
+
+  it('carries a directly-populated message/rfc822 content-type, verified against a real itemAttachment', async () => {
+    // Verified live against the deployed mailbox: Graph's OWN metadata for the
+    // itemAttachment "Sartre and de Beauvoir, Six Lectures at the RH" (a
+    // nested forwarded message, 23,317 bytes) populates contentType directly
+    // as "message/rfc822" -- read verbatim, no @odata.type inference involved.
+    // This is the verified mechanism the fix actually depends on.
+    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = graphClientReturning({
+      name: 'Sartre and de Beauvoir, Six Lectures at the RH',
+      contentType: 'message/rfc822',
+      size: 23317,
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    const probe = mintSpy.mock.calls[0]?.[3];
+    expect(probe?.contentType).toBe('message/rfc822');
+    expect(probe?.name).toBe('Sartre and de Beauvoir, Six Lectures at the RH');
+  });
+
+  it('does not invent a content-type when Graph leaves it null, even with an itemAttachment @odata.type present', async () => {
+    // No @odata.type-gated default: no registered tool in this server's
+    // endpoints.json reaches the single-entity attachment GET this probe
+    // calls (only DELETE is registered for that path), so whether Graph
+    // volunteers @odata.type there has never been verified live. A null
+    // metadata contentType -- also verified live, on a DIFFERENT
+    // itemAttachment ("Katusha") than the one above -- stays null here; the
+    // route's own stream-Content-Type fallback is what still applies to that
+    // case, unchanged from before this fix.
+    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = graphClientReturning({
+      name: 'Katusha',
+      contentType: null,
+      size: 206268,
+      '@odata.type': '#microsoft.graph.itemAttachment',
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    const probe = mintSpy.mock.calls[0]?.[3];
+    expect(probe?.contentType).toBeNull();
+    expect(probe?.name).toBe('Katusha');
+  });
+
+  it('does NOT special-case a reference-attachment-shaped probe response -- mints and fetches like anything else', async () => {
+    // A referenceAttachment carries no bytes at all -- it is a link -- and an
+    // earlier version of this probe tried to refuse one before minting,
+    // keyed on an `@odata.type` annotation. That detection is REMOVED: no
+    // tool in endpoints.json performs a GET on the single attachment
+    // resource this probe queries at all, no live referenceAttachment
+    // specimen was ever found despite a broad search, and Graph's OData
+    // validation rejects $select of any subtype-specific property (verified
+    // live for `contentId`; `sourceUrl` is rejected by the identical
+    // mechanism) -- so there was never a way to prove the detection could
+    // fire. See probeMailEventAttachment's docstring in graph-tools.ts.
+    //
+    // This test is the inverse of the one that used to live here: it proves
+    // the ABSENCE of special-casing is real, not assumed. If detection is
+    // reintroduced keyed on any field in this fixture -- @odata.type,
+    // sourceUrl, or otherwise -- this test fails (mint would not be called,
+    // or the proxy never dialled). That is the point: the fixture below
+    // supplies every field a plausible detector might key on, on purpose.
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'converted anyway' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = graphClientReturning({
+      name: 'Shared design doc',
+      contentType: null,
+      size: 48213,
+      '@odata.type': '#microsoft.graph.referenceAttachment',
+      sourceUrl: 'https://contoso.sharepoint.com/:w:/link',
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    const result = await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe('converted anyway');
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    expect(requests).toHaveLength(1);
+    expect(store.size()).toBe(1);
+  });
+
+  it('keeps minting usable when the probe itself fails, defaulting to no information', async () => {
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'ok despite no probe' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = {
+      makeRequest: async () => {
+        throw new Error('Graph 404');
+      },
+    } as unknown as GraphClient;
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    const result = await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    expect(result.isError).toBe(false);
+    expect(requests).toHaveLength(1);
+    const probe = mintSpy.mock.calls[0]?.[3];
+    expect(probe?.contentType).toBeNull();
+    expect(probe?.name).toBeNull();
+  });
+
+  it('does not probe at all for a target that is not a mail/event attachment', async () => {
+    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const makeRequest = vi.fn(async () => ({ name: 'x', contentType: 'x', size: 1 }));
+    const graphClient = { makeRequest } as unknown as GraphClient;
+
+    await call(await connect(graphClient), { target: '/drives/DRIVE1/items/ITEM1/content' });
+
+    expect(makeRequest).not.toHaveBeenCalled();
+  });
+});
+
 /** A port nothing is listening on: bound to learn the number, then released. */
 async function reserveClosedPort(): Promise<number> {
   const holder = await new Promise<Server>((resolve) => {

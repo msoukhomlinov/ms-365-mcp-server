@@ -477,7 +477,8 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
 async function mintDownloadUrl(
   target: string,
   accountParam: string | undefined,
-  authManager: AuthManager | undefined
+  authManager: AuthManager | undefined,
+  graphClient: Pick<GraphClient, 'makeRequest'>
 ): Promise<CallToolResult | null> {
   const minting = getAttachmentMinting();
   if (!minting) return null;
@@ -522,9 +523,30 @@ async function mintDownloadUrl(
     };
   }
 
+  // Probed once, before minting: the ticket needs to carry whatever this
+  // server already knows about the target's Content-Type -- see
+  // `probeMailEventAttachment`'s docstring for why the redemption route needs
+  // it and can't always trust Graph's own `/$value` response header, and for
+  // why a referenceAttachment (a link, no bytes) is NOT specially refused
+  // here despite being exactly the kind of target a "download URL" can never
+  // usefully serve: no verified way exists to detect it from this probe's
+  // response, and a refusal keyed on an unverifiable field is worse than no
+  // refusal at all. It falls through to the ordinary mint-and-fetch path and
+  // gets whatever error Graph's `/$value` produces for it.
+  let accessToken: string | undefined;
+  try {
+    accessToken = await authManager?.getTokenForAccount(accountParam);
+  } catch {
+    accessToken = undefined;
+  }
+  const probe = await probeMailEventAttachment(target, { graphClient }, accessToken);
+
   let ticket: { id: string; expiresAtMs: number };
   try {
-    ticket = minting.store.mint(target, accountParam);
+    ticket = minting.store.mint(target, accountParam, undefined, {
+      contentType: probe.contentType,
+      name: probe.name,
+    });
   } catch (error) {
     if (error instanceof TicketStoreFullError) {
       return {
@@ -670,21 +692,67 @@ const CONTRACT_ERROR_CODES = new Set([
 ]);
 
 /**
- * Best-effort `name`/`contentType`/`size` for the error envelope.
+ * `name`/`contentType`/`size` for a mail or event attachment, from Graph's own
+ * metadata, read at mint time so the ticket can carry a useful Content-Type
+ * hint.
  *
- * Probed only for mail and event attachments, and only on a failure path. Those
- * are the only Graph resources carrying all three fields; asking a message or a
- * photo for `$select=name,contentType,size` is a guaranteed 400, which would put
- * a noisy Graph error in the log on every failure and buy nothing.
+ * Probed only for mail and event attachments ending in `/$value`. Those are
+ * the only Graph resources carrying all three base fields; asking a message
+ * or a photo for `$select=name,contentType,size` is a guaranteed 400, which
+ * would put a noisy Graph error in the log on every call and buy nothing.
  *
- * Every failure here is swallowed. The caller is already holding a real error,
- * and a probe that fails must never replace it -- "could not read the metadata
- * of the document you could not read" is strictly less useful than the original
- * refusal with three nulls beside it.
+ * `contentType` is used EXACTLY as Graph's metadata states it, with no
+ * inference layered on top. An earlier version of this probe additionally
+ * defaulted a null `contentType` to `message/rfc822` whenever an `@odata.type`
+ * annotation on the same response read `#microsoft.graph.itemAttachment` --
+ * Microsoft's own documented contract for that subtype's `/$value`. That
+ * default, and a sibling one that refused a `referenceAttachment` before
+ * minting by the same `@odata.type` check, are BOTH REMOVED, for the same
+ * reason: this probe calls `ctx.graphClient.makeRequest` directly, which does
+ * NOT run `graph-client.ts`'s `removeODataProps` stripper (that only runs
+ * inside `formatJsonResponse`, which only `graphRequest` calls) -- so
+ * stripping is not why `@odata.type` is unavailable here, contrary to an
+ * earlier version of this comment. The real reason is narrower and just as
+ * fatal: no tool in `endpoints.json` performs a GET on the single attachment
+ * resource this probe queries at all (`/me/messages/{id}/attachments/{id}`
+ * has only a DELETE entry there), and no live `referenceAttachment` specimen
+ * was ever found in the target mailbox despite a broad search. So whether
+ * Graph volunteers `@odata.type` on this exact request has never been
+ * observed, by anyone, through the MCP tool interface -- and neither has any
+ * OTHER base-type-safe field that would discriminate a `referenceAttachment`
+ * from a `fileAttachment`/`itemAttachment`: Graph's OData validation rejects
+ * `$select` of any subtype-specific property (`contentId`, `sourceUrl`, ...)
+ * against this resource's declared abstract type (verified live: requesting
+ * `contentId` 400s with "Could not find a property named 'contentId' on type
+ * 'microsoft.graph.attachment'"), and the same rejection applies to
+ * `sourceUrl` by the identical mechanism -- both are properties of a concrete
+ * subtype, requested against the abstract base type's declared shape, which
+ * is what $select validates against regardless of the concrete runtime type.
+ * A gate that cannot be shown to ever fire is not a fix, it is a false
+ * promise a mocked test would happily pass -- see the project's own prior
+ * lesson on an unscrubbable bypass-list fixture. An honest absence beats it:
+ * a `referenceAttachment` target falls through to the ordinary mint-and-fetch
+ * path and gets whatever error Graph's `/$value` produces for it, same as
+ * before this whole feature existed.
+ *
+ * The mechanism this probe DOES rely on is verified: probing the exact live
+ * itemAttachment a prior report named ("Sartre and de Beauvoir, Six Lectures
+ * at the RH", a nested forwarded message, 23,317 bytes) shows Graph
+ * populating `contentType` directly as `"message/rfc822"` -- no inference
+ * needed, just read the field. A DIFFERENT itemAttachment probed live in the
+ * same mailbox ("Katusha") shows `contentType: null` instead; that case is
+ * simply not improved by this probe -- the route's stream-Content-Type
+ * fallback is what still applies to it, exactly as it did before this fix.
+ *
+ * Every failure here is swallowed into `UNKNOWN_ATTACHMENT`. A probe that
+ * fails must never block or replace anything downstream -- minting proceeds
+ * with no hint (today's behaviour), and on the error path the caller is
+ * already holding a real error that "could not read the metadata of the
+ * document you could not read" would only obscure.
  */
-async function describeAttachment(
+async function probeMailEventAttachment(
   target: string,
-  ctx: UtilityToolContext,
+  ctx: { graphClient: Pick<GraphClient, 'makeRequest'> },
   accessToken: string | undefined
 ): Promise<AttachmentFacts> {
   if (!MAIL_EVENT_ATTACHMENT_TARGET.test(target) || !target.endsWith('/$value')) {
@@ -699,8 +767,8 @@ async function describeAttachment(
     if (!meta || typeof meta !== 'object') return UNKNOWN_ATTACHMENT;
     return {
       name: typeof meta.name === 'string' ? meta.name : null,
-      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
       size: typeof meta.size === 'number' ? meta.size : null,
+      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
     };
   } catch {
     return UNKNOWN_ATTACHMENT;
@@ -1071,7 +1139,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // Match only real Graph mail/calendar attachment resources so driveItem path addressing
       // with folders named messages/events/attachments is not falsely rejected.
       if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart)) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1088,7 +1156,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Recording content endpoints return authenticated bytes, not a pre-authenticated URL.
       if (MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(pathPart))) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1105,7 +1173,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Other /$value byte endpoints (profile photo, Teams hosted content) likewise have no URL.
       if (VALUE_BYTE_TARGET.test(pathPart)) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1196,7 +1264,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           // The metadata path carries no downloadUrl, but the bytes are still
           // reachable at its /content sub-resource -- which is what a ticket
           // has to name, since that is what the redemption route will GET.
-          const minted = await mintDownloadUrl(`${itemPath}/content`, accountParam, authManager);
+          const minted = await mintDownloadUrl(
+            `${itemPath}/content`,
+            accountParam,
+            authManager,
+            graphClient
+          );
           if (minted) return minted;
           return {
             content: [
@@ -1350,6 +1423,16 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         accessToken = undefined;
       }
 
+      // Probed ONCE, before any minting, and reused for every attempt below
+      // AND for the failure envelope if every attempt fails -- one Graph call
+      // per read-document invocation rather than one per attempt or a second
+      // one on failure. A referenceAttachment (a link, no bytes) is NOT
+      // specially refused here -- see probeMailEventAttachment's docstring
+      // for why no verified way exists to detect one from this probe's
+      // response. It falls through to the attempt loop below and gets
+      // whatever error the proxy's own fetch of Graph's `/$value` produces.
+      const probe = await probeMailEventAttachment(target, ctx, accessToken);
+
       /**
        * One attempt: one FRESH mint, one conversion.
        *
@@ -1377,7 +1460,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       ): Promise<{ ok: true; markdown: string } | { ok: false; code: string; message: string }> => {
         let ticket: { id: string; expiresAtMs: number };
         try {
-          ticket = minting.store.mint(target, accountParam);
+          ticket = minting.store.mint(target, accountParam, undefined, {
+            contentType: probe.contentType,
+            name: probe.name,
+          });
         } catch (error) {
           if (error instanceof TicketStoreFullError) {
             return { ok: false, code: 'no_capacity', message: error.message };
@@ -1446,7 +1532,15 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         return { content: [{ type: 'text', text: outcome.markdown }] };
       }
 
-      const facts = await describeAttachment(target, ctx, accessToken);
+      // Reuses the SAME probe every attempt already minted with, rather than a
+      // second Graph call: describeAttachment's failure-path contract (best
+      // effort, swallow errors, never replace the real failure) is exactly
+      // what probeMailEventAttachment already provides.
+      const facts: AttachmentFacts = {
+        name: probe.name,
+        contentType: probe.contentType,
+        size: probe.size,
+      };
       const known = CONTRACT_ERROR_CODES.has(outcome.code);
       return readDocumentError(
         known ? outcome.code : 'proxy_error',
