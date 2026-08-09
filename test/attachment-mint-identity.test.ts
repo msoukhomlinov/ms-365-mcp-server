@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { UTILITY_TOOLS } from '../src/graph-tools.js';
 import { requestContext } from '../src/request-context.js';
 import { AttachmentTicketStore } from '../src/lib/attachment-tickets.js';
@@ -90,6 +90,90 @@ describe('minting refuses whenever Graph identity comes from the request', () =>
     const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx());
     expect(result.isError).toBe(true);
     expect(parse(result as never).error).toMatch(/do not expose a pre-authenticated/i);
+  });
+});
+
+/**
+ * get-download-url mints through the exact same `AttachmentTicketStore` and
+ * is served by the exact same redemption route as read-document -- the
+ * Content-Type defect this server confirmed live is not read-document-
+ * specific, it is the route's, so the same probe-before-mint fix has to apply
+ * here too or an agent handed this tool's URL hits the identical failure.
+ */
+describe('get-download-url carries the same content-type probe read-document does', () => {
+  const tool = UTILITY_TOOLS.find((t) => t.name === 'get-download-url')!;
+  const MAIL_ATTACHMENT = '/me/messages/AAA/attachments/BBB/$value';
+  let store: AttachmentTicketStore;
+
+  function ctx(graphClient: unknown) {
+    return {
+      graphClient,
+      authManager: {
+        isOAuthModeEnabled: () => false,
+        isMultiAccount: async () => false,
+        getTokenForAccount: async () => 'SERVER_OWN_TOKEN',
+      } as never,
+      multiAccount: false,
+      accountNames: [],
+    };
+  }
+
+  function parse(result: { content: Array<{ text: string }> }) {
+    return JSON.parse(result.content[0].text);
+  }
+
+  beforeEach(() => {
+    store = new AttachmentTicketStore(120);
+    configureAttachmentMinting({
+      store,
+      config: { base: 'http://m365:3000', key: 'k', keyId: '1', ttlSeconds: 120 },
+    });
+  });
+
+  afterEach(() => resetAttachmentMinting());
+
+  it('mints a ticket whose lease carries the probed content-type and name', async () => {
+    const graphClient = {
+      makeRequest: async () => ({
+        name: 'Katusha',
+        contentType: null,
+        size: 206268,
+        '@odata.type': '#microsoft.graph.itemAttachment',
+      }),
+    };
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx(graphClient));
+
+    const { downloadUrl } = parse(result as never);
+    expect(downloadUrl).toMatch(/^http:\/\/m365:3000\/attachment\?/);
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    const ticketId = new URL(downloadUrl).searchParams.get('t')!;
+    const lease = store.redeem(ticketId)!;
+    expect(lease.probedContentType).toBe('message/rfc822');
+    expect(lease.probedName).toBe('Katusha');
+  });
+
+  it('refuses a reference attachment before minting a ticket', async () => {
+    const graphClient = {
+      makeRequest: async () => ({
+        name: 'Shared design doc',
+        contentType: null,
+        size: 48213,
+        '@odata.type': '#microsoft.graph.referenceAttachment',
+        sourceUrl: 'https://contoso.sharepoint.com/:w:/link',
+      }),
+    };
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx(graphClient));
+
+    expect(result.isError).toBe(true);
+    const body = parse(result as never);
+    expect(body.error).toBe('reference_attachment');
+    expect(body.downloadUrl).toBeUndefined();
+    expect(mintSpy).not.toHaveBeenCalled();
+    expect(store.size()).toBe(0);
   });
 });
 

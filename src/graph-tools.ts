@@ -477,7 +477,8 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
 async function mintDownloadUrl(
   target: string,
   accountParam: string | undefined,
-  authManager: AuthManager | undefined
+  authManager: AuthManager | undefined,
+  graphClient: Pick<GraphClient, 'makeRequest'>
 ): Promise<CallToolResult | null> {
   const minting = getAttachmentMinting();
   if (!minting) return null;
@@ -522,9 +523,47 @@ async function mintDownloadUrl(
     };
   }
 
+  // Probed once, before minting: the ticket needs to carry whatever this
+  // server already knows about the target's Content-Type (see
+  // `probeMailEventAttachment`'s docstring for why the redemption route needs
+  // it and can't always trust Graph's own `/$value` response header), and a
+  // referenceAttachment has to be refused here rather than minted -- it names
+  // a link with no bytes behind it, so a "download URL" for it would be a URL
+  // that can never usefully be fetched.
+  let accessToken: string | undefined;
+  try {
+    accessToken = await authManager?.getTokenForAccount(accountParam);
+  } catch {
+    accessToken = undefined;
+  }
+  const probe = await probeMailEventAttachment(target, { graphClient }, accessToken);
+  if (probe.isReferenceAttachment) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'reference_attachment',
+            message:
+              'This is a reference (link) attachment, not a file: Microsoft Graph stores no bytes for ' +
+              'it in this mailbox, only a link to where the real content lives. There is nothing for a ' +
+              'download URL to serve.',
+            name: probe.name,
+            contentType: probe.contentType,
+            size: probe.size,
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
   let ticket: { id: string; expiresAtMs: number };
   try {
-    ticket = minting.store.mint(target, accountParam);
+    ticket = minting.store.mint(target, accountParam, undefined, {
+      contentType: probe.contentType,
+      name: probe.name,
+    });
   } catch (error) {
     if (error instanceof TicketStoreFullError) {
       return {
@@ -670,25 +709,69 @@ const CONTRACT_ERROR_CODES = new Set([
 ]);
 
 /**
- * Best-effort `name`/`contentType`/`size` for the error envelope.
- *
- * Probed only for mail and event attachments, and only on a failure path. Those
- * are the only Graph resources carrying all three fields; asking a message or a
- * photo for `$select=name,contentType,size` is a guaranteed 400, which would put
- * a noisy Graph error in the log on every failure and buy nothing.
- *
- * Every failure here is swallowed. The caller is already holding a real error,
- * and a probe that fails must never replace it -- "could not read the metadata
- * of the document you could not read" is strictly less useful than the original
- * refusal with three nulls beside it.
+ * Result of probing a mail/event attachment's metadata before deciding
+ * whether -- and how -- to mint a ticket for its bytes.
  */
-async function describeAttachment(
+interface AttachmentProbe extends AttachmentFacts {
+  /**
+   * True when Graph's own metadata identifies this as a `referenceAttachment`
+   * -- a link, with no bytes stored in this mailbox at all. `/$value` on one
+   * of these is not "a document this server failed to convert"; it is not a
+   * document at all, and the caller above must refuse before minting rather
+   * than spend a ticket and a proxy round trip finding that out the hard way.
+   */
+  isReferenceAttachment: boolean;
+}
+
+const UNKNOWN_PROBE: AttachmentProbe = { ...UNKNOWN_ATTACHMENT, isReferenceAttachment: false };
+
+/**
+ * Graph's `@odata.type` annotation for the two attachment subtypes this probe
+ * treats specially. Read from the SAME metadata response the probe already
+ * fetches -- not a second call, and not the file's bytes -- so acting on it is
+ * "use metadata this server already has", not format sniffing.
+ */
+const REFERENCE_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.referenceAttachment';
+const ITEM_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.itemAttachment';
+
+/**
+ * Content-Type Microsoft Graph documents for `GET
+ * .../attachments/{id}/$value` on an `itemAttachment` wrapping a mail
+ * message: the raw RFC 5322 source, not a JSON envelope. This is a fallback,
+ * not a preference -- it is used only when Graph's own metadata leaves
+ * `contentType` null, which empirically it does for every itemAttachment
+ * probed live in this mailbox (Graph has no MIME type to report for an
+ * embedded Outlook item; the type only becomes meaningful once you know
+ * `/$value` on it always resolves to a MIME message). Gated on `@odata.type`
+ * specifically, not on "contentType is null", because a plain `fileAttachment`
+ * can also carry a null `contentType` and is not a message.
+ */
+const ITEM_ATTACHMENT_VALUE_CONTENT_TYPE = 'message/rfc822';
+
+/**
+ * `name`/`contentType`/`size` for a mail or event attachment, from Graph's own
+ * metadata -- plus whether it is a reference (link) attachment -- read at mint
+ * time so the ticket can carry a useful Content-Type hint and, for a
+ * reference attachment, so the caller can refuse before minting anything.
+ *
+ * Probed only for mail and event attachments ending in `/$value`. Those are
+ * the only Graph resources carrying all three base fields; asking a message
+ * or a photo for `$select=name,contentType,size` is a guaranteed 400, which
+ * would put a noisy Graph error in the log on every call and buy nothing.
+ *
+ * Every failure here is swallowed into `UNKNOWN_PROBE`. A probe that fails
+ * must never block or replace anything downstream -- minting proceeds with no
+ * hint (today's behaviour), and on the error path the caller is already
+ * holding a real error that "could not read the metadata of the document you
+ * could not read" would only obscure.
+ */
+async function probeMailEventAttachment(
   target: string,
-  ctx: UtilityToolContext,
+  ctx: { graphClient: Pick<GraphClient, 'makeRequest'> },
   accessToken: string | undefined
-): Promise<AttachmentFacts> {
+): Promise<AttachmentProbe> {
   if (!MAIL_EVENT_ATTACHMENT_TARGET.test(target) || !target.endsWith('/$value')) {
-    return UNKNOWN_ATTACHMENT;
+    return UNKNOWN_PROBE;
   }
   try {
     const metadataPath = target.slice(0, -'/$value'.length);
@@ -696,14 +779,20 @@ async function describeAttachment(
       `${metadataPath}?$select=name,contentType,size`,
       { accessToken }
     )) as Record<string, unknown> | null;
-    if (!meta || typeof meta !== 'object') return UNKNOWN_ATTACHMENT;
+    if (!meta || typeof meta !== 'object') return UNKNOWN_PROBE;
+    const odataType =
+      typeof meta['@odata.type'] === 'string' ? (meta['@odata.type'] as string) : null;
+    const rawContentType = typeof meta.contentType === 'string' ? meta.contentType : null;
     return {
       name: typeof meta.name === 'string' ? meta.name : null,
-      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
       size: typeof meta.size === 'number' ? meta.size : null,
+      isReferenceAttachment: odataType === REFERENCE_ATTACHMENT_ODATA_TYPE,
+      contentType:
+        rawContentType ??
+        (odataType === ITEM_ATTACHMENT_ODATA_TYPE ? ITEM_ATTACHMENT_VALUE_CONTENT_TYPE : null),
     };
   } catch {
-    return UNKNOWN_ATTACHMENT;
+    return UNKNOWN_PROBE;
   }
 }
 
@@ -1071,7 +1160,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // Match only real Graph mail/calendar attachment resources so driveItem path addressing
       // with folders named messages/events/attachments is not falsely rejected.
       if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart)) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1088,7 +1177,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Recording content endpoints return authenticated bytes, not a pre-authenticated URL.
       if (MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(pathPart))) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1105,7 +1194,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Other /$value byte endpoints (profile photo, Teams hosted content) likewise have no URL.
       if (VALUE_BYTE_TARGET.test(pathPart)) {
-        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
         if (minted) return minted;
         return {
           content: [
@@ -1196,7 +1285,12 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           // The metadata path carries no downloadUrl, but the bytes are still
           // reachable at its /content sub-resource -- which is what a ticket
           // has to name, since that is what the redemption route will GET.
-          const minted = await mintDownloadUrl(`${itemPath}/content`, accountParam, authManager);
+          const minted = await mintDownloadUrl(
+            `${itemPath}/content`,
+            accountParam,
+            authManager,
+            graphClient
+          );
           if (minted) return minted;
           return {
             content: [
@@ -1350,6 +1444,23 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         accessToken = undefined;
       }
 
+      // Probed ONCE, before any minting, and reused for every attempt below
+      // AND for the failure envelope if every attempt fails -- one Graph call
+      // per read-document invocation rather than one per attempt or a second
+      // one on failure. This is also the only place that can refuse a
+      // referenceAttachment before spending a ticket and a proxy round trip
+      // on a conversion that cannot succeed (it names a link, not bytes).
+      const probe = await probeMailEventAttachment(target, ctx, accessToken);
+      if (probe.isReferenceAttachment) {
+        return readDocumentError(
+          'reference_attachment',
+          'This is a reference (link) attachment, not a file: Microsoft Graph stores no bytes for it ' +
+            'in this mailbox, only a link to where the real content lives. There is nothing here to ' +
+            'convert.',
+          { name: probe.name, contentType: probe.contentType, size: probe.size }
+        );
+      }
+
       /**
        * One attempt: one FRESH mint, one conversion.
        *
@@ -1377,7 +1488,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       ): Promise<{ ok: true; markdown: string } | { ok: false; code: string; message: string }> => {
         let ticket: { id: string; expiresAtMs: number };
         try {
-          ticket = minting.store.mint(target, accountParam);
+          ticket = minting.store.mint(target, accountParam, undefined, {
+            contentType: probe.contentType,
+            name: probe.name,
+          });
         } catch (error) {
           if (error instanceof TicketStoreFullError) {
             return { ok: false, code: 'no_capacity', message: error.message };
@@ -1446,7 +1560,15 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         return { content: [{ type: 'text', text: outcome.markdown }] };
       }
 
-      const facts = await describeAttachment(target, ctx, accessToken);
+      // Reuses the SAME probe every attempt already minted with, rather than a
+      // second Graph call: describeAttachment's failure-path contract (best
+      // effort, swallow errors, never replace the real failure) is exactly
+      // what probeMailEventAttachment already provides.
+      const facts: AttachmentFacts = {
+        name: probe.name,
+        contentType: probe.contentType,
+        size: probe.size,
+      };
       const known = CONTRACT_ERROR_CODES.has(outcome.code);
       return readDocumentError(
         known ? outcome.code : 'proxy_error',

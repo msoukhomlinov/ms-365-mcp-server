@@ -75,6 +75,22 @@ export interface AttachmentTicket {
   readonly accountName: string | undefined;
   /** Epoch milliseconds after which this ticket is dead. */
   readonly expiresAtMs: number;
+  /**
+   * Content-Type the minting tool learned from Graph's own metadata for this
+   * resource, at mint time -- independent of whatever Content-Type header the
+   * `/$value` fetch itself carries at redemption time. `null` when the target
+   * has no metadata resource to probe (drive/SharePoint content, meeting
+   * recordings, an unmintable target) or the probe found nothing specific.
+   *
+   * The redemption route (`attachment-route.ts`) is what actually chooses
+   * between this and the stream's own header -- see its `isGenericContentType`
+   * precedence -- so this field is deliberately just data, not a decision:
+   * a stale or wrong probe can never cost more than falling back to today's
+   * behaviour.
+   */
+  readonly probedContentType: string | null;
+  /** Graph's own `name` for this resource at mint time, same caveats as above. */
+  readonly probedName: string | null;
 }
 
 /** Mutable store entry. `AttachmentTicket` is the part a redeemer may see. */
@@ -151,7 +167,8 @@ export class AttachmentTicketStore {
   mint(
     target: string,
     accountName: string | undefined,
-    nowMs: number = Date.now()
+    nowMs: number = Date.now(),
+    probe?: { contentType?: string | null; name?: string | null }
   ): { id: string; expiresAtMs: number } {
     this.sweep(nowMs);
     if (this.tickets.size >= MAX_LIVE_TICKETS) {
@@ -165,6 +182,8 @@ export class AttachmentTicketStore {
       expiresAtMs,
       remaining: MAX_REDEMPTIONS,
       inFlight: false,
+      probedContentType: probe?.contentType ?? null,
+      probedName: probe?.name ?? null,
     });
     return { id, expiresAtMs };
   }
@@ -217,6 +236,8 @@ export class AttachmentTicketStore {
       accountName: ticket.accountName,
       expiresAtMs: ticket.expiresAtMs,
       remaining: ticket.remaining,
+      probedContentType: ticket.probedContentType,
+      probedName: ticket.probedName,
       release: () => {
         if (released) return;
         released = true;

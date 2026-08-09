@@ -51,6 +51,48 @@ function refuse(res: Response): void {
   res.status(404).type('text/plain').send(NOT_FOUND_BODY);
 }
 
+/**
+ * Content-Type values that name no real format.
+ *
+ * `application/octet-stream` is `graph-client.ts`'s own fallback when Graph's
+ * `/$value` response carries no `content-type` header at all -- so by the
+ * time it reaches here it is indistinguishable from "Graph genuinely said
+ * this", and either way a generic subtype matches nothing in a converter's
+ * format table. `application/binary` is the same shape from a different
+ * source (some older Exchange/Outlook clients write it into an attachment's
+ * own stored MIME type when they had nothing better). The empty string is
+ * defensive -- `downloadStream` should never hand back `''`, since it already
+ * ORs against the same fallback, but treating it as generic rather than
+ * "specific and empty" costs nothing and closes off a future refactor
+ * removing that OR from silently reintroducing an unroutable header.
+ * Parameters (`; charset=...`) are stripped before comparing, the same way
+ * `isBinaryContentType` in graph-client.ts does it.
+ */
+const GENERIC_CONTENT_TYPES = new Set(['application/octet-stream', 'application/binary', '']);
+
+function isGenericContentType(contentType: string): boolean {
+  return GENERIC_CONTENT_TYPES.has(contentType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * A `Content-Disposition` header naming `name`, or the bare `attachment`
+ * fallback when there is no name to give. `name` is untrusted -- it is
+ * Graph's own attachment metadata, not this server's choice -- so it is
+ * stripped of the characters that would let it escape the `filename`
+ * parameter or inject a second header: `"` (closes the quoted value early),
+ * `\` (its escape character), and CR/LF (the only way a single header value
+ * could smuggle another header into the response). Stripping rather than
+ * escaping is deliberate: this is a best-effort hint for a converter's format
+ * resolver, not a byte-for-byte filename contract, so losing an unusual
+ * character from an adversarial name is an acceptable cost for never having
+ * to reason about escaping correctness in a response header.
+ */
+function contentDispositionFor(name: string | null): string {
+  if (!name) return 'attachment';
+  const sanitized = name.replace(/[\r\n"\\]/g, '');
+  return sanitized ? `attachment; filename="${sanitized}"` : 'attachment';
+}
+
 export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
   return async (req: Request, res: Response): Promise<void> => {
     const raw = req.query[TICKET_PARAM];
@@ -108,7 +150,21 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       }
 
       res.status(200);
-      res.setHeader('content-type', stream.contentType);
+      // Precedence: a SPECIFIC Content-Type on THIS fetch's own response wins,
+      // because it is what Graph is answering right now; the ticket's probed
+      // type (learned from Graph's attachment metadata at mint time, see
+      // `probeMailEventAttachment` in graph-tools.ts) is used only when the
+      // stream itself carries nothing useful. Authoritative metadata beats a
+      // generic default, but a specific response header beats a probe that
+      // may be stale -- the probe ran once, at mint time; this fetch is
+      // happening now and may be a retry against a target whose Graph-side
+      // state has moved on.
+      res.setHeader(
+        'content-type',
+        isGenericContentType(stream.contentType) && lease.probedContentType
+          ? lease.probedContentType
+          : stream.contentType
+      );
       // Only declare a length that is a real, positive count of bytes. A
       // `content-length: 0` on a body we are about to stream is never correct
       // here: Node ends the response after zero bytes, the pipeline below then
@@ -124,11 +180,19 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       ) {
         res.setHeader('content-length', String(stream.contentLength));
       }
-      // Graph's own filename when it gave one. `attachment` either way: this
-      // endpoint serves untrusted bytes from a mailbox, and a browser that
-      // wandered onto the URL must not render an inline text/html attachment as
-      // a page on this origin.
-      res.setHeader('content-disposition', stream.contentDisposition ?? 'attachment');
+      // Graph's own filename when it gave one. Falling back to the ticket's
+      // probed name (rather than the bare `attachment` default) hands
+      // docglean a second, cheaper axis for free: its own format resolver
+      // also reads an extension off Content-Disposition's filename, so a
+      // real name can recover a correct route even when neither Content-Type
+      // is specific. `attachment` either way, never `inline`: this endpoint
+      // serves untrusted bytes from a mailbox, and a browser that wandered
+      // onto the URL must not render an inline text/html attachment as a page
+      // on this origin.
+      res.setHeader(
+        'content-disposition',
+        stream.contentDisposition ?? contentDispositionFor(lease.probedName)
+      );
       res.setHeader('cache-control', 'no-store');
       res.setHeader('x-content-type-options', 'nosniff');
 

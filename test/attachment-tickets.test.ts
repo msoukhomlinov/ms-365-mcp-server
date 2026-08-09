@@ -230,6 +230,53 @@ describe('AttachmentTicketStore', () => {
   });
 });
 
+describe('AttachmentTicketStore probed content-type carriage', () => {
+  const NOW = 1_780_000_000_000;
+
+  it('defaults probedContentType and probedName to null when no probe is given', () => {
+    // Every existing call site mints with no 4th argument. That has to keep
+    // meaning "no information", not crash and not silently invent a value.
+    const store = new AttachmentTicketStore(120);
+    const { id } = store.mint('/target', undefined, NOW);
+    const lease = store.redeem(id, NOW)!;
+    expect(lease.probedContentType).toBeNull();
+    expect(lease.probedName).toBeNull();
+  });
+
+  it('carries a probed content-type and name from mint through to the lease', () => {
+    const store = new AttachmentTicketStore(120);
+    const { id } = store.mint('/target', undefined, NOW, {
+      contentType: 'message/rfc822',
+      name: 'Katusha',
+    });
+    const lease = store.redeem(id, NOW)!;
+    expect(lease.probedContentType).toBe('message/rfc822');
+    expect(lease.probedName).toBe('Katusha');
+  });
+
+  it('treats a probe with explicit nulls the same as no probe at all', () => {
+    const store = new AttachmentTicketStore(120);
+    const { id } = store.mint('/target', undefined, NOW, { contentType: null, name: null });
+    const lease = store.redeem(id, NOW)!;
+    expect(lease.probedContentType).toBeNull();
+    expect(lease.probedName).toBeNull();
+  });
+
+  it('carries the probe through every redemption of a multi-fetch ticket, not just the first', () => {
+    const store = new AttachmentTicketStore(120);
+    const { id } = store.mint('/target', undefined, NOW, {
+      contentType: 'application/pdf',
+      name: 'report.pdf',
+    });
+    const first = store.redeem(id, NOW)!;
+    expect(first.probedContentType).toBe('application/pdf');
+    first.release();
+    const second = store.redeem(id, NOW)!;
+    expect(second.probedContentType).toBe('application/pdf');
+    expect(second.probedName).toBe('report.pdf');
+  });
+});
+
 describe('buildAttachmentUrl', () => {
   const config = { base: 'http://m365-max-mcp:3000', key: 'k', keyId: '1', ttlSeconds: 120 };
 
