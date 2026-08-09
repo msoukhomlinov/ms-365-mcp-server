@@ -85,6 +85,27 @@ describe('minting refuses whenever Graph identity comes from the request', () =>
     expect(parse(result as never).downloadUrl).toBeUndefined();
   });
 
+  it('refuses to mint for a mail attachment target missing its required /$value suffix', async () => {
+    // MAIL_EVENT_ATTACHMENT_TARGET matches the whole attachment resource
+    // FAMILY, not only its byte-content member -- `/me/messages/AAA/attachments/BBB`
+    // (no /$value) names the attachment's metadata resource, which for a
+    // fileAttachment carries `contentBytes` as base64 JSON. Minting a ticket
+    // for it would stream that metadata blob straight through the redemption
+    // route, which has no response scrubber (streaming raw bytes with no MCP
+    // envelope is the whole point of a ticket). This is the same class of hole
+    // describeAttachment has always closed with its own paired endsWith
+    // check; get-download-url's own mint gate must close it too.
+    const result = await tool.execute({ target: '/me/messages/AAA/attachments/BBB' }, ctx());
+    expect(result.isError).toBe(true);
+    expect(parse(result as never).downloadUrl).toBeUndefined();
+  });
+
+  it('refuses to mint for an event attachment target missing its required /$value suffix', async () => {
+    const result = await tool.execute({ target: '/me/events/EEE/attachments/BBB' }, ctx());
+    expect(result.isError).toBe(true);
+    expect(parse(result as never).downloadUrl).toBeUndefined();
+  });
+
   it('does not mint at all when the feature is off', async () => {
     resetAttachmentMinting();
     const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx());
