@@ -122,6 +122,105 @@ describe('isMintableTarget rejects targets whose validated string diverges from 
 });
 
 /**
+ * Codex P1 #2 (PR #16, src/graph-tools.ts:539): the first fix's denylist
+ * caught literal `..` but missed the URL Standard's percent-encoded
+ * dot-segment spellings. `/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value`
+ * passed the first fix's `hasUrlDivergentSyntax` and `isMintableTarget`
+ * unchanged, because neither treated `%2e%2e` as a `..`. Verified locally
+ * (Node, simulating `performRequest`'s own concatenation):
+ *
+ *   new URL('https://graph.microsoft.com/v1.0' +
+ *     '/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value').pathname
+ *   -> '/v1.0/me/messages/M/attachments/A2/$value'
+ *
+ * i.e. the ticket this mints redeems attachment A2, never A -- silently
+ * substituting a different attachment than the one the caller named. The
+ * fix is architectural, not another denylist entry: `isMintableTarget` now
+ * runs its family/suffix grammar against the RESOLVED pathname (built the
+ * same way `performRequest` builds it) rather than the raw string, and
+ * separately rejects any raw path segment that is a single-/double-dot
+ * segment per the URL Standard's own closed definition (`.`, `%2e`, `..`,
+ * `.%2e`, `%2e.`, `%2e%2e`, case-insensitively) -- not a guessed encoding
+ * list, but the spec's own enumeration.
+ */
+describe('isMintableTarget rejects percent-encoded dot-segment spellings (Codex P1 #2)', () => {
+  const DOT_SEGMENT_EVASIONS: Array<{ label: string; target: string }> = [
+    {
+      label: 'the full Codex payload verbatim',
+      target: '/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value',
+    },
+    {
+      label: 'a single %2e%2e segment',
+      target: '/me/messages/M/attachments/A/%2e%2e/attachments/A2/$value',
+    },
+    {
+      label: 'mixed-case %2E%2E',
+      target: '/me/messages/M/attachments/A/%2E%2E/%2E%2E/attachments/A2/$value',
+    },
+    {
+      label: 'the mixed literal-dot/encoded-dot spelling .%2e',
+      target: '/me/messages/M/attachments/A/.%2e/.%2e/attachments/A2/$value',
+    },
+    {
+      label: 'the mixed encoded-dot/literal-dot spelling %2e.',
+      target: '/me/messages/M/attachments/A/%2e./%2e./attachments/A2/$value',
+    },
+    {
+      label: 'a single-dot %2e segment (no traversal, still a non-literal path segment)',
+      target: '/me/messages/M/attachments/A/%2e/$value',
+    },
+  ];
+
+  for (const { label, target } of DOT_SEGMENT_EVASIONS) {
+    it(`rejects ${label}`, () => {
+      expect(isMintableTarget(target)).toBe(false);
+    });
+  }
+
+  it('proves the rejected payload really does resolve to a different attachment (the real damage)', () => {
+    // This is the assertion that matters more than a bare rejection check:
+    // confirm the payload isMintableTarget refuses is refused BECAUSE it
+    // would have redeemed attachment A2 rather than the validated A, not for
+    // some unrelated reason. Simulates performRequest's own concatenation
+    // exactly (same prefix, same URL parser) rather than asserting against
+    // the implementation's internals.
+    const target = '/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value';
+    const resolved = new URL(`https://graph.microsoft.com/v1.0${target}`);
+    expect(resolved.pathname).toBe('/v1.0/me/messages/M/attachments/A2/$value');
+    expect(resolved.pathname).not.toContain('/attachments/A/');
+    expect(isMintableTarget(target)).toBe(false);
+  });
+
+  it('does not decode double-percent-encoded dot segments (%252e%252e stays literal, proven inert)', () => {
+    // %252e is the percent-encoding of the literal string '%2e', not of '.'.
+    // Nothing between this gate and fetch() ever decodes a percent-encoded
+    // percent sign, so %252e%252e is NOT one of the URL Standard's six
+    // dot-segment spellings and the parser does not resolve it away -- it
+    // stays a literal (harmless, Graph-will-404-it) path segment rather than
+    // collapsing into attachment A2. Confirmed by simulating performRequest's
+    // own concatenation: the resolved pathname still contains the original
+    // 'A' segment untouched, immediately before the literal encoded junk, so
+    // no attachment substitution happens either way.
+    const target = '/me/messages/M/attachments/A/%252e%252e/%252e%252e/attachments/A2/$value';
+    const resolved = new URL(`https://graph.microsoft.com/v1.0${target}`);
+    expect(resolved.pathname).toBe(
+      '/v1.0/me/messages/M/attachments/A/%252e%252e/%252e%252e/attachments/A2/$value'
+    );
+    // Not rejected: it is inert against the mechanism this gate defends
+    // against, and rejecting literal '%25' would cost real targets for no
+    // safety benefit (percent signs are valid, if unusual, in Graph paths).
+    expect(isMintableTarget(target)).toBe(true);
+  });
+
+  it('still mints legitimate targets containing literal (non-dot-segment) percent sequences', () => {
+    // A filename that happens to already be percent-encoded by the caller,
+    // e.g. copied verbatim from a @microsoft.graph.downloadUrl-adjacent
+    // metadata field, must not be rejected just for containing '%'.
+    expect(isMintableTarget('/me/drive/root:/Invoice%20Q3.pdf:/content')).toBe(true);
+  });
+});
+
+/**
  * End-to-end proof for the exact Codex scenario: a redeemed ticket must not
  * reach the mail attachment's unsuffixed metadata endpoint. Exercised through
  * read-document, which is the tool named in the finding.
@@ -186,6 +285,34 @@ describe('read-document refuses to mint for a target that diverges from its own 
     expect(store.size()).toBe(0);
     expect(requests).toHaveLength(0);
   });
+
+  it('refuses the Codex P1 #2 percent-encoded dot-segment payload, minting nothing and dialling nothing', async () => {
+    const readDocument = UTILITY_TOOLS.find((t) => t.name === 'read-document')!;
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'never reached' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await readDocument.execute(
+      { target: '/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value' },
+      {
+        graphClient: { makeRequest: vi.fn() } as never,
+        authManager: {
+          isOAuthModeEnabled: () => false,
+          isMultiAccount: async () => false,
+          getTokenForAccount: async () => 'SERVER_OWN_TOKEN',
+        } as never,
+        multiAccount: false,
+        accountNames: [],
+      }
+    );
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse((result.content[0] as { text: string }).text);
+    expect(body.error).toBe('invalid_target');
+    // The real damage this closes: no ticket for A2 (or anything else) is
+    // minted just because the string named A -- nothing is minted at all.
+    expect(store.size()).toBe(0);
+    expect(requests).toHaveLength(0);
+  });
 });
 
 /**
@@ -239,5 +366,14 @@ describe('get-download-url refuses the same divergent targets', () => {
   it('still mints a legitimate mail attachment target', async () => {
     const result = await tool.execute({ target: LEGIT_MAIL_ATTACHMENT }, ctx());
     expect(parse(result as never).downloadUrl).toMatch(/^http:\/\/m365:3000\/attachment\?/);
+  });
+
+  it('refuses the Codex P1 #2 percent-encoded dot-segment payload', async () => {
+    const result = await tool.execute(
+      { target: '/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value' },
+      ctx()
+    );
+    expect(result.isError).toBe(true);
+    expect(parse(result as never).downloadUrl).toBeUndefined();
   });
 });

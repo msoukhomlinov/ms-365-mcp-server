@@ -486,55 +486,77 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
- * Whether `target`, taken as a raw string, is guaranteed to name the same
- * resource once it is actually requested.
+ * The exact prefix `GraphClient.performRequest` concatenates `target` onto
+ * for the one flow that ever redeems a minted target: `attachment-route.ts`
+ * calls `downloadStream(lease.target, { accessToken })` with no `apiVersion`
+ * override, so `performRequest`'s `options.apiVersion || 'v1.0'` always
+ * falls back to `'v1.0'` there. Reusing that literal segment (rather than a
+ * placeholder) means any dot-segment arithmetic that could in principle walk
+ * far enough to escape it resolves here exactly as it would on the real
+ * request. The scheme+host stand-in is otherwise arbitrary and never
+ * inspected below: `performRequest` concatenates `target` onto a fixed base
+ * *string* and parses the whole result as one absolute URL -- it does not
+ * resolve `target` as a relative reference against a base -- so a leading
+ * `//` in `target` can never redirect the host either way. Confirmed by
+ * construction (see the divergence report this fix responds to), not
+ * assumed.
+ */
+const REQUEST_URL_PREFIX = 'https://graph.microsoft.com/v1.0';
+/** `new URL(REQUEST_URL_PREFIX + target).pathname` always starts with this. */
+const REQUEST_URL_PATH_PREFIX = '/v1.0';
+
+/**
+ * The URL Standard's own closed definition of a single-/double-dot path
+ * segment: lowercased, a segment is single-dot if it is `.` or `%2e`, and
+ * double-dot if it is `..`, `.%2e`, `%2e.`, or `%2e%2e`. Copied verbatim from
+ * the spec rather than pattern-matched against a guessed set of encodings --
+ * this enumeration is the URL Standard's, not ours, so unlike a hand-rolled
+ * denylist it cannot go stale as new encodings are discovered; it is already
+ * the complete set by definition.
+ */
+function isDotPathSegment(segment: string): boolean {
+  switch (segment.toLowerCase()) {
+    case '.':
+    case '%2e':
+    case '..':
+    case '.%2e':
+    case '%2e.':
+    case '%2e%2e':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * True when `target`'s raw string cannot be trusted to name the resource
+ * `GraphClient.performRequest` will actually request, for a reason a
+ * resolved-pathname check by itself would not catch:
  *
- * `GraphClient.performRequest` builds its request URL by string-concatenating
- * `target` onto the Graph base URL and hands the result straight to `fetch()`,
- * which parses it per the WHATWG URL standard. That parser reassigns meaning
- * to several raw characters instead of treating them as literal path bytes:
+ *   - `#` starts a fragment, which `fetch()` never transmits at all, and `?`
+ *     starts the query string, which Graph's path-based routing ignores.
+ *     Both TRUNCATE rather than normalise -- neither survives into
+ *     `pathname` in any form, so there is no resolved pathname that would
+ *     reveal a truncation, only its absence. Must be caught as raw-string
+ *     syntax before any parsing happens.
+ *   - Backslash and C0 controls/DEL are never legitimate in a real Graph
+ *     resource path or OneDrive/SharePoint item name in the first place
+ *     (OneDrive explicitly forbids `\` in names), so they are rejected
+ *     outright rather than let the parser fold/mangle them into whatever
+ *     pathname results and trust the grammar below to notice.
+ *   - Percent-encoded forms of the above are not decoded anywhere between
+ *     this gate and the wire today (`fetch()` never unescapes `%XX` before
+ *     parsing), so they cannot themselves cause a divergence -- rejected
+ *     anyway, purely as insurance against a future decode step upstream of
+ *     this gate.
  *
- *   - `#` starts a fragment. Fragments are a client-side-only concept -- the
- *     browser/fetch layer strips it before the request is even framed, so
- *     nothing after a `#` is ever transmitted.
- *   - `?` starts the query string, which Graph's path-based routing does not
- *     consult when deciding which resource to serve.
- *   - `\` is folded into `/` for "special" schemes -- https included -- so a
- *     backslash is just another path separator as far as the parser is
- *     concerned, regardless of what the raw string looks like.
- *   - A `.` or `..` path segment is resolved away (dot-segment removal)
- *     before the request is sent, so `a/../b` and `b` are the same request
- *     even though they are different strings.
- *   - C0 controls (and DEL) are stripped or otherwise mangled by the parser.
- *
- * A target validated only as a string -- e.g. the old `endsWith('/$value')`
- * check -- can satisfy that check while naming a completely different URL
- * once any of the above applies. For the mail/event attachment family in
- * particular, the divergent URL is that attachment's *metadata* resource
- * rather than its bytes; for a fileAttachment, Graph's metadata response
- * carries `contentBytes` as base64 JSON, and streaming that through the
- * redemption route in attachment-route.ts -- which has no response scrubber,
- * by design, since streaming raw bytes with no MCP envelope is the whole
- * point of a ticket -- is exactly the exposure minting exists to avoid.
- *
- * This is a denylist, but a closed one: the five bullets above are the
- * complete set of ways the WHATWG URL parser treats a raw input character (or
- * sequence) as anything other than a literal path byte when the input is
- * concatenated onto a fixed scheme+host+version prefix, the way
- * `performRequest` does it. Percent-encoded forms of the same characters
- * (`%23`, `%3F`, ...) are not decoded anywhere between this gate and the wire
- * today, so they cannot themselves cause the divergence above -- they are
- * rejected anyway, purely as insurance against a future refactor adding a
- * decode step upstream of this gate. None of Graph's own resource
- * identifiers, or OneDrive/SharePoint item names (which forbid `\` and
- * several other characters outright), ever legitimately need any of this, so
- * rejecting it costs no real target.
+ * Dot-segments are deliberately NOT handled here -- see `isDotPathSegment`
+ * and `isMintableTarget`'s docstring for why that is a separate, closed,
+ * spec-defined check rather than another entry in this list.
  */
 function hasUrlDivergentSyntax(target: string): boolean {
   // eslint-disable-next-line no-control-regex -- deliberately matching C0/DEL.
   if (/[\x00-\x1f\x7f#?\\]/.test(target)) return true;
-  // A '.' or '..' segment, bounded by '/' or the string edges.
-  if (/(^|\/)\.\.?(\/|$)/.test(target)) return true;
   // Percent-encoded control chars, '#', '?', or '\' -- see docstring above.
   if (/%(?:[01][0-9a-f]|7f|23|3f|5c)/i.test(target)) return true;
   return false;
@@ -556,25 +578,62 @@ function hasUrlDivergentSyntax(target: string): boolean {
  * too, or the scrubber that exists specifically to keep `contentBytes` out of
  * the model's context has a hole a caller can drive straight through.
  *
- * The other three families (drive/SharePoint content, meeting recordings,
- * generic `/$value` endpoints) are already correctly end-anchored in their
- * own patterns, so a plain `.some()` over them is safe -- PROVIDED `target`
- * cannot diverge from the pathname actually requested, which is what
- * `hasUrlDivergentSyntax` above rules out first. Every one of the checks
- * below still operates on the raw string, deliberately: once divergent
- * syntax is excluded, the raw string and the pathname `fetch()` derives from
- * it agree (mod percent-encoding of characters like spaces or non-ASCII
- * letters, which affects neither of these patterns).
+ * **The grammar below runs against the RESOLVED PATHNAME, not the raw
+ * string.** An earlier version of this gate validated `target` as a string
+ * (`target.endsWith('/$value')`); a target crafted so the string satisfies
+ * that check can still name a different URL once `performRequest` actually
+ * builds it -- a literal `#`/`?` truncates it (see `hasUrlDivergentSyntax`),
+ * and a `..` segment -- including its percent-encoded spellings, which a
+ * character-level denylist keeps missing one at a time as they're discovered
+ * -- gets resolved away, silently redeeming a *different* attachment than
+ * the one the caller named (verified: `A/%2e%2e/%2e%2e/attachments/A2/$value`
+ * resolves to attachment `A2`, not `A`). Parsing `target` into the exact
+ * pathname `fetch()` would derive and running the grammar against THAT
+ * closes the whole class at once: whatever the grammar approves is, by
+ * construction, the path Graph will actually be asked for, so there is
+ * nothing left to diverge. Percent-encoding of ordinary characters (spaces,
+ * non-ASCII letters in a OneDrive filename, say) changes the pathname's
+ * encoding but not its meaning, and none of the patterns below care about
+ * encoding, so legitimate targets are unaffected -- see the test suite for
+ * the case that motivated this reasoning (a `root:/My Folder/résumé.docx:/content`
+ * style target broke under a stricter "pathname must equal the raw string"
+ * design that was tried and rejected before this one).
+ *
+ * Dot-segments are additionally rejected outright, per-raw-segment, before
+ * parsing even happens (`isDotPathSegment`, called from the loop below) --
+ * not because the pathname-based grammar can't cope with them (it resolves
+ * them exactly as `fetch()` would, which is by itself enough to stop the
+ * metadata-endpoint leak), but because a caller who wrote `A/../A2` did not
+ * name `A2`, and minting the ticket that `A/../A2` resolves to anyway would
+ * silently substitute a different attachment for the one asked for. That is
+ * real damage independent of whether the substituted target also happens to
+ * be one this server could have minted directly.
  */
 export function isMintableTarget(target: string): boolean {
+  if (!target.startsWith('/')) return false;
   if (hasUrlDivergentSyntax(target)) return false;
-  if (MAIL_EVENT_ATTACHMENT_TARGET.test(target)) {
-    return target.endsWith('/$value');
+  if (target.split(/[/\\]/).some(isDotPathSegment)) return false;
+
+  let resolved: URL;
+  try {
+    resolved = new URL(REQUEST_URL_PREFIX + target);
+  } catch {
+    return false;
+  }
+  // Belt and suspenders: `hasUrlDivergentSyntax` already rejects raw '#'/'?',
+  // so these should always be empty here. If they are not, something about
+  // this parse disagreed with that check, and the safe answer is refusal.
+  if (resolved.search !== '' || resolved.hash !== '') return false;
+  if (!resolved.pathname.startsWith(REQUEST_URL_PATH_PREFIX)) return false;
+  const pathname = resolved.pathname.slice(REQUEST_URL_PATH_PREFIX.length);
+
+  if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathname)) {
+    return pathname.endsWith('/$value');
   }
   return (
-    DRIVE_CONTENT_TARGET_PATTERNS.some((pattern) => pattern.test(target)) ||
-    MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(target)) ||
-    VALUE_BYTE_TARGET.test(target)
+    DRIVE_CONTENT_TARGET_PATTERNS.some((pattern) => pattern.test(pathname)) ||
+    MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(pathname)) ||
+    VALUE_BYTE_TARGET.test(pathname)
   );
 }
 
@@ -1169,13 +1228,16 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Reject any syntax that would make the URL `performRequest` actually
       // builds diverge from this string -- a query string or fragment
-      // silently redirects or truncates what reaches Graph, and a backslash
-      // or dot-segment silently reshapes the path. See `hasUrlDivergentSyntax`
-      // and `isMintableTarget`'s docstrings above: this is the same class of
-      // hole that check exists to close, enforced here too because this
-      // tool's mail/event/recording/$value branches below decide whether to
-      // mint independently of `isMintableTarget`.
-      if (hasUrlDivergentSyntax(target)) {
+      // silently redirects or truncates what reaches Graph, a backslash or
+      // control character is never legitimate in a Graph path to begin with,
+      // and a dot-segment (including its percent-encoded spellings) resolves
+      // away before the request is sent, silently substituting a different
+      // resource than the one named. See `hasUrlDivergentSyntax`,
+      // `isDotPathSegment`, and `isMintableTarget`'s docstrings above: this
+      // is the same class of hole those exist to close, enforced here too
+      // because this tool's mail/event/recording/$value/drive-item branches
+      // below decide whether to mint independently of `isMintableTarget`.
+      if (hasUrlDivergentSyntax(target) || target.split(/[/\\]/).some(isDotPathSegment)) {
         return {
           content: [
             {
