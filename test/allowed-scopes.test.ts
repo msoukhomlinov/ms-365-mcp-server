@@ -224,7 +224,8 @@ describe('allowed scope HTTP behavior', () => {
       false,
       [],
       'Mail.Read',
-      true
+      true,
+      false
     );
   });
 });

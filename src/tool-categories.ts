@@ -112,6 +112,12 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
 // validated the URL base and key, served the route, and registered no tool that could mint.
 export const FLAG_UNIVERSAL_UTILITY_TOOLS: Record<string, keyof PresetToolOptions> = {
   'get-download-url': 'attachmentUrls',
+  // read-document reads any Microsoft 365 document -- mail/event attachments, drive/SharePoint
+  // files, raw message MIME -- so under --attachment-proxy it belongs in every preset for the
+  // same reason download-bytes is universal unconditionally: a list of presets would silently
+  // miss an app and every future one. The tool and this mapping entry land together, in the same
+  // change, so a preset can never claim a tool no build of the server actually has.
+  'read-document': 'attachmentProxy',
 };
 
 /**
@@ -121,6 +127,8 @@ export const FLAG_UNIVERSAL_UTILITY_TOOLS: Record<string, keyof PresetToolOption
 export interface PresetToolOptions {
   /** --enable-attachment-urls: get-download-url can mint URLs for any authenticated byte endpoint. */
   attachmentUrls?: boolean;
+  /** --attachment-proxy: read-document joins every preset, in place of the three byte tools it suppresses. */
+  attachmentProxy?: boolean;
 }
 
 // Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like
