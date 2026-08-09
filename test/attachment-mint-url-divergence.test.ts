@@ -51,14 +51,6 @@ const EVASIONS: Array<{ label: string; target: string }> = [
     target: '/me/messages/M/attachments/A?x=/$value',
   },
   {
-    label: 'a percent-encoded %23 (encoded #)',
-    target: '/me/messages/M/attachments/A%23/$value',
-  },
-  {
-    label: 'a percent-encoded %3F (encoded ?)',
-    target: '/me/messages/M/attachments/A%3Fx=/$value',
-  },
-  {
     // A backslash is folded into '/' by the WHATWG URL parser for "special"
     // schemes (https included), so a raw backslash mid-path can silently
     // reshape the requested pathname while the raw string still ends in the
@@ -221,6 +213,108 @@ describe('isMintableTarget rejects percent-encoded dot-segment spellings (Codex 
 });
 
 /**
+ * Codex P2 (PR #16, src/graph-tools.ts:561): the round-1 fix over-corrected.
+ * It rejected `%23`, `%3F`, and `%5c` -- percent-encoded spellings of `#`,
+ * `?`, and `\` -- as insurance against a decode step that does not exist.
+ * But a literal `#` or `?` in a OneDrive/SharePoint filename is legal and is
+ * ALWAYS spelled percent-encoded in a Graph path (Graph itself requires it,
+ * the same way any URL does), so a target such as
+ * `/me/drive/root:/Quarter%231.pdf:/content` -- which addresses a real file
+ * called "Quarter#1.pdf" -- was being refused even though minting it is
+ * exactly as safe as any other drive path. Confirmed by simulating
+ * `performRequest`'s own concatenation:
+ *
+ *   new URL('https://graph.microsoft.com/v1.0' +
+ *     '/me/drive/root:/Quarter%231.pdf:/content').pathname
+ *   -> '/v1.0/me/drive/root:/Quarter%231.pdf:/content'   (byte-for-byte
+ *      identical to the input, mod the /v1.0 prefix -- no truncation, no
+ *      resolution, nothing diverges)
+ *
+ * This is the general rule the P1 fixes already embody, made explicit: a
+ * raw `#`/`?` is rejected because it TRUNCATES (nothing after it reaches the
+ * wire at all, so no resolved pathname could ever reveal what was lost) and
+ * a dot-segment is rejected because the URL Standard RESOLVES it away (the
+ * resolved pathname names a different resource than the one written). A
+ * percent-encoded ordinary character does neither -- nothing between this
+ * gate and `fetch()` ever decodes it, so it survives into `pathname`
+ * unchanged and the resolved path names exactly what the caller wrote. The
+ * question that decides membership in the reject list is never "is this
+ * character unusual" but "does resolving this target change what it names" --
+ * checked here for every character the previous round rejected, not just
+ * the one Codex named, so the rule is applied uniformly rather than
+ * special-cased for `%23` alone.
+ */
+describe('isMintableTarget allows percent-encoded punctuation that merely spells a character (Codex P2)', () => {
+  const SAFE_PERCENT_ENCODINGS: Array<{ label: string; target: string; expectedPathname: string }> =
+    [
+      {
+        label: 'the exact Codex example: a literal # in a drive filename',
+        target: '/me/drive/root:/Quarter%231.pdf:/content',
+        expectedPathname: '/v1.0/me/drive/root:/Quarter%231.pdf:/content',
+      },
+      {
+        label: 'a literal ? in a drive filename',
+        target: '/me/drive/root:/Question%3Fmark.pdf:/content',
+        expectedPathname: '/v1.0/me/drive/root:/Question%3Fmark.pdf:/content',
+      },
+      {
+        label:
+          'a literal backslash in a drive filename (still just a spelled character once encoded)',
+        target: '/me/drive/root:/back%5Cslash.pdf:/content',
+        expectedPathname: '/v1.0/me/drive/root:/back%5Cslash.pdf:/content',
+      },
+      {
+        label: 'a percent-encoded # in a mail attachment id (same rule, different family)',
+        target: '/me/messages/M/attachments/A%23/$value',
+        expectedPathname: '/v1.0/me/messages/M/attachments/A%23/$value',
+      },
+      {
+        label: 'a percent-encoded ? in a mail attachment id (same rule, different family)',
+        target: '/me/messages/M/attachments/A%3F/$value',
+        expectedPathname: '/v1.0/me/messages/M/attachments/A%3F/$value',
+      },
+    ];
+
+  for (const { label, target, expectedPathname } of SAFE_PERCENT_ENCODINGS) {
+    it(`mints ${label}, and the resolved pathname still names exactly what the caller wrote`, () => {
+      // Simulate performRequest's own concatenation directly: the resolved
+      // pathname must be byte-identical to the input (mod the fixed /v1.0
+      // prefix), proving nothing was truncated or resolved away.
+      const resolved = new URL(`https://graph.microsoft.com/v1.0${target}`);
+      expect(resolved.pathname).toBe(expectedPathname);
+      expect(isMintableTarget(target)).toBe(true);
+    });
+  }
+
+  // The pair that matters most: this loosening must not reopen either P1.
+  // Same suite, same run, so a regression here fails alongside everything
+  // else rather than in a separate file someone has to remember to check.
+  it('still rejects a RAW # fragment (P1 #1 stays closed)', () => {
+    expect(isMintableTarget('/me/messages/M/attachments/A#/$value')).toBe(false);
+  });
+
+  it('still rejects a RAW ? query string (P1 #1 stays closed)', () => {
+    expect(isMintableTarget('/me/messages/M/attachments/A?x=/$value')).toBe(false);
+  });
+
+  it('still rejects a RAW backslash (folds into a path separator, unlike its percent-encoded form)', () => {
+    expect(isMintableTarget('/me/messages/M/attachments/A\\foo/$value')).toBe(false);
+  });
+
+  it('still rejects percent-encoded dot segments (P1 #2 stays closed)', () => {
+    expect(
+      isMintableTarget('/me/messages/M/attachments/A/%2e%2e/%2e%2e/attachments/A2/$value')
+    ).toBe(false);
+  });
+
+  it('still rejects a literal .. path segment (P1 #2 stays closed)', () => {
+    expect(isMintableTarget('/me/messages/M/attachments/A/../../attachments/A2/$value')).toBe(
+      false
+    );
+  });
+});
+
+/**
  * End-to-end proof for the exact Codex scenario: a redeemed ticket must not
  * reach the mail attachment's unsuffixed metadata endpoint. Exercised through
  * read-document, which is the tool named in the finding.
@@ -312,6 +406,34 @@ describe('read-document refuses to mint for a target that diverges from its own 
     // minted just because the string named A -- nothing is minted at all.
     expect(store.size()).toBe(0);
     expect(requests).toHaveLength(0);
+  });
+
+  it('mints the Codex P2 drive-path target (a literal # in a filename), regression-closing the over-tight gate', async () => {
+    const readDocument = UTILITY_TOOLS.find((t) => t.name === 'read-document')!;
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: '# Quarter 1\n\nBody.' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await readDocument.execute(
+      { target: '/me/drive/root:/Quarter%231.pdf:/content' },
+      {
+        graphClient: { makeRequest: vi.fn() } as never,
+        authManager: {
+          isOAuthModeEnabled: () => false,
+          isMultiAccount: async () => false,
+          getTokenForAccount: async () => 'SERVER_OWN_TOKEN',
+        } as never,
+        multiAccount: false,
+        accountNames: [],
+      }
+    );
+
+    // A success response omits `isError` entirely rather than setting it
+    // `false` -- unlike the failure-path assertions elsewhere in this file,
+    // which do set it, this checks falsiness rather than exact equality.
+    expect(Boolean(result.isError)).toBe(false);
+    expect(result.content[0]).toEqual({ type: 'text', text: '# Quarter 1\n\nBody.' });
+    expect(requests).toHaveLength(1);
+    expect(store.size()).toBe(1);
   });
 });
 

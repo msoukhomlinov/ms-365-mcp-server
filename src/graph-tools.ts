@@ -529,37 +529,56 @@ function isDotPathSegment(segment: string): boolean {
 }
 
 /**
- * True when `target`'s raw string cannot be trusted to name the resource
+ * True when `target`'s RAW string cannot be trusted to name the resource
  * `GraphClient.performRequest` will actually request, for a reason a
- * resolved-pathname check by itself would not catch:
+ * resolved-pathname check by itself would not catch.
  *
- *   - `#` starts a fragment, which `fetch()` never transmits at all, and `?`
- *     starts the query string, which Graph's path-based routing ignores.
- *     Both TRUNCATE rather than normalise -- neither survives into
- *     `pathname` in any form, so there is no resolved pathname that would
- *     reveal a truncation, only its absence. Must be caught as raw-string
- *     syntax before any parsing happens.
- *   - Backslash and C0 controls/DEL are never legitimate in a real Graph
- *     resource path or OneDrive/SharePoint item name in the first place
- *     (OneDrive explicitly forbids `\` in names), so they are rejected
- *     outright rather than let the parser fold/mangle them into whatever
- *     pathname results and trust the grammar below to notice.
- *   - Percent-encoded forms of the above are not decoded anywhere between
- *     this gate and the wire today (`fetch()` never unescapes `%XX` before
- *     parsing), so they cannot themselves cause a divergence -- rejected
- *     anyway, purely as insurance against a future decode step upstream of
- *     this gate.
+ * **The test every entry here must pass: does resolving `target` change what
+ * it names?** Not "is this character unusual" -- a percent-encoded ordinary
+ * character survives into `pathname` unchanged (nothing between this gate and
+ * `fetch()` ever decodes `%XX`), so it names exactly what the caller wrote and
+ * belongs nowhere on this list, however unusual it looks. Two raw characters
+ * fail that test in a way no resolved pathname can even reveal, because they
+ * TRUNCATE rather than normalise:
+ *   - `#` starts a fragment, which `fetch()` never transmits at all.
+ *   - `?` starts the query string, which Graph's path-based routing ignores.
+ * Neither survives into `pathname` in any form -- there is no resolved
+ * pathname that would show what was lost, only its absence -- so both must be
+ * caught as raw-string syntax before any parsing happens. A THIRD raw
+ * character fails the test by normalising rather than truncating:
+ *   - `\` is folded into `/` for "special" schemes (https included),
+ *     restructuring path segments rather than merely re-spelling one.
+ * Their percent-encoded forms (`%23`, `%3F`, `%5C`) are the counter-example
+ * that motivates the test above: encoded, none of them truncate or fold --
+ * `%23`/`%3F`/`%5C` sit in `pathname` exactly where the caller put them, so a
+ * `#`/`?`/`\` that is part of a real OneDrive/SharePoint filename (Graph
+ * *requires* this encoding for such names) is not rejected here. Rejecting
+ * them anyway was this gate's own regression (Codex P2 on PR #16): it cost a
+ * real, previously-working target (`/me/drive/root:/Quarter%231.pdf:/content`)
+ * for a divergence that provably cannot occur.
+ *
+ * Raw C0 controls/DEL are rejected on different grounds -- not because
+ * resolving them changes the target (most are percent-encoded verbatim by the
+ * parser, which is exactly as inert as a caller pre-encoding them), but
+ * because TAB/LF/CR specifically are *stripped* rather than encoded, wherever
+ * they appear, which does change the target by silently merging what
+ * surrounds them. None of the C0 range is ever legitimate in a real Graph
+ * resource id or OneDrive/SharePoint item name (unlike `#`/`?`/`\`, which
+ * commonly appear in real filenames), so the whole range is rejected together
+ * rather than carving out the few bytes that would technically pass the
+ * resolution test -- there is no real target to lose by doing so.
  *
  * Dot-segments are deliberately NOT handled here -- see `isDotPathSegment`
  * and `isMintableTarget`'s docstring for why that is a separate, closed,
- * spec-defined check rather than another entry in this list.
+ * spec-defined check rather than another entry in this list. They are the
+ * other counter-example: the URL Standard RESOLVES them away, so the
+ * resolved pathname names a different resource than the one written --
+ * exactly the divergence this whole gate exists to catch, which is why they
+ * stay rejected even though they are "just" percent-encoded punctuation too.
  */
 function hasUrlDivergentSyntax(target: string): boolean {
   // eslint-disable-next-line no-control-regex -- deliberately matching C0/DEL.
-  if (/[\x00-\x1f\x7f#?\\]/.test(target)) return true;
-  // Percent-encoded control chars, '#', '?', or '\' -- see docstring above.
-  if (/%(?:[01][0-9a-f]|7f|23|3f|5c)/i.test(target)) return true;
-  return false;
+  return /[\x00-\x1f\x7f#?\\]/.test(target);
 }
 
 /**
