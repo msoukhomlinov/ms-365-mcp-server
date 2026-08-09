@@ -225,6 +225,23 @@ describe('read-document', () => {
     expect(requests).toHaveLength(0);
   });
 
+  it('mints a ticket for a OneDrive/SharePoint drive item content target', async () => {
+    // read-document's own tool description advertises
+    // /drives/{drive-id}/items/{driveItem-id}/content as a valid target; the
+    // grammar must actually accept it, not just describe it.
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: '# Report\n\nBody.' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const result = await call(await connect(), {
+      target: '/drives/DRIVE1/items/ITEM1/content',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe('# Report\n\nBody.');
+    expect(requests).toHaveLength(1);
+    expect(store.size()).toBe(1);
+  });
+
   it('mints a fresh ticket on every call rather than reusing one', async () => {
     const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'ok' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });

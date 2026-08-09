@@ -453,6 +453,22 @@ const MEETING_RECORDING_TARGETS = [
 ];
 const VALUE_BYTE_TARGET = /\/\$value$/;
 
+// Drive/SharePoint file content. Unlike get-download-url's own driveItem
+// matcher (isDriveItemById/isDriveItemByPath below), /content is mandatory
+// here rather than optional: get-download-url fetches item metadata first and
+// appends /content itself before minting, but a target matched against this
+// list is minted (or read-document-validated) as-is, with no such append
+// step, so it must already name the bytes endpoint a ticket redemption will
+// GET.
+const DRIVE_CONTENT_TARGET_PATTERNS = [
+  /^\/drives\/[^/]+\/items\/[^/]+\/content$/,
+  /^\/(?:me|users\/[^/]+|groups\/[^/]+|sites\/[^/]+)\/drive\/items\/[^/]+\/content$/,
+  /^\/(?:groups\/[^/]+|sites\/[^/]+)\/drives\/[^/]+\/items\/[^/]+\/content$/,
+  /^\/drives\/[^/]+\/root:\/.+:\/content$/,
+  /^\/(?:me|users\/[^/]+|groups\/[^/]+|sites\/[^/]+)\/drive\/root:\/.+:\/content$/,
+  /^\/(?:groups\/[^/]+|sites\/[^/]+)\/drives\/[^/]+\/root:\/.+:\/content$/,
+];
+
 // Family membership, not a mint decision. This drives preset derivation too
 // (attachment-url-preset-gating.test.ts applies it to endpoints.json's base
 // -- never `/$value`-suffixed -- path patterns to answer "which presets
@@ -465,6 +481,7 @@ const VALUE_BYTE_TARGET = /\/\$value$/;
 export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
   MAIL_EVENT_ATTACHMENT_TARGET,
   ...MEETING_RECORDING_TARGETS,
+  ...DRIVE_CONTENT_TARGET_PATTERNS,
   VALUE_BYTE_TARGET,
 ];
 
@@ -484,15 +501,16 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
  * too, or the scrubber that exists specifically to keep `contentBytes` out of
  * the model's context has a hole a caller can drive straight through.
  *
- * The other two families (meeting recordings, generic `/$value` endpoints)
- * are already correctly end-anchored in their own patterns, so a plain
- * `.some()` over them is safe.
+ * The other three families (drive/SharePoint content, meeting recordings,
+ * generic `/$value` endpoints) are already correctly end-anchored in their
+ * own patterns, so a plain `.some()` over them is safe.
  */
 export function isMintableTarget(target: string): boolean {
   if (MAIL_EVENT_ATTACHMENT_TARGET.test(target)) {
     return target.endsWith('/$value');
   }
   return (
+    DRIVE_CONTENT_TARGET_PATTERNS.some((pattern) => pattern.test(target)) ||
     MEETING_RECORDING_TARGETS.some((pattern) => pattern.test(target)) ||
     VALUE_BYTE_TARGET.test(target)
   );
@@ -1354,9 +1372,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         return readDocumentError(
           'invalid_target',
           `target must be a relative Microsoft Graph byte path this server can mint for: a mail or event attachment ` +
-            `(/me/messages/{message-id}/attachments/{attachment-id}/$value), a meeting recording, or any other ` +
-            `authenticated /$value endpoint (/me/messages/{message-id}/$value for the raw message). Absolute URLs ` +
-            `are not accepted. Got ${JSON.stringify(target)}.`,
+            `(/me/messages/{message-id}/attachments/{attachment-id}/$value), a drive or SharePoint file content path ` +
+            `(/drives/{drive-id}/items/{driveItem-id}/content), a meeting recording, or any other authenticated ` +
+            `/$value endpoint (/me/messages/{message-id}/$value for the raw message). Absolute URLs are not ` +
+            `accepted. Got ${JSON.stringify(target)}.`,
           UNKNOWN_ATTACHMENT
         );
       }
