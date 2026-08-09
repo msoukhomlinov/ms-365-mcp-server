@@ -486,6 +486,61 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
+ * Whether `target`, taken as a raw string, is guaranteed to name the same
+ * resource once it is actually requested.
+ *
+ * `GraphClient.performRequest` builds its request URL by string-concatenating
+ * `target` onto the Graph base URL and hands the result straight to `fetch()`,
+ * which parses it per the WHATWG URL standard. That parser reassigns meaning
+ * to several raw characters instead of treating them as literal path bytes:
+ *
+ *   - `#` starts a fragment. Fragments are a client-side-only concept -- the
+ *     browser/fetch layer strips it before the request is even framed, so
+ *     nothing after a `#` is ever transmitted.
+ *   - `?` starts the query string, which Graph's path-based routing does not
+ *     consult when deciding which resource to serve.
+ *   - `\` is folded into `/` for "special" schemes -- https included -- so a
+ *     backslash is just another path separator as far as the parser is
+ *     concerned, regardless of what the raw string looks like.
+ *   - A `.` or `..` path segment is resolved away (dot-segment removal)
+ *     before the request is sent, so `a/../b` and `b` are the same request
+ *     even though they are different strings.
+ *   - C0 controls (and DEL) are stripped or otherwise mangled by the parser.
+ *
+ * A target validated only as a string -- e.g. the old `endsWith('/$value')`
+ * check -- can satisfy that check while naming a completely different URL
+ * once any of the above applies. For the mail/event attachment family in
+ * particular, the divergent URL is that attachment's *metadata* resource
+ * rather than its bytes; for a fileAttachment, Graph's metadata response
+ * carries `contentBytes` as base64 JSON, and streaming that through the
+ * redemption route in attachment-route.ts -- which has no response scrubber,
+ * by design, since streaming raw bytes with no MCP envelope is the whole
+ * point of a ticket -- is exactly the exposure minting exists to avoid.
+ *
+ * This is a denylist, but a closed one: the five bullets above are the
+ * complete set of ways the WHATWG URL parser treats a raw input character (or
+ * sequence) as anything other than a literal path byte when the input is
+ * concatenated onto a fixed scheme+host+version prefix, the way
+ * `performRequest` does it. Percent-encoded forms of the same characters
+ * (`%23`, `%3F`, ...) are not decoded anywhere between this gate and the wire
+ * today, so they cannot themselves cause the divergence above -- they are
+ * rejected anyway, purely as insurance against a future refactor adding a
+ * decode step upstream of this gate. None of Graph's own resource
+ * identifiers, or OneDrive/SharePoint item names (which forbid `\` and
+ * several other characters outright), ever legitimately need any of this, so
+ * rejecting it costs no real target.
+ */
+function hasUrlDivergentSyntax(target: string): boolean {
+  // eslint-disable-next-line no-control-regex -- deliberately matching C0/DEL.
+  if (/[\x00-\x1f\x7f#?\\]/.test(target)) return true;
+  // A '.' or '..' segment, bounded by '/' or the string edges.
+  if (/(^|\/)\.\.?(\/|$)/.test(target)) return true;
+  // Percent-encoded control chars, '#', '?', or '\' -- see docstring above.
+  if (/%(?:[01][0-9a-f]|7f|23|3f|5c)/i.test(target)) return true;
+  return false;
+}
+
+/**
  * Whether `target` is a Graph byte resource this server can actually mint a
  * ticket for -- the real security gate, as opposed to iterating
  * `MINTABLE_TARGET_PATTERNS` directly with `.some()`.
@@ -503,9 +558,16 @@ export const MINTABLE_TARGET_PATTERNS: readonly RegExp[] = [
  *
  * The other three families (drive/SharePoint content, meeting recordings,
  * generic `/$value` endpoints) are already correctly end-anchored in their
- * own patterns, so a plain `.some()` over them is safe.
+ * own patterns, so a plain `.some()` over them is safe -- PROVIDED `target`
+ * cannot diverge from the pathname actually requested, which is what
+ * `hasUrlDivergentSyntax` above rules out first. Every one of the checks
+ * below still operates on the raw string, deliberately: once divergent
+ * syntax is excluded, the raw string and the pathname `fetch()` derives from
+ * it agree (mod percent-encoding of characters like spaces or non-ASCII
+ * letters, which affects neither of these patterns).
  */
 export function isMintableTarget(target: string): boolean {
+  if (hasUrlDivergentSyntax(target)) return false;
   if (MAIL_EVENT_ATTACHMENT_TARGET.test(target)) {
     return target.endsWith('/$value');
   }
@@ -1105,23 +1167,30 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           isError: true,
         };
       }
-      // Normalize: separate any query string and strip trailing slashes so the /content and
-      // /$value suffix checks are robust to e.g. "/content/" or "/content?select=id".
-      const queryIdx = target.indexOf('?');
-      if (queryIdx >= 0) {
+      // Reject any syntax that would make the URL `performRequest` actually
+      // builds diverge from this string -- a query string or fragment
+      // silently redirects or truncates what reaches Graph, and a backslash
+      // or dot-segment silently reshapes the path. See `hasUrlDivergentSyntax`
+      // and `isMintableTarget`'s docstrings above: this is the same class of
+      // hole that check exists to close, enforced here too because this
+      // tool's mail/event/recording/$value branches below decide whether to
+      // mint independently of `isMintableTarget`.
+      if (hasUrlDivergentSyntax(target)) {
         return {
           content: [
             {
               type: 'text',
               text: JSON.stringify({
                 error:
-                  'target must not include query parameters. Pass the drive item /content path or item metadata path without $select, $expand, or other query options.',
+                  'target must not include query parameters, a "#" fragment, backslashes, control characters, or "." / ".." path segments. Pass the drive item /content path or item metadata path without $select, $expand, or other query options.',
               }),
             },
           ],
           isError: true,
         };
       }
+      // Normalize: strip trailing slashes so the /content and /$value suffix
+      // checks are robust to e.g. "/content/".
       const pathPart = target.replace(/\/+$/, '');
       // Mail/event attachments expose no pre-authenticated download URL in Graph; bytes come
       // only from base64 contentBytes or the authenticated /$value endpoint (use download-bytes).
@@ -1131,7 +1200,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // Paired with the /$value suffix, not just the family match: without it, pathPart names
       // the attachment's metadata resource (contentBytes and all), not its bytes -- see
       // isMintableTarget's docstring above for why minting that would defeat the scrubber.
-      if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart) && pathPart.endsWith('/$value')) {
+      // The suffix/divergence decision itself is delegated to `isMintableTarget` rather than
+      // re-implemented here as its own `endsWith`, so this branch and read-document's mint gate
+      // cannot drift apart and disagree about which strings are safe to mint.
+      if (MAIL_EVENT_ATTACHMENT_TARGET.test(pathPart) && isMintableTarget(pathPart)) {
         const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
         if (minted) return minted;
         return {
