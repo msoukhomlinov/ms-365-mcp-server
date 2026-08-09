@@ -121,7 +121,17 @@ export function toWireArguments(req: ConvertRequest): Record<string, unknown> {
  * before scanning, so the last (unterminated) frame's data survives in
  * `current` to the throw below instead of being mistaken for a dispatch.
  */
-function extractSseData(body: string): string | null {
+/**
+ * `expectedId` correlates the returned frame to a specific JSON-RPC request
+ * id, the way the SDK's own transport does. Omitted, this returns the first
+ * non-empty frame exactly as before -- a caller with nothing to correlate
+ * against (there is none in this module currently) keeps the original
+ * behaviour. Given, every completed frame is parsed as JSON-RPC and checked
+ * for a matching `id` before being accepted; a frame that fails to parse or
+ * carries a different id is skipped rather than returned, since it belongs to
+ * some other in-flight exchange on the same connection, not this one.
+ */
+function extractSseData(body: string, expectedId?: unknown): string | null {
   const lines = body.split(/\r\n|\r|\n/);
   const last = lines.length - 1;
   if (lines[last] === '' && lines[last - 1] !== '') {
@@ -132,7 +142,15 @@ function extractSseData(body: string): string | null {
     if (line === '') {
       const joined = current.join('\n');
       current = [];
-      if (joined !== '') return joined;
+      if (joined === '') continue;
+      if (expectedId === undefined) return joined;
+      try {
+        const parsed = JSON.parse(joined) as { id?: unknown } | null;
+        if (parsed && typeof parsed === 'object' && parsed.id === expectedId) return joined;
+      } catch {
+        // Not JSON-RPC shaped, or not parseable yet -- not our frame. Keep scanning; the
+        // final JSON.parse in decodeJsonRpcBody is what reports a genuinely malformed body.
+      }
       continue;
     }
     if (line.startsWith(':') || !line.startsWith('data:')) continue;
@@ -154,11 +172,19 @@ function extractSseData(body: string): string | null {
  * two is exactly the class of defect that served every attachment as an empty
  * 200 on 2026-08-07 — a well-formed response the client could not read.
  */
-export function decodeJsonRpcBody(contentType: string | null, body: string): unknown {
+export function decodeJsonRpcBody(
+  contentType: string | null,
+  body: string,
+  expectedId?: unknown
+): unknown {
   const isSse = (contentType ?? '').toLowerCase().includes('text/event-stream');
-  const payload = isSse ? extractSseData(body) : body;
+  const payload = isSse ? extractSseData(body, expectedId) : body;
   if (payload === null) {
-    throw new Error('the proxy sent an event stream with no data frame in it');
+    throw new Error(
+      expectedId === undefined
+        ? 'the proxy sent an event stream with no data frame in it'
+        : `the proxy sent an event stream with no frame matching request id ${String(expectedId)}`
+    );
   }
   return JSON.parse(payload);
 }
@@ -303,11 +329,17 @@ export class AttachmentProxyClient {
   }
 
   async convertToMarkdown(req: ConvertRequest): Promise<ConvertResult> {
+    // A fixed id is correct here and not laziness: one request per
+    // connection, no session, nothing else to correlate against today. It is
+    // still THE id the response must carry, though, so it is threaded through
+    // to decodeJsonRpcBody below rather than assumed -- an SSE stream is
+    // framed, and a reader that accepts whichever frame arrives first rather
+    // than the one addressed to this request would be correct only by
+    // coincidence of there being nothing else on the wire yet.
+    const requestId = 1;
     const body = JSON.stringify({
       jsonrpc: '2.0',
-      // A fixed id is correct here and not laziness: one request per
-      // connection, no session, nothing to correlate against.
-      id: 1,
+      id: requestId,
       method: 'tools/call',
       params: { name: PROXY_TOOL_NAME, arguments: toWireArguments(req) },
     });
@@ -364,7 +396,7 @@ export class AttachmentProxyClient {
 
     let message: unknown;
     try {
-      message = decodeJsonRpcBody(contentType, text);
+      message = decodeJsonRpcBody(contentType, text, requestId);
     } catch {
       // A gateway's HTML, a truncated stream, a proxy that answered in prose.
       // The body is deliberately not quoted: it is upstream text this server

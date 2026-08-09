@@ -145,6 +145,38 @@ describe('AttachmentProxyClient.convertToMarkdown', () => {
       message: expect.stringContaining('no markdown'),
     });
   });
+
+  /**
+   * The request this client sends carries a fixed JSON-RPC id (see the
+   * comment on `id: 1` above). A correct reader picks the SSE frame whose
+   * `id` matches that request, not merely the first non-empty `data:` frame
+   * the stream happens to carry. Low-impact today -- one stateless request
+   * per connection, so in practice the first frame IS the answer -- but wrong,
+   * and it would surface as baffling cross-talk the moment anything batches
+   * or multiplexes frames on one connection.
+   */
+  it('picks the SSE frame whose JSON-RPC id matches the request, not merely the first frame', async () => {
+    const wrongIdFrame = {
+      jsonrpc: '2.0',
+      id: 999,
+      result: { structuredContent: { markdown: 'WRONG -- unrelated frame' } },
+    };
+    const rightIdFrame = okMessage('# Correct');
+    const body =
+      `event: message\r\ndata: ${JSON.stringify(wrongIdFrame)}\r\n\r\n` +
+      `event: message\r\ndata: ${JSON.stringify(rightIdFrame)}\r\n\r\n`;
+    const response = new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    });
+    const { impl } = recordingFetch([response]);
+    const client = new AttachmentProxyClient({ url: 'http://proxy:8080/mcp', fetchImpl: impl });
+
+    expect(await client.convertToMarkdown({ uri: 'http://m365:3001/attachment?t=abc' })).toEqual({
+      ok: true,
+      markdown: '# Correct',
+    });
+  });
 });
 
 /** A coded tool error as `_error_result` puts it on the wire: both channels, isError true. */

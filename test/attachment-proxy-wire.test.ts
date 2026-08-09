@@ -155,4 +155,27 @@ describe('decodeJsonRpcBody', () => {
     const body = `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
     expect(decodeJsonRpcBody('text/event-stream', body)).toEqual(message);
   });
+
+  /**
+   * An optional third argument correlates the returned frame to a specific
+   * JSON-RPC request id, for a caller that cares (AttachmentProxyClient does,
+   * passing the fixed id it sent). Omitting it preserves every test above:
+   * "first non-empty frame" remains the default for a caller with nothing to
+   * correlate against.
+   */
+  it('with an expected id, returns the frame whose id matches even when it is not first', () => {
+    const other = { jsonrpc: '2.0', id: 2, result: { structuredContent: { markdown: 'other' } } };
+    const body =
+      `event: message\r\ndata: ${JSON.stringify(other)}\r\n\r\n` +
+      `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(decodeJsonRpcBody('text/event-stream', body, 1)).toEqual(message);
+    expect(decodeJsonRpcBody('text/event-stream', body, 2)).toEqual(other);
+  });
+
+  it('throws a distinct error when no frame matches the expected id', () => {
+    const body = `event: message\r\ndata: ${JSON.stringify(message)}\r\n\r\n`;
+    expect(() => decodeJsonRpcBody('text/event-stream', body, 404)).toThrow(
+      /no frame matching request id 404/
+    );
+  });
 });
