@@ -726,27 +726,26 @@ interface AttachmentProbe extends AttachmentFacts {
 const UNKNOWN_PROBE: AttachmentProbe = { ...UNKNOWN_ATTACHMENT, isReferenceAttachment: false };
 
 /**
- * Graph's `@odata.type` annotation for the two attachment subtypes this probe
- * treats specially. Read from the SAME metadata response the probe already
- * fetches -- not a second call, and not the file's bytes -- so acting on it is
- * "use metadata this server already has", not format sniffing.
+ * Graph's `@odata.type` annotation, IF present, for the `referenceAttachment`
+ * subtype -- a link, with no bytes stored in this mailbox.
+ *
+ * **This is read defensively, not relied on.** No registered tool in this
+ * server's endpoints.json reaches a GET on the single attachment resource
+ * this probe queries (`/me/messages/{id}/attachments/{id}` has only a DELETE
+ * entry there) -- only `list-mail-attachments`' COLLECTION endpoint is
+ * registered, and every tool-facing response (this one included) is stripped
+ * of every `@odata.*` key by `graph-client.ts`'s `formatJsonResponse` before
+ * it reaches a caller. So whether Graph actually volunteers `@odata.type` on
+ * EITHER shape has never been observed live by this project, through the MCP
+ * tool interface, by anyone -- this probe's own call bypasses that stripper
+ * (it uses `makeRequest` directly, not `graphRequest`), so it WOULD see the
+ * annotation if Graph sends it, but that is exactly the part nothing has
+ * verified. If Graph never sends it, this check is a no-op: `isReferenceAttachment`
+ * stays `false`, and behaviour for that (unconfirmed) case is unchanged from
+ * before this fix. Costed as free-if-wrong rather than promoted to something
+ * this server's tests or docs claim is proven.
  */
 const REFERENCE_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.referenceAttachment';
-const ITEM_ATTACHMENT_ODATA_TYPE = '#microsoft.graph.itemAttachment';
-
-/**
- * Content-Type Microsoft Graph documents for `GET
- * .../attachments/{id}/$value` on an `itemAttachment` wrapping a mail
- * message: the raw RFC 5322 source, not a JSON envelope. This is a fallback,
- * not a preference -- it is used only when Graph's own metadata leaves
- * `contentType` null, which empirically it does for every itemAttachment
- * probed live in this mailbox (Graph has no MIME type to report for an
- * embedded Outlook item; the type only becomes meaningful once you know
- * `/$value` on it always resolves to a MIME message). Gated on `@odata.type`
- * specifically, not on "contentType is null", because a plain `fileAttachment`
- * can also carry a null `contentType` and is not a message.
- */
-const ITEM_ATTACHMENT_VALUE_CONTENT_TYPE = 'message/rfc822';
 
 /**
  * `name`/`contentType`/`size` for a mail or event attachment, from Graph's own
@@ -758,6 +757,24 @@ const ITEM_ATTACHMENT_VALUE_CONTENT_TYPE = 'message/rfc822';
  * the only Graph resources carrying all three base fields; asking a message
  * or a photo for `$select=name,contentType,size` is a guaranteed 400, which
  * would put a noisy Graph error in the log on every call and buy nothing.
+ *
+ * `contentType` is used EXACTLY as Graph's metadata states it, with no
+ * inference layered on top. An earlier version of this probe additionally
+ * defaulted a null `contentType` to `message/rfc822` whenever `@odata.type`
+ * read `#microsoft.graph.itemAttachment` -- Microsoft's own documented
+ * contract for that subtype's `/$value`. That default is REMOVED: per the
+ * `@odata.type` docstring above, this project has no live evidence `@odata.type`
+ * is ever populated in this probe's response, and a gate keyed on a field
+ * Graph may never return is not a fix, it is a false promise a mocked test
+ * would happily pass. The mechanism this probe actually relies on is
+ * verified instead: probing the exact live itemAttachment a prior report
+ * named ("Sartre and de Beauvoir, Six Lectures at the RH", a nested forwarded
+ * message, 23,317 bytes) shows Graph populating `contentType` directly as
+ * `"message/rfc822"` -- no inference needed, just read the field. A
+ * DIFFERENT itemAttachment probed live in the same mailbox ("Katusha") shows
+ * `contentType: null` instead; that case is simply not improved by this
+ * probe -- the route's stream-Content-Type fallback is what still applies to
+ * it, exactly as it did before this fix.
  *
  * Every failure here is swallowed into `UNKNOWN_PROBE`. A probe that fails
  * must never block or replace anything downstream -- minting proceeds with no
@@ -782,14 +799,11 @@ async function probeMailEventAttachment(
     if (!meta || typeof meta !== 'object') return UNKNOWN_PROBE;
     const odataType =
       typeof meta['@odata.type'] === 'string' ? (meta['@odata.type'] as string) : null;
-    const rawContentType = typeof meta.contentType === 'string' ? meta.contentType : null;
     return {
       name: typeof meta.name === 'string' ? meta.name : null,
       size: typeof meta.size === 'number' ? meta.size : null,
       isReferenceAttachment: odataType === REFERENCE_ATTACHMENT_ODATA_TYPE,
-      contentType:
-        rawContentType ??
-        (odataType === ITEM_ATTACHMENT_ODATA_TYPE ? ITEM_ATTACHMENT_VALUE_CONTENT_TYPE : null),
+      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
     };
   } catch {
     return UNKNOWN_PROBE;

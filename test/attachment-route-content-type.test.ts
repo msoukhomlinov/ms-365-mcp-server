@@ -9,13 +9,15 @@
  * converter that actually exists for the real format.
  *
  * Verified live against the deployed mailbox (see the SDD content-type
- * report): a mail `itemAttachment` (a nested forwarded message) came back
- * with a `null` Content-Type in Graph's own attachment metadata too, so the
- * probe cannot recover a real value there by reading metadata alone -- the
- * fix additionally falls back to Graph's documented `itemAttachment.$value`
- * contract (always the RFC 5322 source) when the metadata's own probe found
- * nothing and the concrete attachment type is a message item.
+ * report): Graph's own attachment metadata sometimes populates `contentType`
+ * directly for a mail `itemAttachment` (a nested forwarded message) --
+ * `message/rfc822`, read verbatim, no inference -- and sometimes leaves it
+ * `null` for a different itemAttachment in the same mailbox. The probe used
+ * by `graph-tools.ts` relies only on the former (verified) case; the route
+ * tested here is agnostic to how the ticket's `probedContentType` was
+ * decided and just applies the precedence rule against whatever it carries.
  *
+
  * These tests exercise the route's precedence rule directly, with
  * `downloadStream` mocked -- the same harness `attachment-content-length.test.ts`
  * uses -- so the fetch itself is out of scope; the minting side that produces
@@ -25,6 +27,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { Writable } from 'node:stream';
+import { OutgoingMessage } from 'node:http';
 import { createAttachmentHandler } from '../src/attachment-route.js';
 import { AttachmentTicketStore } from '../src/lib/attachment-tickets.js';
 
@@ -44,7 +47,15 @@ describe('the attachment route resolves Content-Type by precedence, not by forwa
     res.status = (s: number) => ((sent.status = s), res);
     res.type = () => res;
     res.send = () => res;
+    // A throwaway REAL http.OutgoingMessage validates the header the exact
+    // way Node's actual response object would -- synchronously, no socket
+    // needed for setHeader itself -- rather than a permissive mock that
+    // would happily accept a value real Node rejects. This is the harness
+    // gap that let the RFC 5987 defect (ERR_INVALID_CHAR on a non-Latin-1
+    // probed filename) ship unnoticed: every prior test here used a plain
+    // object assignment for setHeader, which cannot throw on anything.
     res.setHeader = (k: string, v: string) => {
+      new OutgoingMessage().setHeader(k, v);
       sent.headers[k.toLowerCase()] = v;
     };
     const handler = createAttachmentHandler({
@@ -163,10 +174,13 @@ describe('the attachment route resolves Content-Type by precedence, not by forwa
     const value = sent.headers['content-disposition']!;
     // No raw CR/LF anywhere -- that is the actual header-injection vector.
     expect(value).not.toMatch(/[\r\n]/);
-    // Exactly the two delimiter quotes around `filename=...`, none smuggled
-    // in from the name itself.
-    expect(value.match(/"/g)).toHaveLength(2);
-    expect(value).toBe('attachment; filename="evilX-Injected: yes.pdf"');
+    // The ASCII-safe filename= param has exactly its two delimiter quotes,
+    // none smuggled in from the name itself.
+    const asciiParam = /filename="([^]*?)"/.exec(value)!;
+    expect(asciiParam[1]).toBe('evilX-Injected: yes.pdf');
+    // The raw CR/LF is outside HEADER_SAFE_CHAR, so this name also gets an
+    // RFC 5987 extended form -- percent-encoded, so still injection-safe.
+    expect(value).toContain("; filename*=UTF-8''");
     expect(Object.keys(sent.headers)).not.toContain('x-injected');
   });
 
@@ -175,5 +189,141 @@ describe('the attachment route resolves Content-Type by precedence, not by forwa
     const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined);
     await handler({ query: { t: id } } as never, res as never, (() => {}) as never);
     expect(sent.headers['content-disposition']).toBe('attachment');
+  });
+
+  /**
+   * Regression cover for a defect this PR itself introduced: the probed-name
+   * Content-Disposition fallback above is new, and Node's `setHeader` rejects
+   * ANY code point past U+00FF in a header value (`ERR_INVALID_CHAR`) --
+   * verified directly against a real `http.OutgoingMessage` (see this file's
+   * harness). Before this fallback existed, Graph sending no
+   * Content-Disposition just meant no header; after it, a non-Latin-1 probed
+   * `name` (a perfectly ordinary email attachment filename, e.g. `报告.pdf`)
+   * made every redemption of that ticket 500 instead of streaming the bytes
+   * -- spending one of the caller's 3 fetches for nothing.
+   */
+  describe('content-disposition survives a non-Latin-1 probed name', () => {
+    it('leaves a pure-ASCII name exactly as before (no RFC 5987 extension)', async () => {
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: 'report.pdf',
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      expect(sent.headers['content-disposition']).toBe('attachment; filename="report.pdf"');
+    });
+
+    it('leaves a Latin-1-representable name unextended too (café.pdf is valid in a raw header value)', async () => {
+      // Node's own header-value validator accepts the raw Latin-1 supplement
+      // (0x80-0xFF) directly -- HTTP header values are historically
+      // ISO-8859-1 -- so a name like this never needed RFC 5987 at all.
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: 'café.pdf',
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      const value = sent.headers['content-disposition']!;
+      expect(value).toBe('attachment; filename="café.pdf"');
+      expect(value).not.toContain('filename*=');
+    });
+
+    it('does not throw ERR_INVALID_CHAR for a non-Latin-1 name, and emits a well-formed RFC 5987 pair', async () => {
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: '报告.pdf',
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      const value = sent.headers['content-disposition']!;
+      // ASCII-safe fallback recovers at least the extension, so an agent or
+      // client reading only `filename=` (the RFC 5987 fallback rule) still
+      // gets a usable, format-bearing name rather than an empty one.
+      expect(value).toContain('filename="attachment.pdf"');
+      expect(value).toContain("filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf");
+      // The RFC 5987 grammar's attr-char set excludes ' ( ) * -- encodeURIComponent
+      // alone leaves those unescaped, so a correct encoder must not either.
+      expect(value).not.toMatch(/filename\*=UTF-8''[^;]*['()*]/);
+    });
+
+    it('recovers gracefully when the name is entirely non-ASCII with no extension to fall back to', async () => {
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: '报告',
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      const value = sent.headers['content-disposition']!;
+      expect(value).toContain('filename="attachment"');
+      expect(value).toContain("filename*=UTF-8''%E6%8A%A5%E5%91%8A");
+    });
+
+    it('does not throw for a quote/backslash mixed with non-Latin-1 characters', async () => {
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: '报"告\\.pdf',
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      const value = sent.headers['content-disposition']!;
+      expect(value).not.toMatch(/[\r\n]/);
+      // Exactly the two delimiter quotes -- none smuggled in from the name.
+      const asciiParam = /filename="([^]*?)"/.exec(value)!;
+      expect(asciiParam[1]).not.toMatch(/["\\]/);
+    });
+
+    it('does not throw for a very long non-ASCII name', async () => {
+      const longName = '报'.repeat(300) + '.pdf';
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: null,
+        name: longName,
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      expect(sent.headers['content-disposition']).toContain('filename="attachment.pdf"');
+    });
+  });
+
+  describe('content-type from a probe is guarded the same way', () => {
+    it('falls back to the stream type rather than throwing when the probed content-type is unusable', async () => {
+      // A metadata field, not an HTTP header Graph itself sent -- so nothing
+      // upstream already constrained it to header-safe characters the way
+      // stream.contentType is. Same class of defect as the filename one
+      // above, same fix standard: never let untrusted probe text reach
+      // setHeader unguarded.
+      const { store, handler, sent, res } = harness('application/pdf', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: 'application/pdf; name=报告.pdf',
+        name: null,
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      expect(sent.headers['content-type']).toBe('application/pdf');
+    });
+
+    it('falls back to the generic default when the probed content-type is unusable AND the stream is also generic', async () => {
+      const { store, handler, sent, res } = harness('application/octet-stream', null);
+      const { id } = store.mint('/me/messages/1/attachments/2/$value', undefined, undefined, {
+        contentType: 'message/rfc822; x=报告',
+        name: null,
+      });
+      await expect(
+        handler({ query: { t: id } } as never, res as never, (() => {}) as never)
+      ).resolves.not.toThrow();
+      expect(sent.headers['content-type']).toBe('application/octet-stream');
+    });
   });
 });

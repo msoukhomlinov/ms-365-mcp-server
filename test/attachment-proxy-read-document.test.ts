@@ -429,14 +429,38 @@ describe('read-document mints with the content-type it already knows', () => {
     expect(probe?.name).toBe('report.pdf');
   });
 
-  it("defaults to Graph's documented itemAttachment.$value contract when the metadata contentType is null", async () => {
-    // Empirically confirmed live: an itemAttachment (nested forwarded message)
-    // has a NULL contentType in Graph's own attachment metadata -- the probe
-    // cannot read "message/rfc822" off the metadata the way a fileAttachment's
-    // contentType can be read verbatim. @odata.type is metadata this server
-    // already fetched in the same call, not sniffed bytes, and Graph documents
-    // GET .../attachments/{id}/$value on an itemAttachment as always the raw
-    // RFC 5322 source for a message item.
+  it('carries a directly-populated message/rfc822 content-type, verified against a real itemAttachment', async () => {
+    // Verified live against the deployed mailbox: Graph's OWN metadata for the
+    // itemAttachment "Sartre and de Beauvoir, Six Lectures at the RH" (a
+    // nested forwarded message, 23,317 bytes) populates contentType directly
+    // as "message/rfc822" -- read verbatim, no @odata.type inference involved.
+    // This is the verified mechanism the fix actually depends on.
+    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+    const graphClient = graphClientReturning({
+      name: 'Sartre and de Beauvoir, Six Lectures at the RH',
+      contentType: 'message/rfc822',
+      size: 23317,
+    });
+    const mintSpy = vi.spyOn(store, 'mint');
+
+    await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
+
+    expect(mintSpy).toHaveBeenCalledTimes(1);
+    const probe = mintSpy.mock.calls[0]?.[3];
+    expect(probe?.contentType).toBe('message/rfc822');
+    expect(probe?.name).toBe('Sartre and de Beauvoir, Six Lectures at the RH');
+  });
+
+  it('does not invent a content-type when Graph leaves it null, even with an itemAttachment @odata.type present', async () => {
+    // No @odata.type-gated default: no registered tool in this server's
+    // endpoints.json reaches the single-entity attachment GET this probe
+    // calls (only DELETE is registered for that path), so whether Graph
+    // volunteers @odata.type there has never been verified live. A null
+    // metadata contentType -- also verified live, on a DIFFERENT
+    // itemAttachment ("Katusha") than the one above -- stays null here; the
+    // route's own stream-Content-Type fallback is what still applies to that
+    // case, unchanged from before this fix.
     const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
     const graphClient = graphClientReturning({
@@ -449,30 +473,9 @@ describe('read-document mints with the content-type it already knows', () => {
 
     await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
 
-    expect(mintSpy).toHaveBeenCalledTimes(1);
-    const probe = mintSpy.mock.calls[0]?.[3];
-    expect(probe?.contentType).toBe('message/rfc822');
-    expect(probe?.name).toBe('Katusha');
-  });
-
-  it('does not override a null contentType for a plain fileAttachment (no itemAttachment marker)', async () => {
-    // Guards against over-reaching: a null metadata contentType alone must not
-    // be enough to trigger the message/rfc822 default. Only the concrete
-    // @odata.type earns it.
-    const { client: proxy } = stubProxy({ ok: true, markdown: 'ok' });
-    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
-    const graphClient = graphClientReturning({
-      name: 'mystery.bin',
-      contentType: null,
-      size: 42,
-      '@odata.type': '#microsoft.graph.fileAttachment',
-    });
-    const mintSpy = vi.spyOn(store, 'mint');
-
-    await call(await connect(graphClient), { target: MAIL_ATTACHMENT });
-
     const probe = mintSpy.mock.calls[0]?.[3];
     expect(probe?.contentType).toBeNull();
+    expect(probe?.name).toBe('Katusha');
   });
 
   it('refuses a reference attachment before minting anything, with a clear error', async () => {
@@ -481,6 +484,18 @@ describe('read-document mints with the content-type it already knows', () => {
     // not the linked file, so this must be refused up front rather than
     // spending a ticket and a proxy round trip on a conversion that cannot
     // succeed.
+    //
+    // UNVERIFIED LIVE: no referenceAttachment specimen was ever found in the
+    // target mailbox despite a broad search (see the content-type report),
+    // and this detection depends on the same @odata.type annotation the
+    // itemAttachment default above turned out NOT to be able to rely on --
+    // no registered tool reaches the single-entity GET this probe calls, so
+    // whether Graph actually sends @odata.type here has never been observed
+    // live. This mocked test proves the WIRING (refuse-before-mint, given the
+    // annotation) is correct; it does not prove the annotation arrives in
+    // production. If it never does, this refusal simply never fires and
+    // behaviour for that (unconfirmed) case is unchanged from before this fix
+    // -- see probeMailEventAttachment's docstring in graph-tools.ts.
     const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'never reached' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
     const graphClient = graphClientReturning({

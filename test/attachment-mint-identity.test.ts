@@ -132,13 +132,17 @@ describe('get-download-url carries the same content-type probe read-document doe
 
   afterEach(() => resetAttachmentMinting());
 
-  it('mints a ticket whose lease carries the probed content-type and name', async () => {
+  it('mints a ticket whose lease carries a directly-populated content-type, verified against a real itemAttachment', async () => {
+    // Same verified mechanism as read-document's: Graph's OWN metadata for
+    // the real itemAttachment "Sartre and de Beauvoir, Six Lectures at the
+    // RH" populates contentType directly as "message/rfc822" -- no
+    // @odata.type inference. See probeMailEventAttachment's docstring in
+    // graph-tools.ts for why that inference was removed.
     const graphClient = {
       makeRequest: async () => ({
-        name: 'Katusha',
-        contentType: null,
-        size: 206268,
-        '@odata.type': '#microsoft.graph.itemAttachment',
+        name: 'Sartre and de Beauvoir, Six Lectures at the RH',
+        contentType: 'message/rfc822',
+        size: 23317,
       }),
     };
     const mintSpy = vi.spyOn(store, 'mint');
@@ -151,10 +155,29 @@ describe('get-download-url carries the same content-type probe read-document doe
     const ticketId = new URL(downloadUrl).searchParams.get('t')!;
     const lease = store.redeem(ticketId)!;
     expect(lease.probedContentType).toBe('message/rfc822');
+    expect(lease.probedName).toBe('Sartre and de Beauvoir, Six Lectures at the RH');
+  });
+
+  it('does not invent a content-type when Graph leaves it null, even with an itemAttachment @odata.type present', async () => {
+    const graphClient = {
+      makeRequest: async () => ({
+        name: 'Katusha',
+        contentType: null,
+        size: 206268,
+        '@odata.type': '#microsoft.graph.itemAttachment',
+      }),
+    };
+
+    const result = await tool.execute({ target: MAIL_ATTACHMENT }, ctx(graphClient));
+
+    const { downloadUrl } = parse(result as never);
+    const ticketId = new URL(downloadUrl).searchParams.get('t')!;
+    const lease = store.redeem(ticketId)!;
+    expect(lease.probedContentType).toBeNull();
     expect(lease.probedName).toBe('Katusha');
   });
 
-  it('refuses a reference attachment before minting a ticket', async () => {
+  it('refuses a reference attachment before minting a ticket (mocked -- @odata.type presence here is UNVERIFIED live, see graph-tools.ts)', async () => {
     const graphClient = {
       makeRequest: async () => ({
         name: 'Shared design doc',
