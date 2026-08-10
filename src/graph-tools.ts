@@ -848,7 +848,8 @@ function readDocumentError(
   code: string,
   message: string,
   attachment: AttachmentFacts,
-  proxyCode?: string
+  proxyCode?: string,
+  contentStatus?: string
 ): CallToolResult {
   return {
     content: [
@@ -857,6 +858,7 @@ function readDocumentError(
         text: JSON.stringify({
           error: code,
           ...(proxyCode ? { proxyCode } : {}),
+          ...(contentStatus ? { contentStatus } : {}),
           message,
           name: attachment.name,
           contentType: attachment.contentType,
@@ -866,6 +868,41 @@ function readDocumentError(
     ],
     isError: true,
   };
+}
+
+/**
+ * Why a successful conversion produced nothing, in a sentence.
+ *
+ * The two statuses spelled out here are the ones a caller can act on
+ * differently -- a scan is a document whose text exists but is unreachable
+ * without OCR, a blank document has no text to reach -- and telling them apart
+ * is the difference between "this cannot be read" and "there is nothing in
+ * it". Every other status, including one that does not exist yet, is reported
+ * verbatim rather than flattened: a converter that grows an OCR pass and then
+ * fails it must reach the agent as a stated reason with no edit here, which is
+ * exactly what an interpreted-vocabulary approach would break.
+ */
+function describeEmptyConversion(contentStatus?: string): string {
+  if (contentStatus === 'no_text_layer') {
+    return (
+      'The document converted, but it has no text layer to extract — it is a scan or an ' +
+      'image-only PDF, and the converter has no OCR. Retrying, or varying pages/offset/maxChars, ' +
+      'will return the same nothing. Report it as a document that cannot be read, not as a blank one.'
+    );
+  }
+  if (contentStatus === 'empty_document') {
+    return 'The document converted successfully and contains no text. It is empty, not unreadable.';
+  }
+  if (contentStatus) {
+    return (
+      `The converter extracted no text and reported status ${contentStatus}. Treat it as a ` +
+      `document that could not be read rather than an empty one, and report that status as the reason.`
+    );
+  }
+  return (
+    'The converter extracted no text and gave no reason for it. Report that the document could ' +
+    'not be read rather than describing it as empty.'
+  );
 }
 
 /**
@@ -887,6 +924,11 @@ const CONTRACT_ERROR_CODES = new Set([
   'proxy_unreachable',
   'invalid_target',
   'no_capacity',
+  // Server-origin, like invalid_target and no_capacity: raised when the proxy
+  // succeeded and the document had no text to give. Its sibling scopes the same
+  // emptiness to a requested slice, claiming nothing about the document.
+  'no_text_content',
+  'no_text_in_selection',
 ]);
 
 /**
@@ -1680,7 +1722,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
 
       const attempt = async (
         attemptNumber: number
-      ): Promise<{ ok: true; markdown: string } | { ok: false; code: string; message: string }> => {
+      ): Promise<
+        | { ok: true; markdown: string; contentStatus?: string }
+        | { ok: false; code: string; message: string }
+      > => {
         let ticket: { id: string; expiresAtMs: number };
         try {
           ticket = minting.store.mint(target, accountParam, undefined, {
@@ -1733,6 +1778,18 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           return {
             ok: true,
             markdown: redactAttachmentSecrets(outcome.markdown, ticket.id, ticketUrl),
+            // Redacted on the same grounds as the markdown beside it: the proxy
+            // was handed the live ticket URL and nothing stops it echoing that
+            // URL, or the bare ticket id, into a status string.
+            ...(outcome.contentStatus
+              ? {
+                  contentStatus: redactAttachmentSecrets(
+                    outcome.contentStatus,
+                    ticket.id,
+                    ticketUrl
+                  ),
+                }
+              : {}),
           };
         }
         return {
@@ -1751,10 +1808,6 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         outcome = await attempt(2);
       }
 
-      if (outcome.ok) {
-        return { content: [{ type: 'text', text: outcome.markdown }] };
-      }
-
       // Reuses the SAME probe every attempt already minted with, rather than a
       // second Graph call: describeAttachment's failure-path contract (best
       // effort, swallow errors, never replace the real failure) is exactly
@@ -1764,6 +1817,51 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         contentType: probe.contentType,
         size: probe.size,
       };
+
+      if (outcome.ok) {
+        // A success with nothing in it is reported as a failure to read, not as
+        // a read that returned nothing. The proxy did its job; the document has
+        // no text to hand over, and an empty string cannot say so -- it is
+        // indistinguishable from a bug, so a model retries it, varies the
+        // paging arguments, or tells the user the document is blank. Trimmed
+        // rather than length-checked: a converter answering with a lone newline
+        // has produced no more text than one answering with "".
+        if (outcome.markdown.trim() === '') {
+          // Whose claim is it? `content_status` is the converter describing the
+          // DOCUMENT, so it survives slicing untouched -- a PDF with no text
+          // layer has none on page 5 either. An empty RESULT only describes the
+          // document when nothing was sliced away: `pages` and `offset` are
+          // advertised continuation parameters, so a caller who already read
+          // pages 1-4 can legitimately ask for a blank page 5 or pass an offset
+          // that lands at EOF, and answering that with "the document is empty or
+          // unreadable" contradicts text the caller is already holding.
+          //
+          // offset 0 selects nothing away, and maxChars truncates from the start
+          // rather than selecting a position, so neither makes a read sliced.
+          const sliced =
+            typeof params.pages === 'string' ||
+            (typeof params.offset === 'number' && params.offset > 0);
+          if (sliced && !outcome.contentStatus) {
+            return readDocumentError(
+              'no_text_in_selection',
+              'The pages or offset you asked for hold no text. This says nothing about the rest of ' +
+                'the document: text you already read from earlier pages or offsets still stands, and ' +
+                'the selection is most likely past the end. Stop paging here rather than reporting ' +
+                'the document as empty or unreadable.',
+              facts
+            );
+          }
+          return readDocumentError(
+            'no_text_content',
+            describeEmptyConversion(outcome.contentStatus),
+            facts,
+            undefined,
+            outcome.contentStatus
+          );
+        }
+        return { content: [{ type: 'text', text: outcome.markdown }] };
+      }
+
       const known = CONTRACT_ERROR_CODES.has(outcome.code);
       return readDocumentError(
         known ? outcome.code : 'proxy_error',
