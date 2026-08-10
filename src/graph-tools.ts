@@ -1534,7 +1534,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // @microsoft.graph.downloadUrl, and proxy scrubbing deliberately leaves
       // URLs intact. What is true, and mechanism-backed, is the sentence about
       // bytes -- the scrubber enforces that one.
-      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says, with one limit: it mints a URL that is redeemed later with no Authorization header, so whenever Graph identity comes from the request (OAuth, OBO, or bearer mode) rather than the server token cache it refuses with identity_not_supported. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
     readOnlyHint: true,
     openWorldHint: true,
     proxyOnly: true,
@@ -1878,7 +1878,13 @@ export const PROXY_DOCUMENT_READ_GUIDANCE =
   // it is installed on the same condition that registers read-document. Saying
   // "or a download URL" here was false -- nothing strips URLs and get-drive-item
   // still returns @microsoft.graph.downloadUrl.
-  'Byte payloads are stripped from every tool result here, so no tool returns raw bytes.';
+  'Byte payloads are stripped from every tool result here, so no tool returns raw bytes. ' +
+  // Same qualification the tool's own description and initialize.instructions
+  // carry. This text is appended to Graph tool descriptions, so without it a
+  // model reading list-mail-attachments is sent to a tool that answers
+  // identity_not_supported to every call in OAuth, OBO and bearer deployments.
+  'read-document refuses with identity_not_supported when Graph identity comes from the request ' +
+  '(OAuth, OBO, or bearer mode) rather than from the server token cache.';
 
 /** Every gate that decides whether a tool -- Graph or utility -- is registered. */
 export interface ToolRegistrationGates extends UtilityToolGates {
