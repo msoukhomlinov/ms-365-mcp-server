@@ -2,11 +2,21 @@
  * Strip byte payloads out of any tool result, at any depth, before it reaches
  * the model.
  *
- * This module carries the proxy-mode invariant -- *no tool on this server
- * returns raw bytes to the model* -- and it deliberately depends on nothing.
- * No server, no ticket store, no network: the unit that holds the invariant has
- * to be testable in isolation, and anything it imported would become a way for
- * the invariant to fail for reasons unrelated to bytes.
+ * This module is the whole of the proxy-mode byte rule -- *any field named
+ * `contentBytes`, and any long string that is wholly valid base64, is replaced
+ * by a marker and reported* -- and it deliberately depends on nothing. No
+ * server, no ticket store, no network: the unit that carries the rule has to be
+ * testable in isolation, and anything it imported would become a way for the
+ * rule to fail for reasons unrelated to bytes.
+ *
+ * It used to say it carried the invariant *no tool on this server returns raw
+ * bytes to the model*. That guarantee was withdrawn in 3025efe (PR #19) as
+ * false, and the reasoning is recorded above `CLASSIFIED` in
+ * `test/absence-claims.test.ts`. What this module decides is whether a *value*
+ * in a parsed tool result looks like a byte payload; which tools are registered
+ * at all, and which byte paths therefore stay reachable, is decided elsewhere
+ * and is not something a shape rule can promise. See the **Coverage** note in
+ * `response-scrubbing.ts` for the paths this rule does not reach.
  *
  * **Why a shape rule and not a field-name list.** Three distinct paths to the
  * same context blowout were found in eight days (`download-bytes`,
