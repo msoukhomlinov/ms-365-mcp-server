@@ -66,16 +66,25 @@ function handlerFor(alias: string, outputFormat: 'json' | 'toon' = 'json'): Hand
   return handler;
 }
 
-/** Queues one JSON body per fetch call, in order. */
-function mockPages(...bodies: unknown[]) {
-  const queue = [...bodies];
+/** Queues one raw Response per fetch call, in order. */
+function mockResponses(...responses: Response[]) {
+  const queue = [...responses];
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
-    const body = queue.length > 0 ? queue.shift() : { value: [] };
-    return new Response(JSON.stringify(body), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
+    const next = queue.shift();
+    return next ?? jsonPage({ value: [] });
   });
+}
+
+function jsonPage(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+/** Queues one successful JSON body per fetch call, in order. */
+function mockPages(...bodies: unknown[]) {
+  return mockResponses(...bodies.map(jsonPage));
 }
 
 const NEXT_1 = 'https://graph.microsoft.com/v1.0/me/messages?$skiptoken=page2';
@@ -245,5 +254,60 @@ describe('fetchAllPages and @odata.count', () => {
 
     expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(parsed['@odata.nextLink']).toBeUndefined();
+  });
+
+  // graphRequest turns a transport/HTTP failure into a JSON `{error}` body with
+  // isError:true instead of throwing (src/graph-client.ts graphRequest catch), so
+  // the merge loop used to read the error object as "a page with no nextLink" and
+  // report the truncated collection as complete.
+  it('keeps the unconsumed nextLink when a follow-up page fails', async () => {
+    mockFetch = mockResponses(
+      jsonPage({ '@odata.count': 3, '@odata.nextLink': NEXT_1, value: [{ id: '1' }] }),
+      new Response('upstream boom', { status: 500 }),
+      jsonPage({ value: [{ id: 'never-reached' }] })
+    );
+
+    const parsed = await callAndParse(handlerFor('list-mail-messages'), {
+      count: true,
+      fetchAllPages: true,
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    // Page one only, and the link that failed is still the resume token.
+    expect((parsed.value as unknown[]).map((v) => (v as { id: string }).id)).toEqual(['1']);
+    expect(parsed['@odata.nextLink']).toBe(NEXT_1);
+    expect(parsed['@odata.count']).toBe(3);
+  });
+
+  // 400 (not 429/503/504, which graph-resilience retries — see isRetryableStatus).
+  it('does not swallow the error page body into the merged response', async () => {
+    mockFetch = mockResponses(
+      jsonPage({ '@odata.nextLink': NEXT_1, value: [{ id: '1' }] }),
+      new Response('bad request', { status: 400 })
+    );
+
+    const parsed = await callAndParse(handlerFor('list-mail-messages'), { fetchAllPages: true });
+
+    expect(parsed.error).toBeUndefined();
+    expect((parsed.value as unknown[]).length).toBe(1);
+    expect(parsed['@odata.nextLink']).toBe(NEXT_1);
+  });
+
+  it('treats a follow-up page that is not a collection as truncation', async () => {
+    // A 200 whose body is not JSON becomes { message: 'OK!', rawResponse } — it
+    // parses, but it is not a page, so it must not end the loop as a success.
+    mockFetch = mockResponses(
+      jsonPage({ '@odata.nextLink': NEXT_1, value: [{ id: '1' }] }),
+      new Response('<html>gateway</html>', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    );
+
+    const parsed = await callAndParse(handlerFor('list-mail-messages'), { fetchAllPages: true });
+
+    expect((parsed.value as unknown[]).length).toBe(1);
+    expect(parsed['@odata.nextLink']).toBe(NEXT_1);
+    expect(parsed.rawResponse).toBeUndefined();
   });
 });

@@ -2525,20 +2525,40 @@ async function executeGraphTool(
             const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
             const nextOptions = { ...options };
 
+            // Every `break` below leaves `nextLink` pointing at the page we did
+            // NOT manage to consume, which the merge treats as truncation. Only a
+            // page that parses AND carries a `value` array is allowed to advance
+            // the token: graphRequest converts transport and HTTP failures into a
+            // `{ error }` body with isError:true rather than throwing (see its
+            // catch block), and reading `@odata.nextLink` off that object silently
+            // turned a failed follow-up into "no more pages".
             const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
-            if (nextResponse?.content?.[0]?.text) {
-              const nextJsonResponse = JSON.parse(nextResponse.content[0].text) as ODataPage;
-              if (Array.isArray(nextJsonResponse.value)) {
-                allItems = allItems.concat(nextJsonResponse.value);
-              }
-              nextLink = nextJsonResponse['@odata.nextLink'];
-              if (nextJsonResponse['@odata.deltaLink']) {
-                deltaLink = nextJsonResponse['@odata.deltaLink'];
-              }
-              pageCount++;
-            } else {
+            const nextText = nextResponse?.content?.[0]?.text;
+            if (!nextText) {
               break;
             }
+
+            let nextJsonResponse: ODataPage;
+            try {
+              nextJsonResponse = JSON.parse(nextText) as ODataPage;
+            } catch (e) {
+              logger.warn(`Pagination stopped: page ${pageCount + 1} was not parseable JSON: ${e}`);
+              break;
+            }
+
+            if (nextResponse.isError === true || !Array.isArray(nextJsonResponse.value)) {
+              logger.warn(
+                `Pagination stopped: page ${pageCount + 1} was not a successful collection response — returning ${allItems.length} items with the resume link intact`
+              );
+              break;
+            }
+
+            allItems = allItems.concat(nextJsonResponse.value);
+            nextLink = nextJsonResponse['@odata.nextLink'];
+            if (nextJsonResponse['@odata.deltaLink']) {
+              deltaLink = nextJsonResponse['@odata.deltaLink'];
+            }
+            pageCount++;
           }
 
           if (pageCount >= maxPages) {
