@@ -22,6 +22,7 @@ import {
   proxySuppressedToolNames,
   registerDiscoveryTools,
   registerGraphTools,
+  resolveRegisteredToolNames,
   selectUtilityTools,
   UTILITY_TOOLS,
   type UtilityToolGates,
@@ -75,7 +76,7 @@ function mentionedToolNames(text: string): string[] {
   const found = new Set<string>();
   for (const name of KNOWN_TOOL_NAMES) {
     const pattern = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/-/g, '[-_]');
-    if (new RegExp(`(?<![A-Za-z0-9_-])${pattern}(?![A-Za-z0-9_-])`).test(text)) {
+    if (new RegExp(`(?<![A-Za-z0-9_-])${pattern}(?![A-Za-z0-9_-])`, 'i').test(text)) {
       found.add(name);
     }
   }
@@ -117,6 +118,7 @@ function registerAndCollect(opts: {
   discovery: boolean;
   attachmentProxy: boolean;
   httpMode: boolean;
+  enabledTools?: string;
 }): { names: Set<string>; surfaces: Surface[]; handlers: Map<string, Handler> } {
   const server = new McpServer({ name: 'test', version: '1.0.0' });
   const surfaces: Surface[] = [];
@@ -153,7 +155,7 @@ function registerAndCollect(opts: {
     for (const name of buildToolsRegistry(
       false,
       true,
-      undefined,
+      opts.enabledTools ? new RegExp(opts.enabledTools, 'i') : undefined,
       undefined,
       [],
       opts.attachmentProxy
@@ -163,6 +165,7 @@ function registerAndCollect(opts: {
     for (const utility of selectUtilityTools({
       httpMode: opts.httpMode,
       attachmentProxy: opts.attachmentProxy,
+      enabledTools: opts.enabledTools,
     })) {
       names.add(utility.name);
     }
@@ -174,7 +177,7 @@ function registerAndCollect(opts: {
       undefined, // authManager
       false, // multiAccount
       [], // accountNames
-      undefined, // enabledTools
+      opts.enabledTools,
       undefined, // allowedScopes
       opts.httpMode,
       opts.attachmentProxy, // attachmentUrls -- proxy implies it
@@ -185,7 +188,7 @@ function registerAndCollect(opts: {
       server,
       {} as GraphClient,
       false, // readOnly
-      undefined, // enabledToolsPattern
+      opts.enabledTools,
       true, // orgMode
       undefined, // authManager
       false, // multiAccount
@@ -251,7 +254,11 @@ describe('guidance text under --attachment-proxy', () => {
       readOnly: false,
       multiAccount: false,
       discovery: false,
-      attachmentProxy: true,
+      registeredTools: resolveRegisteredToolNames({
+        orgMode: true,
+        httpMode: true,
+        attachmentProxy: true,
+      }),
     });
 
     expect(
@@ -266,7 +273,7 @@ describe('guidance text under --attachment-proxy', () => {
       readOnly: false,
       multiAccount: false,
       discovery: false,
-      attachmentProxy: false,
+      registeredTools: resolveRegisteredToolNames({ orgMode: true, httpMode: false }),
     });
 
     expect(instructions).toContain('get-download-url');
@@ -362,6 +369,169 @@ describe('guidance text under --attachment-proxy', () => {
 });
 
 /**
+ * PR #19 review, both findings. They are one defect: the suppressed set was a
+ * delta between two `selectUtilityTools` calls and the instructions keyed off
+ * proxy activation, when the only thing true is the resolved registered set.
+ *
+ * A tool excluded by proxy mode AND an --enabled-tools regex is missing from
+ * both sides of that delta, so it cancels out and its stale guidance survives;
+ * a tool the regex dropped is still advertised by the instructions. Both
+ * expressions below are the reviewer's own.
+ */
+describe('guidance under --attachment-proxy combined with an --enabled-tools filter', () => {
+  /** The reachable tool names for a configuration, from the gates registration uses. */
+  function reachable(opts: {
+    enabledTools?: string;
+    attachmentProxy: boolean;
+    httpMode: boolean;
+  }): Set<string> {
+    const names = new Set<string>(AUTH_TOOL_NAMES);
+    for (const name of buildToolsRegistry(
+      false,
+      true,
+      opts.enabledTools ? new RegExp(opts.enabledTools, 'i') : undefined,
+      undefined,
+      [],
+      opts.attachmentProxy
+    ).keys()) {
+      names.add(name);
+    }
+    for (const utility of selectUtilityTools({
+      httpMode: opts.httpMode,
+      attachmentProxy: opts.attachmentProxy,
+      enabledTools: opts.enabledTools,
+    })) {
+      names.add(utility.name);
+    }
+    return names;
+  }
+
+  // Finding 1. download-bytes is dropped twice over -- by proxy mode and by the
+  // regex -- so a delta between the two selections cannot see it.
+  it('drops byte-tool guidance when the filter also excludes the byte tool', () => {
+    const enabledTools = '^(list-mail-attachments|read-document)$';
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+      enabledTools,
+    });
+
+    expect(names.has('read-document')).toBe(true);
+    expect(names.has('download-bytes')).toBe(false);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  // Finding 2. The filter admits a Graph tool but not read-document: startup
+  // warns and keeps running, so the instructions must not promise a tool that
+  // was never registered.
+  it('promises no document-read tool when the filter excludes read-document', () => {
+    const enabledTools = '^(list-mail-attachments)$';
+    const names = reachable({ enabledTools, attachmentProxy: true, httpMode: true });
+    expect(names.has('read-document')).toBe(false);
+
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools: names,
+    });
+
+    expect(
+      staleReferences(names, [{ tool: 'instructions', where: 'text', text: instructions }])
+    ).toEqual([]);
+    expect(instructions).not.toContain('read-document');
+  });
+
+  // Same filter, the description surface rather than the instructions: the
+  // replacement sentence names read-document, so it cannot be appended when
+  // read-document is the tool that went missing.
+  it('does not substitute read-document into descriptions when it is filtered out too', () => {
+    const enabledTools = '^(list-mail-attachments)$';
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+      enabledTools,
+    });
+
+    expect(names.has('read-document')).toBe(false);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  // The rule is the registered set, not the proxy flag, so it holds for a
+  // preset-shaped filter with no proxy in sight.
+  it('drops cross-references to Graph tools a filter excluded, with no proxy', () => {
+    const enabledTools = '^(get-drive-item|list-mail-attachments)$';
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: false,
+      httpMode: false,
+      enabledTools,
+    });
+
+    expect(names.has('download-bytes')).toBe(false);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  // The stdio-scoped download-bytes-to-file sentence: kept where the tool is
+  // real, dropped where it is not. Registration decides, not the prose.
+  it('keeps the stdio byte-to-file sentence in stdio and drops it over HTTP', () => {
+    const stdio = reachable({ attachmentProxy: false, httpMode: false });
+    const http = reachable({ attachmentProxy: false, httpMode: true });
+    expect(stdio.has('download-bytes-to-file')).toBe(true);
+    expect(http.has('download-bytes-to-file')).toBe(false);
+
+    const base = { orgMode: true, readOnly: false, multiAccount: false, discovery: false };
+    const stdioText = buildMcpServerInstructions({ ...base, registeredTools: stdio });
+    const httpText = buildMcpServerInstructions({ ...base, registeredTools: http });
+
+    expect(stdioText).toContain('download-bytes-to-file');
+    expect(httpText).not.toContain('download-bytes-to-file');
+    expect(httpText).toContain('download-bytes');
+    // Which clause lands first depends on what registered, so the join has to
+    // capitalise the ones that follow a full stop -- without renaming a tool
+    // whose name happens to open the sentence.
+    for (const text of [stdioText, httpText]) {
+      expect(text).not.toMatch(/\.\s+[a-z]/);
+      expect(text).not.toMatch(/[A-Z][a-z0-9]*-[a-z]+-/);
+    }
+    expect(staleReferences(http, [{ tool: 'i', where: 't', text: httpText }])).toEqual([]);
+    expect(staleReferences(stdio, [{ tool: 'i', where: 't', text: stdioText }])).toEqual([]);
+  });
+
+  // The derivation itself: one definition, checked against what registration
+  // actually did rather than against a second copy of the same reasoning.
+  it('resolves the same tool names registration registers', () => {
+    for (const enabledTools of [
+      undefined,
+      '^(list-mail-attachments|read-document)$',
+      '^(list-mail-attachments)$',
+      '^(get-drive-item|download-bytes)$',
+    ]) {
+      for (const attachmentProxy of [true, false]) {
+        const { names } = registerAndCollect({
+          discovery: false,
+          attachmentProxy,
+          httpMode: true,
+          enabledTools,
+        });
+        const resolved = resolveRegisteredToolNames({
+          readOnly: false,
+          orgMode: true,
+          enabledTools,
+          httpMode: true,
+          attachmentProxy,
+        });
+        const registered = [...names].filter((n) => !AUTH_TOOL_NAMES.includes(n)).sort();
+        expect([...resolved].sort()).toEqual(registered);
+      }
+    }
+  });
+});
+
+/**
  * The sentence splitter is the one fragile part: cutting at the wrong period
  * either loses true guidance or leaves half a stale sentence behind. Every
  * period shape that appears in the tips it runs over is pinned here.
@@ -395,9 +565,19 @@ describe('stripStaleToolGuidance', () => {
   it('appends the replacement once however many sentences were dropped', () => {
     const text =
       'Metadata only. Call get-download-url for large files. Call download-bytes for small ones.';
-    expect(stripStaleToolGuidance(text, suppressed, 'Use read-document.')).toBe(
+    const replacement = { text: 'Use read-document.', whenDropped: suppressed };
+    expect(stripStaleToolGuidance(text, suppressed, replacement)).toBe(
       'Metadata only. Use read-document.'
     );
+  });
+
+  // A sentence dropped for an unrelated reason gets no substitute: the
+  // read-document offer answers "the byte tools are gone", not "a preset
+  // excluded a tool this tip cross-referenced".
+  it('withholds the replacement when the dropped sentence is unrelated to it', () => {
+    const text = 'Metadata only. Call list-mail-folders for the folder ids.';
+    const replacement = { text: 'Use read-document.', whenDropped: ['download-bytes'] };
+    expect(stripStaleToolGuidance(text, ['list-mail-folders'], replacement)).toBe('Metadata only.');
   });
 
   it('matches tool names on word boundaries and either separator', () => {

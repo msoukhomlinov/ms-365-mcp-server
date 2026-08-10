@@ -2,7 +2,23 @@ import { describe, expect, it } from 'vitest';
 import { buildMcpServerInstructions } from '../src/mcp-instructions.js';
 
 describe('buildMcpServerInstructions', () => {
-  const baseCtx = { orgMode: true, readOnly: false, multiAccount: false };
+  // A stdio, non-proxy server: every byte tool registered. Stated explicitly
+  // rather than derived, because these tests are about the wording; the
+  // derivation itself is covered in proxy-mode-guidance.test.ts.
+  const STDIO_TOOLS = new Set([
+    'get-download-url',
+    'download-bytes',
+    'download-bytes-to-file',
+    'list-users',
+    'upload-file-content',
+    'create-upload-session',
+  ]);
+  const baseCtx = {
+    orgMode: true,
+    readOnly: false,
+    multiAccount: false,
+    registeredTools: STDIO_TOOLS,
+  };
 
   it('includes general Graph guidance for standard mode', () => {
     const s = buildMcpServerInstructions({ ...baseCtx, discovery: false });

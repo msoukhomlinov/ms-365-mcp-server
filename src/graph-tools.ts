@@ -1868,28 +1868,78 @@ export const PROXY_DOCUMENT_READ_GUIDANCE =
   '/content (/drives/{drive-id}/items/{driveItem-id}/content). ' +
   'No tool on this server returns raw bytes or a download URL.';
 
+/** Every gate that decides whether a tool -- Graph or utility -- is registered. */
+export interface ToolRegistrationGates extends UtilityToolGates {
+  orgMode?: boolean;
+  /** Raw --allowed-scopes value, parsed the way registration parses it. */
+  allowedScopes?: string;
+}
+
 /**
- * The tool names this configuration removed *relative to the same
- * configuration without --attachment-proxy*, so guidance naming them is stale.
+ * THE set of tool names a configuration exposes. Everything that needs to know
+ * "does this server have tool X" asks this, and nothing re-derives it.
  *
- * Derived from the tool table and endpoints.json, never from a literal list:
- * the utility half is whatever `selectUtilityTools` drops when the flag goes on
- * (today the `bytesToModel` tools), and the Graph half is whatever
- * `isProxySuppressedGraphTool` matches (today `get-mail-message-mime`, by the
- * class rule rather than by name). A tool added to either set is covered the
- * day it lands, with no edit here.
+ * Not a delta between two selections, which is how PR #19 shipped a hole: a
+ * tool dropped by two gates at once (proxy mode AND an --enabled-tools regex)
+ * is missing from both sides of such a delta, cancels out, and reads as still
+ * registered. A name is registered or it is not, and only the resolved set
+ * knows which.
  *
- * Deliberately scoped to the proxy delta rather than "every tool this mode does
- * not register": `download-bytes-to-file` is absent in HTTP mode too, but the
- * guidance that names it says so ("In stdio mode, ..."), and rewriting that
- * into silence would lose true stdio guidance to fix nothing.
+ * The Graph half is `buildToolsRegistry`, which applies gate for gate what
+ * registerGraphTools' own loop applies (org mode, proxy byte suppression,
+ * read-only, --enabled-tools, --allowed-scopes); the utility half is
+ * `selectUtilityTools`. Both are the same functions registration calls, and
+ * `resolves the same tool names registration registers` in
+ * test/proxy-mode-guidance.test.ts fails if either loop ever drifts from this.
+ */
+export function resolveRegisteredToolNames(gates: ToolRegistrationGates): Set<string> {
+  const names = new Set<string>();
+  const registry = buildToolsRegistry(
+    Boolean(gates.readOnly),
+    Boolean(gates.orgMode),
+    compileToolFilter(gates.enabledTools),
+    gates.allowedScopes,
+    [],
+    Boolean(gates.attachmentProxy)
+  );
+  for (const name of registry.keys()) names.add(name);
+  for (const utility of selectUtilityTools(gates)) names.add(utility.name);
+  return names;
+}
+
+/**
+ * The tool names that can appear in guidance and be checked against the
+ * registered set: every Graph endpoint and every utility.
+ *
+ * Auth tools (login, list-accounts, ...) and the discovery meta-tools
+ * (search-tools, get-tool-schema, execute-tool) are deliberately absent. They
+ * are registered by other modules under conditions this file cannot see, so
+ * including them would make every mention of `list-accounts` read as stale. No
+ * data-sourced guidance directs to them, and the authored instructions that do
+ * are gated by the same option that registers them.
+ *
+ * Single-word names are excluded: they are ordinary English and would match
+ * prose rather than a tool reference.
+ */
+const GUIDANCE_TOOL_NAME_UNIVERSE: readonly string[] = [
+  ...endpointsData.map((endpoint) => endpoint.toolName),
+  ...UTILITY_TOOLS.map((utility) => utility.name),
+].filter((name) => name.includes('-'));
+
+/**
+ * The tools --attachment-proxy takes away, from their markings alone.
+ *
+ * Used only to decide whether the read-document replacement sentence is the
+ * right thing to say in place of a dropped one -- NOT to decide what gets
+ * dropped, which is the registered set's job. Marking-based rather than a
+ * delta between selections, so a byte tool an --enabled-tools regex also
+ * excludes is still recognised as a proxy casualty.
  */
 export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
   if (!gates.attachmentProxy) return [];
-  const registered = new Set(selectUtilityTools(gates).map((utility) => utility.name));
-  const utilityNames = selectUtilityTools({ ...gates, attachmentProxy: false })
-    .map((utility) => utility.name)
-    .filter((name) => !registered.has(name));
+  const utilityNames = UTILITY_TOOLS.filter((utility) => utility.bytesToModel).map(
+    (utility) => utility.name
+  );
   const graphNames = endpointsData
     .filter((endpoint) => isProxySuppressedGraphTool(endpoint.method, endpoint.pathPattern))
     .map((endpoint) => endpoint.toolName);
@@ -1897,15 +1947,26 @@ export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
 }
 
 /**
- * Guidance rewriter for one resolved configuration. Built once per registration
- * pass and applied to every model-facing string, so a new guidance surface is
- * one call away from being covered rather than a new place for the fix to be
- * forgotten.
+ * Guidance rewriter for one resolved configuration: drops any sentence naming a
+ * tool this configuration did not register.
+ *
+ * The rule is the registered set, not the proxy flag, so it holds for a preset
+ * that excluded a cross-referenced tool just as much as for a suppressed byte
+ * tool. The read-document replacement is offered only when proxy mode is what
+ * removed the tool AND read-document itself registered -- a filter can drop
+ * read-document too (startup warns and keeps running), and substituting a
+ * second unregistered name for the first would fix nothing.
  */
-export function createGuidanceFilter(gates: UtilityToolGates): (text: string) => string {
-  const suppressed = proxySuppressedToolNames(gates);
+export function createGuidanceFilter(gates: ToolRegistrationGates): (text: string) => string {
+  const registered = resolveRegisteredToolNames(gates);
+  const suppressed = GUIDANCE_TOOL_NAME_UNIVERSE.filter((name) => !registered.has(name));
   if (suppressed.length === 0) return (text: string) => text;
-  return (text: string) => stripStaleToolGuidance(text, suppressed, PROXY_DOCUMENT_READ_GUIDANCE);
+  const proxyCasualties = proxySuppressedToolNames(gates);
+  const replacement =
+    proxyCasualties.length > 0 && registered.has('read-document')
+      ? { text: PROXY_DOCUMENT_READ_GUIDANCE, whenDropped: proxyCasualties }
+      : undefined;
+  return (text: string) => stripStaleToolGuidance(text, suppressed, replacement);
 }
 
 function registerUtilityToolWithMcp(
@@ -2727,8 +2788,10 @@ export function registerGraphTools(
   const disabledByAllowedScopes: DisabledToolScope[] = [];
   const filterGuidance = createGuidanceFilter({
     readOnly,
+    orgMode,
     httpMode,
     enabledTools: enabledToolsPattern,
+    allowedScopes: allowedScopesValue,
     attachmentProxy,
   });
 
@@ -3197,8 +3260,10 @@ export function registerDiscoveryTools(
   const utilityByName = new Map(utilityTools.map((u) => [u.name, u]));
   const filterGuidance = createGuidanceFilter({
     readOnly,
+    orgMode,
     httpMode,
     enabledTools,
+    allowedScopes: allowedScopesValue,
     attachmentProxy,
   });
 

@@ -10,6 +10,7 @@ import { registerAuthTools } from './auth-tools.js';
 import {
   registerGraphTools,
   registerDiscoveryTools,
+  resolveRegisteredToolNames,
   utilityToolWillRegister,
 } from './graph-tools.js';
 import { buildMcpServerInstructions } from './mcp-instructions.js';
@@ -283,9 +284,18 @@ class MicrosoftGraphServer {
           orgMode: Boolean(this.options.orgMode),
           readOnly: Boolean(this.options.readOnly),
           multiAccount: this.multiAccount,
-          // Same resolved condition the registration gates use, so the
-          // instructions cannot describe a different server than the one built.
-          attachmentProxy: this.attachmentProxyActive,
+          // The registered set, not the flags that shape it. --attachment-proxy
+          // being on is not proof read-document registered: an --enabled-tools
+          // filter can drop it, and startup only warns. Same gates, same
+          // arguments as the registration calls below.
+          registeredTools: resolveRegisteredToolNames({
+            readOnly: Boolean(this.options.readOnly),
+            orgMode: Boolean(this.options.orgMode),
+            enabledTools: this.options.enabledTools,
+            allowedScopes: this.options.allowedScopes,
+            httpMode: Boolean(this.options.http),
+            attachmentProxy: this.attachmentProxyActive,
+          }),
         }),
       }
     );

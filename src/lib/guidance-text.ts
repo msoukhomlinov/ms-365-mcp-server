@@ -36,7 +36,11 @@ const SENTENCE_BOUNDARY = /(?<=\.)\s+(?=[A-Z(])/;
  */
 function toolNamePattern(name: string): RegExp {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/-/g, '[-_]');
-  return new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`);
+  // Case-insensitive: a sentence that opens with a tool name gets capitalised
+  // when guidance is assembled, and a case-sensitive match would let
+  // "Download-bytes ..." slip past the very check that exists to catch it.
+  // Safe here because these names are hyphenated and do not occur as prose.
+  return new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, 'i');
 }
 
 /** Whether `text` names any of `toolNames`. */
@@ -45,27 +49,46 @@ export function mentionsToolName(text: string, toolNames: readonly string[]): bo
 }
 
 /**
+ * Guidance to offer in place of what was dropped.
+ *
+ * `whenDropped` keeps the offer honest: the replacement is appended only if a
+ * sentence naming one of those tools is what went. A sentence dropped for an
+ * unrelated reason — a preset that excluded a cross-referenced tool, say — gets
+ * no substitute, because the substitute would answer a question nobody asked.
+ */
+export interface GuidanceReplacement {
+  text: string;
+  whenDropped: readonly string[];
+}
+
+/**
  * `text` with every sentence naming a tool in `suppressed` removed, and
- * `replacement` appended once if anything was removed (and it is not already
- * there). Returns `text` unchanged when `suppressed` is empty or nothing
- * matches, which is the common case — no configuration pays for this but the
- * one that needs it.
+ * `replacement` appended once (and only once, however many sentences went) when
+ * its `whenDropped` condition is met. Returns `text` unchanged when `suppressed`
+ * is empty or nothing matches, which is the common case — no configuration pays
+ * for this but the one that needs it.
  */
 export function stripStaleToolGuidance(
   text: string,
   suppressed: readonly string[],
-  replacement?: string
+  replacement?: GuidanceReplacement
 ): string {
   if (!text || suppressed.length === 0) return text;
   if (!mentionsToolName(text, suppressed)) return text;
 
-  const kept = text
-    .split(SENTENCE_BOUNDARY)
-    .filter((sentence) => !mentionsToolName(sentence, suppressed));
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const sentence of text.split(SENTENCE_BOUNDARY)) {
+    (mentionsToolName(sentence, suppressed) ? dropped : kept).push(sentence);
+  }
 
   const parts = kept.map((s) => s.trim()).filter((s) => s.length > 0);
-  if (replacement && !parts.includes(replacement.trim())) {
-    parts.push(replacement.trim());
+  if (
+    replacement &&
+    mentionsToolName(dropped.join(' '), replacement.whenDropped) &&
+    !parts.includes(replacement.text.trim())
+  ) {
+    parts.push(replacement.text.trim());
   }
   return parts.join(' ');
 }
