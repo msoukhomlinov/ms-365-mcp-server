@@ -39,6 +39,7 @@ export interface DiscoverySearchIndex {
   nameTokens: Map<string, Set<string>>;
 }
 import { describeToolSchema, describeUtilityToolSchema } from './lib/tool-schema.js';
+import { stripStaleToolGuidance } from './lib/guidance-text.js';
 import {
   TOP_UNSUPPORTED_DELTA_TOOLS,
   shouldOmitTopParam,
@@ -1527,7 +1528,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'read attachment read document convert to markdown pdf docx xlsx pptx eml msg extract text from attachment open attachment',
     description:
-      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. This is the ONLY way to read the content of anything inside Microsoft 365 on this server. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+      // No superlative. "The ONLY way to read the content of anything inside
+      // Microsoft 365 on this server" was a claim about every other registered
+      // tool, which this string cannot know: get-drive-item still returns
+      // @microsoft.graph.downloadUrl, and proxy scrubbing deliberately leaves
+      // URLs intact. What is true, and mechanism-backed, is the sentence about
+      // bytes -- the scrubber enforces that one.
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes: this server fetches the document itself and converts it out of band, so no document bytes travel back through this tool. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says, with one limit: it mints a URL that is redeemed later with no Authorization header, so whenever Graph identity comes from the request (OAuth, OBO, or bearer mode) rather than the server token cache it refuses with identity_not_supported. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
     readOnlyHint: true,
     openWorldHint: true,
     proxyOnly: true,
@@ -1854,6 +1861,135 @@ export function utilityToolWillRegister(name: string, gates: UtilityToolGates): 
   return selectUtilityTools(gates).some((utility) => utility.name === name);
 }
 
+/**
+ * What read-document says in place of the guidance that named the tools
+ * `--attachment-proxy` removed. Written once, appended wherever a sentence was
+ * dropped, and carrying the part of those sentences that was worth keeping: the
+ * exact target shapes, including the `/$value` suffix a mail attachment needs.
+ */
+export const PROXY_DOCUMENT_READ_GUIDANCE =
+  'Read the content with read-document, which returns markdown and takes the same relative Microsoft ' +
+  'Graph path: a mail or event attachment keeps its /$value suffix ' +
+  '(/me/messages/{message-id}/attachments/{attachment-id}/$value), a drive or SharePoint file its ' +
+  '/content (/drives/{drive-id}/items/{driveItem-id}/content). ' +
+  // The one absence worth asserting, because a mechanism enforces it rather
+  // than a tool list implying it: installResponseScrubbing strips contentBytes
+  // and any base64 over 4 KB from every result (lib/response-scrubber.ts), and
+  // it is installed on the same condition that registers read-document. Saying
+  // "or a download URL" here was false -- nothing strips URLs and get-drive-item
+  // still returns @microsoft.graph.downloadUrl.
+  // Describes the mechanism rather than promising an absence. "No tool returns
+  // raw bytes" was false: proxy suppression only matches GET paths ending
+  // /$value, so graph-batch (POST /$batch, no presets) stays registered and can
+  // batch a GET of /me/messages/{id}/$value, whose RFC 5322 body is text/plain
+  // and not wholly valid base64 -- neither scrubber rule matches it while its
+  // attachments ride inline. See isProxySuppressedGraphTool's docstring and
+  // response-scrubbing.ts, which both already disclose that gap.
+  'Byte payloads are stripped from tool results here: any contentBytes field, and any large base64 ' +
+  'value. ' +
+  // Same qualification the tool's own description and initialize.instructions
+  // carry. This text is appended to Graph tool descriptions, so without it a
+  // model reading list-mail-attachments is sent to a tool that answers
+  // identity_not_supported to every call in OAuth, OBO and bearer deployments.
+  'read-document refuses with identity_not_supported when Graph identity comes from the request ' +
+  '(OAuth, OBO, or bearer mode) rather than from the server token cache.';
+
+/** Every gate that decides whether a tool -- Graph or utility -- is registered. */
+export interface ToolRegistrationGates extends UtilityToolGates {
+  orgMode?: boolean;
+  /** Raw --allowed-scopes value, parsed the way registration parses it. */
+  allowedScopes?: string;
+}
+
+/**
+ * THE set of tool names a configuration exposes. Everything that needs to know
+ * "does this server have tool X" asks this, and nothing re-derives it.
+ *
+ * Not a delta between two selections, which is how PR #19 shipped a hole: a
+ * tool dropped by two gates at once (proxy mode AND an --enabled-tools regex)
+ * is missing from both sides of such a delta, cancels out, and reads as still
+ * registered. A name is registered or it is not, and only the resolved set
+ * knows which.
+ *
+ * The Graph half is `buildToolsRegistry`, which applies gate for gate what
+ * registerGraphTools' own loop applies (org mode, proxy byte suppression,
+ * read-only, --enabled-tools, --allowed-scopes); the utility half is
+ * `selectUtilityTools`. Both are the same functions registration calls, and
+ * `resolves the same tool names registration registers` in
+ * test/proxy-mode-guidance.test.ts fails if either loop ever drifts from this.
+ */
+export function resolveRegisteredToolNames(gates: ToolRegistrationGates): Set<string> {
+  const names = new Set<string>();
+  const registry = buildToolsRegistry(
+    Boolean(gates.readOnly),
+    Boolean(gates.orgMode),
+    compileToolFilter(gates.enabledTools),
+    gates.allowedScopes,
+    [],
+    Boolean(gates.attachmentProxy)
+  );
+  for (const name of registry.keys()) names.add(name);
+  for (const utility of selectUtilityTools(gates)) names.add(utility.name);
+  return names;
+}
+
+/**
+ * The tools --attachment-proxy takes away, from their markings alone.
+ *
+ * Marking-based rather than a delta between two `selectUtilityTools` calls: a
+ * byte tool an --enabled-tools regex also excludes is missing from both sides
+ * of such a delta, cancels out, and reads as still registered. That hole is how
+ * `list-mail-attachments` kept advertising download-bytes under
+ * `^(list-mail-attachments|read-document)$`.
+ */
+export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
+  if (!gates.attachmentProxy) return [];
+  const utilityNames = UTILITY_TOOLS.filter((utility) => utility.bytesToModel).map(
+    (utility) => utility.name
+  );
+  const graphNames = endpointsData
+    .filter((endpoint) => isProxySuppressedGraphTool(endpoint.method, endpoint.pathPattern))
+    .map((endpoint) => endpoint.toolName);
+  return [...new Set([...utilityNames, ...graphNames])];
+}
+
+/**
+ * Guidance rewriter for one resolved configuration: drops the sentences that
+ * direct the model at a byte tool --attachment-proxy took away.
+ *
+ * Scoped to those tools, and NOT to every name absent from the registered set,
+ * because a sentence carries more than one fact and dropping it destroys all of
+ * them. `update-planner-bucket`'s entire tip is one sentence -- "CRITICAL:
+ * Requires If-Match header with ETag from get-planner-bucket (use
+ * includeHeaders=true)." -- so suppressing it because get-planner-bucket is
+ * filtered out takes the If-Match requirement with it and the next update is a
+ * 412 nobody can explain. Fourteen tips in endpoints.json put a requirement in
+ * the same sentence as a cross-reference; two are single-sentence tips where
+ * nothing at all survives.
+ *
+ * The two failures are not equal. Naming an unregistered tool costs one failed
+ * call whose error says exactly what is wrong; losing a requirement produces a
+ * well-formed request that Graph rejects, or silently accepts wrong. The wider
+ * invariant needs endpoints.json to hold the cross-reference apart from the
+ * requirement so one can go without the other -- worth doing, not done here.
+ *
+ * The byte-tool sentences are safe to drop precisely because they carry one
+ * fact: "call download-bytes with target=X" is a direction and nothing else,
+ * and PROXY_DOCUMENT_READ_GUIDANCE restates the target shapes they held.
+ * That replacement is offered only when read-document actually registered -- a
+ * filter can drop it too (startup warns and keeps running), and substituting one
+ * unregistered name for another would fix nothing.
+ */
+export function createGuidanceFilter(gates: ToolRegistrationGates): (text: string) => string {
+  const registered = resolveRegisteredToolNames(gates);
+  const suppressed = proxySuppressedToolNames(gates).filter((name) => !registered.has(name));
+  if (suppressed.length === 0) return (text: string) => text;
+  const replacement = registered.has('read-document')
+    ? { text: PROXY_DOCUMENT_READ_GUIDANCE, whenDropped: suppressed }
+    : undefined;
+  return (text: string) => stripStaleToolGuidance(text, suppressed, replacement);
+}
+
 function registerUtilityToolWithMcp(
   server: McpServer,
   utility: UtilityTool,
@@ -2100,8 +2236,9 @@ async function executeGraphTool(
               expand: blocked,
               message:
                 `Expanding "${blocked}" inlines the raw attachment bytes (base64 contentBytes) into this ` +
-                `response, and $select does not suppress them. This server runs with --attachment-proxy, where ` +
-                `no tool returns raw bytes. Call this tool again WITHOUT that expand value to get the message ` +
+                `response, and $select does not suppress them. This server runs with --attachment-proxy, which ` +
+                `strips contentBytes fields and large base64 values out of tool results. Call this tool again ` +
+                `WITHOUT that expand value to get the message ` +
                 `or event itself; use list-mail-attachments (or the matching list tool) for each attachment's ` +
                 `id, name, contentType and size; and use read-document with the attachment's $value path to ` +
                 `read its content as markdown.`,
@@ -2706,6 +2843,14 @@ export function registerGraphTools(
   let failedCount = 0;
   const allowedScopes = parseAllowedScopes(allowedScopesValue);
   const disabledByAllowedScopes: DisabledToolScope[] = [];
+  const filterGuidance = createGuidanceFilter({
+    readOnly,
+    orgMode,
+    httpMode,
+    enabledTools: enabledToolsPattern,
+    allowedScopes: allowedScopesValue,
+    attachmentProxy,
+  });
 
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
@@ -2875,14 +3020,23 @@ export function registerGraphTools(
         .optional();
     }
 
-    // Build the tool description, optionally appending LLM tips
+    // Build the tool description, optionally appending LLM tips. The base text
+    // and the tip are filtered separately, before they are joined: the filter
+    // works a sentence at a time and the "\n\n💡 TIP: " seam is not a sentence
+    // boundary, so filtering the joined string could take the last sentence of
+    // the description away with the first sentence of the tip.
     let toolDescription = withApiVersionPrefix(
-      (endpointConfig?.descriptionOverride ?? tool.description) ||
-        `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
+      filterGuidance(
+        (endpointConfig?.descriptionOverride ?? tool.description) ||
+          `Execute ${tool.method.toUpperCase()} request to ${tool.path}`
+      ),
       endpointConfig
     );
     if (endpointConfig?.llmTip) {
-      toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
+      // A tip filtered down to nothing gets no header: an empty "💡 TIP:" is a
+      // promise of advice that is not there.
+      const tip = filterGuidance(endpointConfig.llmTip);
+      if (tip.length > 0) toolDescription += `\n\n💡 TIP: ${tip}`;
     }
 
     // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
@@ -3164,6 +3318,14 @@ export function registerDiscoveryTools(
     accountNames,
   };
   const utilityByName = new Map(utilityTools.map((u) => [u.name, u]));
+  const filterGuidance = createGuidanceFilter({
+    readOnly,
+    orgMode,
+    httpMode,
+    enabledTools,
+    allowedScopes: allowedScopesValue,
+    attachmentProxy,
+  });
 
   const categoryNames = Object.keys(TOOL_CATEGORIES).join(', ');
 
@@ -3171,16 +3333,19 @@ export function registerDiscoveryTools(
     const entry = toolsRegistry.get(name);
     if (entry) {
       const { tool, config } = entry;
+      const llmTip = config?.llmTip ? filterGuidance(config.llmTip) : undefined;
       return {
         name,
         method: tool.method.toUpperCase(),
         path: tool.path,
         description: withApiVersionPrefix(
-          (config?.descriptionOverride ?? tool.description) ||
-            `${tool.method.toUpperCase()} ${tool.path}`,
+          filterGuidance(
+            (config?.descriptionOverride ?? tool.description) ||
+              `${tool.method.toUpperCase()} ${tool.path}`
+          ),
           config
         ),
-        ...(config?.llmTip ? { llmTip: config.llmTip } : {}),
+        ...(llmTip ? { llmTip } : {}),
       };
     }
     const utility = utilityByName.get(name);
@@ -3189,15 +3354,26 @@ export function registerDiscoveryTools(
         name: utility.name,
         method: utility.method,
         path: utility.path,
-        description: utility.description,
+        description: filterGuidance(utility.description),
       };
     }
     return null;
   };
 
+  // The example utility is picked from the tools this configuration actually
+  // selected, not written in: hardcoding "like download-bytes" named a tool
+  // --attachment-proxy had already unregistered. The document/byte reader is the
+  // useful example in either mode, and exactly one of them is ever registered.
+  const utilityExample =
+    utilityTools.find((utility) => utility.proxyOnly || utility.bytesToModel)?.name ??
+    utilityTools[0]?.name;
+  const utilitiesPhrase = utilityExample
+    ? `${utilityTools.length} server utilities like ${utilityExample}`
+    : `${utilityTools.length} server utilities`;
+
   server.tool(
     'search-tools',
-    `Search through ${totalCount} tools (${toolsRegistry.size} Microsoft Graph API operations + ${utilityTools.length} server utilities like download-bytes). Ranks results by BM25 over tool name, llmTip, description, and path. After picking a tool, call get-tool-schema for parameters, then execute-tool.`,
+    `Search through ${totalCount} tools (${toolsRegistry.size} Microsoft Graph API operations + ${utilitiesPhrase}). Ranks results by BM25 over tool name, llmTip, description, and path. After picking a tool, call get-tool-schema for parameters, then execute-tool.`,
     {
       query: z
         .string()
@@ -3269,14 +3445,25 @@ export function registerDiscoveryTools(
     async ({ tool_name }) => {
       const entry = toolsRegistry.get(tool_name);
       if (entry) {
-        const schema = describeToolSchema(entry.tool, entry.config, { multiAccount, accountNames });
+        const described = describeToolSchema(entry.tool, entry.config, {
+          multiAccount,
+          accountNames,
+        });
+        // Same guidance strings search-tools returns, reaching the model by a
+        // second route, so filtered on both.
+        const schema = {
+          ...described,
+          description: filterGuidance(described.description),
+          ...(described.llmTip ? { llmTip: filterGuidance(described.llmTip) } : {}),
+        };
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };
       }
       const utility = utilityByName.get(tool_name);
       if (utility) {
-        const schema = describeUtilityToolSchema(utility, utilityCtx);
+        const described = describeUtilityToolSchema(utility, utilityCtx);
+        const schema = { ...described, description: filterGuidance(described.description) };
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };
