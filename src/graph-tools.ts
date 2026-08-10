@@ -885,9 +885,10 @@ function readDocumentError(
 function describeEmptyConversion(contentStatus?: string): string {
   if (contentStatus === 'no_text_layer') {
     return (
-      'The document converted, but it has no text layer to extract — it is a scan or an ' +
-      'image-only PDF, and the converter has no OCR. Retrying, or varying pages/offset/maxChars, ' +
-      'will return the same nothing. Report it as a document that cannot be read, not as a blank one.'
+      'The converter reports that this document has no text layer to extract — typically a scan ' +
+      'or an image-only PDF. That status describes the document rather than the read, so the same ' +
+      'read reports it again. Report it as a document whose text could not be extracted, not as a ' +
+      'blank one.'
     );
   }
   if (contentStatus === 'empty_document') {
@@ -1844,10 +1845,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           if (sliced && !outcome.contentStatus) {
             return readDocumentError(
               'no_text_in_selection',
-              'The pages or offset you asked for hold no text. This says nothing about the rest of ' +
-                'the document: text you already read from earlier pages or offsets still stands, and ' +
-                'the selection is most likely past the end. Stop paging here rather than reporting ' +
-                'the document as empty or unreadable.',
+              'The pages or offset you asked for hold no text. That is a statement about the ' +
+                'requested slice only: text you already read from earlier pages or offsets still ' +
+                'stands, and the selection is most likely past the end. Stop paging here rather ' +
+                'than reporting the document as empty or unreadable.',
               facts
             );
           }
