@@ -924,8 +924,10 @@ const CONTRACT_ERROR_CODES = new Set([
   'invalid_target',
   'no_capacity',
   // Server-origin, like invalid_target and no_capacity: raised when the proxy
-  // succeeded and the document had no text to give.
+  // succeeded and the document had no text to give. Its sibling scopes the same
+  // emptiness to a requested slice, claiming nothing about the document.
   'no_text_content',
+  'no_text_in_selection',
 ]);
 
 /**
@@ -1818,6 +1820,30 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         // rather than length-checked: a converter answering with a lone newline
         // has produced no more text than one answering with "".
         if (outcome.markdown.trim() === '') {
+          // Whose claim is it? `content_status` is the converter describing the
+          // DOCUMENT, so it survives slicing untouched -- a PDF with no text
+          // layer has none on page 5 either. An empty RESULT only describes the
+          // document when nothing was sliced away: `pages` and `offset` are
+          // advertised continuation parameters, so a caller who already read
+          // pages 1-4 can legitimately ask for a blank page 5 or pass an offset
+          // that lands at EOF, and answering that with "the document is empty or
+          // unreadable" contradicts text the caller is already holding.
+          //
+          // offset 0 selects nothing away, and maxChars truncates from the start
+          // rather than selecting a position, so neither makes a read sliced.
+          const sliced =
+            typeof params.pages === 'string' ||
+            (typeof params.offset === 'number' && params.offset > 0);
+          if (sliced && !outcome.contentStatus) {
+            return readDocumentError(
+              'no_text_in_selection',
+              'The pages or offset you asked for hold no text. This says nothing about the rest of ' +
+                'the document: text you already read from earlier pages or offsets still stands, and ' +
+                'the selection is most likely past the end. Stop paging here rather than reporting ' +
+                'the document as empty or unreadable.',
+              facts
+            );
+          }
           return readDocumentError(
             'no_text_content',
             describeEmptyConversion(outcome.contentStatus),

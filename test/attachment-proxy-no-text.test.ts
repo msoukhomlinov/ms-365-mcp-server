@@ -115,7 +115,8 @@ describe('a conversion that produced no text', () => {
   }
 
   async function read(
-    payload: Record<string, unknown> | ((requestedUri: string) => Record<string, unknown>)
+    payload: Record<string, unknown> | ((requestedUri: string) => Record<string, unknown>),
+    extraArgs: Record<string, unknown> = {}
   ): Promise<{
     isError: boolean;
     text: string;
@@ -127,7 +128,10 @@ describe('a conversion that produced no text', () => {
     });
     const result = (await (
       await connect()
-    ).callTool({ name: 'read-document', arguments: { target: MAIL_ATTACHMENT } })) as {
+    ).callTool({
+      name: 'read-document',
+      arguments: { target: MAIL_ATTACHMENT, ...extraArgs },
+    })) as {
       isError?: boolean;
       content: Array<{ text: string }>;
     };
@@ -236,6 +240,62 @@ describe('a conversion that produced no text', () => {
 
     expect(result.isError).toBe(false);
     expect(result.text).toBe('# Q3 report\n\nBody.');
+  });
+
+  /**
+   * An empty SLICE is not an empty document.
+   *
+   * `pages` and `offset` are advertised continuation parameters, so a caller
+   * that has already read pages 1-4 can legitimately ask for a blank page 5, or
+   * pass an offset that lands at EOF. Calling that document empty or unreadable
+   * contradicts text the caller is already holding. The distinction is about
+   * who is making the claim: the converter's `content_status` is a statement
+   * about the document and stays valid however the read was sliced, while the
+   * emptiness of a returned slice is only a statement about the document when
+   * nothing was sliced.
+   */
+  describe('when the caller asked for a slice', () => {
+    it('does not call the document empty because a requested page was', async () => {
+      const result = await read({ markdown: '' }, { pages: '5' });
+
+      expect(result.body.error).toBe('no_text_in_selection');
+      expect(String(result.body.message)).toMatch(/slice|selection|requested/i);
+      // The claim the caller must not be handed: anything about the document.
+      expect(String(result.body.message)).not.toMatch(/no text layer/i);
+      expect(String(result.body.message)).not.toMatch(/document (is|contains no)/i);
+    });
+
+    it('treats an offset past the end the same way', async () => {
+      const result = await read({ markdown: '' }, { offset: 50_000 });
+
+      expect(result.body.error).toBe('no_text_in_selection');
+    });
+
+    it('still reports a document-level status the converter stated, sliced or not', async () => {
+      // no_text_layer is a fact about the whole PDF, not about page 5, so
+      // slicing does not make it unsafe to repeat.
+      const result = await read({ markdown: '', content_status: 'no_text_layer' }, { pages: '5' });
+
+      expect(result.body.error).toBe('no_text_content');
+      expect(result.body.contentStatus).toBe('no_text_layer');
+      expect(String(result.body.message)).toMatch(/no text layer/i);
+    });
+
+    it('classifies offset 0 as an unsliced read', async () => {
+      // offset:0 selects nothing away, so an empty result is still a statement
+      // about the document.
+      const result = await read({ markdown: '' }, { offset: 0 });
+
+      expect(result.body.error).toBe('no_text_content');
+    });
+
+    it('does not treat maxChars alone as a slice', async () => {
+      // maxChars truncates from the start rather than selecting a position, so
+      // an empty result under it means there was no text to truncate.
+      const result = await read({ markdown: '' }, { maxChars: 5000 });
+
+      expect(result.body.error).toBe('no_text_content');
+    });
   });
 
   it('redacts a ticket the converter echoed into its status', async () => {
