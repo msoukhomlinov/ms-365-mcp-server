@@ -51,7 +51,7 @@ describe('OData nextLink preservation', () => {
         JSON.stringify({
           '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#messages',
           '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=10',
-          '@odata.count': 42,
+          '@odata.etag': 'W/"abc"',
           value: [{ id: '1', subject: 'Test' }],
         }),
         { status: 200 }
@@ -63,7 +63,31 @@ describe('OData nextLink preservation', () => {
 
     expect(parsed['@odata.nextLink']).toBe('https://graph.microsoft.com/v1.0/me/messages?$skip=10');
     expect(parsed['@odata.context']).toBeUndefined();
-    expect(parsed['@odata.count']).toBeUndefined();
+    expect(parsed['@odata.etag']).toBeUndefined();
+
+    mockFetch.mockRestore();
+  });
+
+  // @odata.count is not protocol noise: Graph only sends it when the request
+  // asked for it ($count=true), so dropping it discarded data the caller
+  // explicitly requested.
+  it('should preserve @odata.count, which the caller opts into with $count=true', async () => {
+    const mockFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#messages',
+          '@odata.count': 42,
+          value: [{ id: '1', subject: 'Test' }],
+        }),
+        { status: 200 }
+      )
+    );
+
+    const result = await graphClient.graphRequest('/me/messages');
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed['@odata.count']).toBe(42);
+    expect(parsed['@odata.context']).toBeUndefined();
 
     mockFetch.mockRestore();
   });

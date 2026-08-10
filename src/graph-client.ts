@@ -513,14 +513,23 @@ class GraphClient {
       };
     }
 
-    // Remove OData properties
+    // Strip OData annotations that are pure protocol noise (@odata.context,
+    // @odata.etag, @odata.type, ...), keeping the ones that carry answers the
+    // caller asked for:
+    //   - nextLink/deltaLink: the resume tokens the tool descriptions tell
+    //     agents to feed back in.
+    //   - count: Graph only emits it when the request carried $count=true, and
+    //     100 v1.0 endpoints expose $count as a tool parameter. Deleting it
+    //     silently discarded the one field the caller opted into, and left the
+    //     fetchAllPages count rewrite in graph-tools.ts unreachable.
     const removeODataProps = (obj: Record<string, unknown>): void => {
       if (typeof obj === 'object' && obj !== null) {
         Object.keys(obj).forEach((key) => {
           if (
             key.startsWith('@odata.') &&
             key !== '@odata.nextLink' &&
-            key !== '@odata.deltaLink'
+            key !== '@odata.deltaLink' &&
+            key !== '@odata.count'
           ) {
             delete obj[key];
           } else if (typeof obj[key] === 'object') {
