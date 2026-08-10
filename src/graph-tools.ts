@@ -2525,20 +2525,40 @@ async function executeGraphTool(
             const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
             const nextOptions = { ...options };
 
+            // Every `break` below leaves `nextLink` pointing at the page we did
+            // NOT manage to consume, which the merge treats as truncation. Only a
+            // page that parses AND carries a `value` array is allowed to advance
+            // the token: graphRequest converts transport and HTTP failures into a
+            // `{ error }` body with isError:true rather than throwing (see its
+            // catch block), and reading `@odata.nextLink` off that object silently
+            // turned a failed follow-up into "no more pages".
             const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
-            if (nextResponse?.content?.[0]?.text) {
-              const nextJsonResponse = JSON.parse(nextResponse.content[0].text) as ODataPage;
-              if (Array.isArray(nextJsonResponse.value)) {
-                allItems = allItems.concat(nextJsonResponse.value);
-              }
-              nextLink = nextJsonResponse['@odata.nextLink'];
-              if (nextJsonResponse['@odata.deltaLink']) {
-                deltaLink = nextJsonResponse['@odata.deltaLink'];
-              }
-              pageCount++;
-            } else {
+            const nextText = nextResponse?.content?.[0]?.text;
+            if (!nextText) {
               break;
             }
+
+            let nextJsonResponse: ODataPage;
+            try {
+              nextJsonResponse = JSON.parse(nextText) as ODataPage;
+            } catch (e) {
+              logger.warn(`Pagination stopped: page ${pageCount + 1} was not parseable JSON: ${e}`);
+              break;
+            }
+
+            if (nextResponse.isError === true || !Array.isArray(nextJsonResponse.value)) {
+              logger.warn(
+                `Pagination stopped: page ${pageCount + 1} was not a successful collection response — returning ${allItems.length} items with the resume link intact`
+              );
+              break;
+            }
+
+            allItems = allItems.concat(nextJsonResponse.value);
+            nextLink = nextJsonResponse['@odata.nextLink'];
+            if (nextJsonResponse['@odata.deltaLink']) {
+              deltaLink = nextJsonResponse['@odata.deltaLink'];
+            }
+            pageCount++;
           }
 
           if (pageCount >= maxPages) {
@@ -2551,16 +2571,31 @@ async function executeGraphTool(
           }
 
           combinedResponse.value = allItems;
-          if (combinedResponse['@odata.count']) {
-            combinedResponse['@odata.count'] = allItems.length;
+          // @odata.count is Graph's size for the whole filtered collection, taken
+          // before $top/$skip and server-side paging are applied — it is not a
+          // description of `value`, which is why a single-page response with
+          // $top=10 legitimately reports a count of hundreds. So it is passed
+          // through verbatim. There is no case where recomputing it from the
+          // merged items helps: on a complete merge without $skip the two numbers
+          // are equal, and with $skip the tally omits the skipped prefix, so
+          // rewriting would report 80 for a 100-item collection.
+          if (nextLink) {
+            // A surviving nextLink means we stopped early — maxPages/maxItems, or
+            // a follow-up page that failed or was not a collection. The merge is
+            // partial, so stamp back the CURRENT token (page one's is already
+            // spent) and let its presence be the caller's signal that there is
+            // more to fetch. Unconditionally deleting it reported a truncated
+            // collection as a complete one.
+            combinedResponse['@odata.nextLink'] = nextLink;
+          } else {
+            delete combinedResponse['@odata.nextLink'];
           }
-          delete combinedResponse['@odata.nextLink'];
           if (deltaLink) {
             combinedResponse['@odata.deltaLink'] = deltaLink;
           }
 
           logger.info(
-            `Pagination complete: collected ${allItems.length} items across ${pageCount} pages`
+            `Pagination ${nextLink ? 'truncated' : 'complete'}: collected ${allItems.length} items across ${pageCount} pages`
           );
         }
       } catch (e) {
