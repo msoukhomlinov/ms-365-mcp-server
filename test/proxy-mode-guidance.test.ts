@@ -460,19 +460,127 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
     expect(staleReferences(names, surfaces)).toEqual([]);
   });
 
-  // The rule is the registered set, not the proxy flag, so it holds for a
-  // preset-shaped filter with no proxy in sight.
-  it('drops cross-references to Graph tools a filter excluded, with no proxy', () => {
-    const enabledTools = '^(get-drive-item|list-mail-attachments)$';
+  /*
+   * Why filtering stops at the proxy byte tools instead of every unregistered
+   * name (PR #19 re-review, finding A).
+   *
+   * A sentence carries more than one fact. `update-planner-bucket`'s whole tip
+   * is one sentence -- "CRITICAL: Requires If-Match header with ETag from
+   * get-planner-bucket (use includeHeaders=true)." -- so dropping it to avoid
+   * naming an unregistered get-planner-bucket takes the If-Match requirement
+   * with it. Fourteen tips in endpoints.json put a requirement in the same
+   * sentence as a cross-reference and two of them are single-sentence tips
+   * where nothing survives the drop.
+   *
+   * The two failure modes are not equal. Naming a tool that is not registered
+   * costs one failed tool call, with an error that says exactly what is wrong.
+   * Losing an If-Match requirement produces a well-formed request that Graph
+   * rejects with 412, or a todoTaskListId omitted from a create -- silent,
+   * and blamed on Graph rather than on this text. Trading the legible failure
+   * for the silent one is not a win, so the byte-tool guidance the proxy flag
+   * strands is filtered and other cross-references are left alone.
+   *
+   * Presets are why the residual exposure is small: download-bytes and
+   * download-bytes-to-file are in every preset (UNIVERSAL_UTILITY_TOOLS), so
+   * only a hand-written --enabled-tools regex can strand a cross-referenced
+   * tool. Splitting cross-reference from requirement in endpoints.json is the
+   * fix that would make the wider invariant safe; it is not this change.
+   */
+  it('keeps a requirement whose sentence also names an excluded tool', () => {
     const { names, surfaces } = registerAndCollect({
       discovery: false,
       attachmentProxy: false,
       httpMode: false,
-      enabledTools,
+      enabledTools: '^update-planner-bucket$',
+    });
+
+    expect(names.has('update-planner-bucket')).toBe(true);
+    expect(names.has('get-planner-bucket')).toBe(false);
+    const tip = surfaces.find(
+      (s) => s.tool === 'update-planner-bucket' && s.where === 'description'
+    )!.text;
+
+    // The requirement survives, cross-reference and all: losing it means a 412
+    // the model cannot diagnose.
+    expect(tip).toContain('If-Match');
+    expect(tip).toContain('ETag');
+    expect(tip).toContain('includeHeaders');
+  });
+
+  it('keeps the same requirement on delete-planner-bucket', () => {
+    const { surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: false,
+      httpMode: false,
+      enabledTools: '^delete-planner-bucket$',
+    });
+    const tip = surfaces.find(
+      (s) => s.tool === 'delete-planner-bucket' && s.where === 'description'
+    )!.text;
+
+    expect(tip).toContain('If-Match');
+    expect(tip).toContain('ETag');
+  });
+
+  // Byte-tool guidance is still filtered even when the same filter strands the
+  // byte tool -- that is the defect this PR exists for, and it does not lose a
+  // requirement, because a "call download-bytes with target=..." sentence is a
+  // direction and nothing else.
+  it('still drops byte-tool guidance the proxy flag stranded, under a filter', () => {
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+      enabledTools: '^(list-mail-attachments|read-document)$',
     });
 
     expect(names.has('download-bytes')).toBe(false);
-    expect(staleReferences(names, surfaces)).toEqual([]);
+    const tip = surfaces.find(
+      (s) => s.tool === 'list-mail-attachments' && s.where === 'description'
+    )!.text;
+    expect(tip).not.toMatch(/download[-_]bytes/i);
+    expect(tip).toContain('read-document');
+  });
+
+  /*
+   * The no-byte-tool paragraph claims only what those four utilities do (PR #19
+   * re-review, finding B). Their absence says nothing about Graph tools that
+   * return content inside their JSON: get-mail-message returns the message body
+   * whether or not a byte tool exists, so "no content can be read" is false and
+   * "do not offer a read" is an instruction to refuse work the server can do.
+   *
+   * Narrowed rather than enumerated. A list of content-returning Graph tools
+   * would go stale against endpoints.json every time upstream adds one, and
+   * being wrong in the other direction -- claiming a read is available when it
+   * is not -- is the failure this whole PR is about.
+   */
+  it('claims only that byte/document tools are missing, not that content is unreadable', () => {
+    const registeredTools = resolveRegisteredToolNames({
+      orgMode: true,
+      enabledTools: '^get-mail-message$',
+    });
+    expect(registeredTools.has('get-mail-message')).toBe(true);
+    for (const tool of ['read-document', 'download-bytes', 'get-download-url']) {
+      expect(registeredTools.has(tool)).toBe(false);
+    }
+
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools,
+    });
+
+    // Must not deny a capability the registered Graph tool plainly has.
+    expect(instructions).not.toContain('no document can be read here at all');
+    expect(instructions).not.toContain('report the capability as unavailable');
+    // The true, narrower claim: no binary/attachment tool, JSON content intact.
+    expect(instructions).toMatch(/binary|attachment/i);
+    expect(instructions).toMatch(/message body|JSON|response body/i);
+    expect(
+      staleReferences(registeredTools, [{ tool: 'i', where: 't', text: instructions }])
+    ).toEqual([]);
   });
 
   // The stdio-scoped download-bytes-to-file sentence: kept where the tool is

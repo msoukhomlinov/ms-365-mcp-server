@@ -98,10 +98,19 @@ function buildByteContentInstructions(registered: ReadonlySet<string>): string {
   );
 
   if (body.length === 0) {
+    // The narrow claim, deliberately. These four tools are the binary and
+    // document readers; their absence says nothing about Graph tools that
+    // return content inside their JSON — get-mail-message returns the message
+    // body either way — so "no content can be read" would be false and would
+    // have the model refuse work this server can do. Not enumerated either: a
+    // list of content-returning Graph tools goes stale against endpoints.json
+    // every time upstream adds one, and claiming a read that is not there is
+    // the failure this guidance exists to prevent.
     return (
-      'Files / binary content: this server registers no tool that can read file, attachment or ' +
-      'message content, so no document can be read here at all. Do not offer the user a download ' +
-      'or a document read; report the capability as unavailable.'
+      'Files / binary content: this server registers no tool that returns binary or attachment ' +
+      'bytes, mints a download URL, or converts a document to text, so file content, attachment ' +
+      'bytes and raw message MIME cannot be read here. Text a Graph tool already returns in its ' +
+      'JSON response body — a message body, an item description — is unaffected.'
     );
   }
   // Each clause is written to follow the section label, so the first reads

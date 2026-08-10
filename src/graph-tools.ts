@@ -1908,32 +1908,13 @@ export function resolveRegisteredToolNames(gates: ToolRegistrationGates): Set<st
 }
 
 /**
- * The tool names that can appear in guidance and be checked against the
- * registered set: every Graph endpoint and every utility.
- *
- * Auth tools (login, list-accounts, ...) and the discovery meta-tools
- * (search-tools, get-tool-schema, execute-tool) are deliberately absent. They
- * are registered by other modules under conditions this file cannot see, so
- * including them would make every mention of `list-accounts` read as stale. No
- * data-sourced guidance directs to them, and the authored instructions that do
- * are gated by the same option that registers them.
- *
- * Single-word names are excluded: they are ordinary English and would match
- * prose rather than a tool reference.
- */
-const GUIDANCE_TOOL_NAME_UNIVERSE: readonly string[] = [
-  ...endpointsData.map((endpoint) => endpoint.toolName),
-  ...UTILITY_TOOLS.map((utility) => utility.name),
-].filter((name) => name.includes('-'));
-
-/**
  * The tools --attachment-proxy takes away, from their markings alone.
  *
- * Used only to decide whether the read-document replacement sentence is the
- * right thing to say in place of a dropped one -- NOT to decide what gets
- * dropped, which is the registered set's job. Marking-based rather than a
- * delta between selections, so a byte tool an --enabled-tools regex also
- * excludes is still recognised as a proxy casualty.
+ * Marking-based rather than a delta between two `selectUtilityTools` calls: a
+ * byte tool an --enabled-tools regex also excludes is missing from both sides
+ * of such a delta, cancels out, and reads as still registered. That hole is how
+ * `list-mail-attachments` kept advertising download-bytes under
+ * `^(list-mail-attachments|read-document)$`.
  */
 export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
   if (!gates.attachmentProxy) return [];
@@ -1947,25 +1928,39 @@ export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
 }
 
 /**
- * Guidance rewriter for one resolved configuration: drops any sentence naming a
- * tool this configuration did not register.
+ * Guidance rewriter for one resolved configuration: drops the sentences that
+ * direct the model at a byte tool --attachment-proxy took away.
  *
- * The rule is the registered set, not the proxy flag, so it holds for a preset
- * that excluded a cross-referenced tool just as much as for a suppressed byte
- * tool. The read-document replacement is offered only when proxy mode is what
- * removed the tool AND read-document itself registered -- a filter can drop
- * read-document too (startup warns and keeps running), and substituting a
- * second unregistered name for the first would fix nothing.
+ * Scoped to those tools, and NOT to every name absent from the registered set,
+ * because a sentence carries more than one fact and dropping it destroys all of
+ * them. `update-planner-bucket`'s entire tip is one sentence -- "CRITICAL:
+ * Requires If-Match header with ETag from get-planner-bucket (use
+ * includeHeaders=true)." -- so suppressing it because get-planner-bucket is
+ * filtered out takes the If-Match requirement with it and the next update is a
+ * 412 nobody can explain. Fourteen tips in endpoints.json put a requirement in
+ * the same sentence as a cross-reference; two are single-sentence tips where
+ * nothing at all survives.
+ *
+ * The two failures are not equal. Naming an unregistered tool costs one failed
+ * call whose error says exactly what is wrong; losing a requirement produces a
+ * well-formed request that Graph rejects, or silently accepts wrong. The wider
+ * invariant needs endpoints.json to hold the cross-reference apart from the
+ * requirement so one can go without the other -- worth doing, not done here.
+ *
+ * The byte-tool sentences are safe to drop precisely because they carry one
+ * fact: "call download-bytes with target=X" is a direction and nothing else,
+ * and PROXY_DOCUMENT_READ_GUIDANCE restates the target shapes they held.
+ * That replacement is offered only when read-document actually registered -- a
+ * filter can drop it too (startup warns and keeps running), and substituting one
+ * unregistered name for another would fix nothing.
  */
 export function createGuidanceFilter(gates: ToolRegistrationGates): (text: string) => string {
   const registered = resolveRegisteredToolNames(gates);
-  const suppressed = GUIDANCE_TOOL_NAME_UNIVERSE.filter((name) => !registered.has(name));
+  const suppressed = proxySuppressedToolNames(gates).filter((name) => !registered.has(name));
   if (suppressed.length === 0) return (text: string) => text;
-  const proxyCasualties = proxySuppressedToolNames(gates);
-  const replacement =
-    proxyCasualties.length > 0 && registered.has('read-document')
-      ? { text: PROXY_DOCUMENT_READ_GUIDANCE, whenDropped: proxyCasualties }
-      : undefined;
+  const replacement = registered.has('read-document')
+    ? { text: PROXY_DOCUMENT_READ_GUIDANCE, whenDropped: suppressed }
+    : undefined;
   return (text: string) => stripStaleToolGuidance(text, suppressed, replacement);
 }
 
@@ -2976,7 +2971,10 @@ export function registerGraphTools(
       endpointConfig
     );
     if (endpointConfig?.llmTip) {
-      toolDescription += `\n\n💡 TIP: ${filterGuidance(endpointConfig.llmTip)}`;
+      // A tip filtered down to nothing gets no header: an empty "💡 TIP:" is a
+      // promise of advice that is not there.
+      const tip = filterGuidance(endpointConfig.llmTip);
+      if (tip.length > 0) toolDescription += `\n\n💡 TIP: ${tip}`;
     }
 
     // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
