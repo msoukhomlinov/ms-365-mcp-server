@@ -34,9 +34,14 @@ export type McpInstructionsContext = {
 type GuidanceClause = { text: string; tools?: readonly string[] };
 
 function emit(clauses: readonly GuidanceClause[], registered: ReadonlySet<string>): string[] {
-  return clauses
-    .filter((clause) => (clause.tools ?? []).every((tool) => registered.has(tool)))
-    .map((clause) => clause.text);
+  return (
+    clauses
+      .filter((clause) => (clause.tools ?? []).every((tool) => registered.has(tool)))
+      .map((clause) => clause.text)
+      // A clause that resolved to nothing (the byte paragraph with no byte tools)
+      // must not leave a double space or a stray full stop in the joined output.
+      .filter((text) => text.trim().length > 0)
+  );
 }
 
 /**
@@ -45,9 +50,9 @@ function emit(clauses: readonly GuidanceClause[], registered: ReadonlySet<string
  * Self-contained is the whole design: each sentence names exactly one tool and
  * survives its neighbours' removal, so any combination of registered byte tools
  * produces true text with no per-combination branch and no cross-reference to a
- * tool that may be gone. When none of them registered — proxy mode with a
- * filter that also dropped read-document — the paragraph says so instead of
- * naming a tool that is not there.
+ * tool that may be gone. When none of them registered the paragraph is omitted
+ * entirely rather than describing what is missing — see the comment on the
+ * empty case below for why an absence is not this module's to assert.
  */
 function buildByteContentInstructions(registered: ReadonlySet<string>): string {
   const body = emit(
@@ -61,8 +66,11 @@ function buildByteContentInstructions(registered: ReadonlySet<string>): string {
           'required), a raw message (/me/messages/{message-id}/$value), a drive or SharePoint file ' +
           '(/drives/{drive-id}/items/{driveItem-id}/content), or another authenticated /$value ' +
           'endpoint. Absolute URLs are not accepted, and pages, offset and maxChars read a long ' +
-          'document in parts. This server registers no tool that returns raw bytes, base64 content, ' +
-          'or a download URL.',
+          'document in parts. Byte payloads are stripped from every tool result here, so no tool ' +
+          'returns raw bytes to you. read-document mints a URL that is redeemed later with no ' +
+          'Authorization header, so it refuses with identity_not_supported whenever Graph identity ' +
+          "comes from the request (OAuth, OBO, or bearer mode) rather than from this server's own " +
+          'token cache; there is no byte-level fallback to reach for when it does.',
       },
       {
         tools: ['get-download-url'],
@@ -97,22 +105,22 @@ function buildByteContentInstructions(registered: ReadonlySet<string>): string {
     registered
   );
 
-  if (body.length === 0) {
-    // The narrow claim, deliberately. These four tools are the binary and
-    // document readers; their absence says nothing about Graph tools that
-    // return content inside their JSON — get-mail-message returns the message
-    // body either way — so "no content can be read" would be false and would
-    // have the model refuse work this server can do. Not enumerated either: a
-    // list of content-returning Graph tools goes stale against endpoints.json
-    // every time upstream adds one, and claiming a read that is not there is
-    // the failure this guidance exists to prevent.
-    return (
-      'Files / binary content: this server registers no tool that returns binary or attachment ' +
-      'bytes, mints a download URL, or converts a document to text, so file content, attachment ' +
-      'bytes and raw message MIME cannot be read here. Text a Graph tool already returns in its ' +
-      'JSON response body — a message body, an item description — is unaffected.'
-    );
-  }
+  // Nothing to say, so nothing is said.
+  //
+  // This paragraph asserted an absence twice and was false both times: first
+  // that no content could be read (get-mail-message returns the body), then,
+  // narrowed to binary, that no tool returned bytes (get-meeting-recording-content
+  // is a GET on /content, so no proxy rule suppresses it, and graph-client.ts
+  // base64-encodes the MP4 into contentBytes). The four utilities are the only
+  // tools this module knows about; their absence is not evidence about the ~120
+  // Graph endpoints, and enumerating the byte-returning ones would go stale on
+  // every endpoints.json addition, silently.
+  //
+  // So: guidance states what is registered and never what cannot be done. A
+  // claim of absence needs knowledge this module does not have -- the single
+  // exception being the scrubber above, which is a mechanism that enforces the
+  // absence rather than an inference from a tool list.
+  if (body.length === 0) return '';
   // Each clause is written to follow the section label, so the first reads
   // correctly after the colon and the rest have to be capitalised: which clause
   // lands first depends on what registered, and any of them can. A hyphenated

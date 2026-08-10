@@ -1866,7 +1866,13 @@ export const PROXY_DOCUMENT_READ_GUIDANCE =
   'Graph path: a mail or event attachment keeps its /$value suffix ' +
   '(/me/messages/{message-id}/attachments/{attachment-id}/$value), a drive or SharePoint file its ' +
   '/content (/drives/{drive-id}/items/{driveItem-id}/content). ' +
-  'No tool on this server returns raw bytes or a download URL.';
+  // The one absence worth asserting, because a mechanism enforces it rather
+  // than a tool list implying it: installResponseScrubbing strips contentBytes
+  // and any base64 over 4 KB from every result (lib/response-scrubber.ts), and
+  // it is installed on the same condition that registers read-document. Saying
+  // "or a download URL" here was false -- nothing strips URLs and get-drive-item
+  // still returns @microsoft.graph.downloadUrl.
+  'Byte payloads are stripped from every tool result here, so no tool returns raw bytes.';
 
 /** Every gate that decides whether a tool -- Graph or utility -- is registered. */
 export interface ToolRegistrationGates extends UtilityToolGates {

@@ -364,7 +364,7 @@ describe('guidance text under --attachment-proxy', () => {
     expect(tip).toContain('/$value');
     expect(tip).toContain('read-document');
     // ...and the replacement is stated once, not once per dropped sentence.
-    expect(tip.match(/No tool on this server returns raw bytes/g)).toHaveLength(1);
+    expect(tip.match(/Byte payloads are stripped from every tool result/g)).toHaveLength(1);
   });
 });
 
@@ -540,6 +540,10 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
     )!.text;
     expect(tip).not.toMatch(/download[-_]bytes/i);
     expect(tip).toContain('read-document');
+    // The replacement carries the same absence claim as the instructions, so it
+    // is held to the same standard: raw bytes yes (scrubber), download URL no.
+    expect(tip).not.toMatch(/or a download URL/i);
+    expect(tip).toMatch(/raw bytes/i);
   });
 
   /*
@@ -554,6 +558,110 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
    * being wrong in the other direction -- claiming a read is available when it
    * is not -- is the failure this whole PR is about.
    */
+  /*
+   * The fallback asserted an absence it could not verify (PR #19 re-review,
+   * finding C -- the second catch of the same shape). With
+   * `^get-meeting-recording-content$` the four utilities are all absent, but
+   * that Graph tool is registered, its path ends `/content` rather than
+   * `/$value` so nothing suppresses it, and graph-client.ts base64-encodes the
+   * MP4 into contentBytes. The paragraph denied a binary read the server
+   * performs.
+   *
+   * Enumerating registered Graph byte endpoints instead would go stale on every
+   * endpoints.json addition, silently. So the rule is: guidance may state what
+   * is registered, never what cannot be done -- and with nothing to state, it
+   * says nothing.
+   */
+  it('says nothing about byte content when no byte/document utility is registered', () => {
+    const registeredTools = resolveRegisteredToolNames({
+      orgMode: true,
+      enabledTools: '^get-meeting-recording-content$',
+    });
+    expect(registeredTools.has('get-meeting-recording-content')).toBe(true);
+    for (const tool of ['read-document', 'download-bytes', 'get-download-url']) {
+      expect(registeredTools.has(tool)).toBe(false);
+    }
+
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools,
+    });
+
+    // No byte-content guidance at all, rather than a claim of absence.
+    expect(instructions).not.toContain('Files / binary content');
+    expect(instructions).not.toMatch(/cannot be read/i);
+    expect(instructions).not.toMatch(/no tool that returns/i);
+    // Dropping a clause must not leave a seam behind.
+    expect(instructions).not.toMatch(/ {2}/);
+    expect(instructions).not.toMatch(/\.\s*\./);
+    // The rest of the instructions are unaffected.
+    expect(instructions).toContain('Microsoft Graph OData');
+  });
+
+  /*
+   * The one absence claim that survives is the one a mechanism enforces: under
+   * proxy mode installResponseScrubbing strips contentBytes and any base64 over
+   * 4 KB from every tool result (src/lib/response-scrubber.ts), and it is
+   * installed on exactly the condition that registers read-document. Download
+   * URLs are NOT stripped, and get-drive-item still returns
+   * @microsoft.graph.downloadUrl, so claiming none is available was false.
+   */
+  it('claims no raw bytes under proxy mode but does not deny download URLs', () => {
+    const registeredTools = resolveRegisteredToolNames({
+      orgMode: true,
+      httpMode: true,
+      attachmentProxy: true,
+    });
+    expect(registeredTools.has('read-document')).toBe(true);
+    expect(registeredTools.has('get-drive-item')).toBe(true);
+
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools,
+    });
+
+    // Scrubber-backed, so it may be stated.
+    expect(instructions).toMatch(/raw bytes/i);
+    // Not scrubber-backed: get-drive-item hands the model a download URL.
+    expect(instructions).not.toMatch(/or a download URL/i);
+    expect(instructions).not.toMatch(/mints a download URL/i);
+  });
+
+  /*
+   * Finding D. read-document mints internally, so it inherits the identity
+   * constraint get-download-url already carries (src/graph-tools.ts:704), and
+   * its own guard at src/graph-tools.ts:1618 --
+   * `ctx.authManager?.isOAuthModeEnabled() || getRequestTokens()` -- answers
+   * identity_not_supported before any conversion. Under --http
+   * --attachment-proxy with bearer, OAuth or OBO the tool is registered and
+   * visible in the model's tool list but always refuses, so the guidance has to
+   * name the condition.
+   */
+  it('qualifies read-document with the request-scoped identity condition', () => {
+    const registeredTools = resolveRegisteredToolNames({
+      orgMode: true,
+      httpMode: true,
+      attachmentProxy: true,
+    });
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools,
+    });
+
+    expect(instructions).toContain('read-document');
+    expect(instructions).toMatch(/OAuth, OBO, or bearer mode/);
+    expect(instructions).toMatch(/Authorization header/i);
+  });
+
   it('claims only that byte/document tools are missing, not that content is unreadable', () => {
     const registeredTools = resolveRegisteredToolNames({
       orgMode: true,
@@ -573,11 +681,12 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
     });
 
     // Must not deny a capability the registered Graph tool plainly has.
+    // get-mail-message returns the message body regardless of byte tools, and
+    // narrowing the claim was not enough (see finding C): the paragraph is gone.
     expect(instructions).not.toContain('no document can be read here at all');
     expect(instructions).not.toContain('report the capability as unavailable');
-    // The true, narrower claim: no binary/attachment tool, JSON content intact.
-    expect(instructions).toMatch(/binary|attachment/i);
-    expect(instructions).toMatch(/message body|JSON|response body/i);
+    expect(instructions).not.toContain('Files / binary content');
+    expect(instructions).not.toMatch(/cannot be read/i);
     expect(
       staleReferences(registeredTools, [{ tool: 'i', where: 't', text: instructions }])
     ).toEqual([]);
