@@ -1528,7 +1528,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'read attachment read document convert to markdown pdf docx xlsx pptx eml msg extract text from attachment open attachment',
     description:
-      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. This is the ONLY way to read the content of anything inside Microsoft 365 on this server. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+      // No superlative. "The ONLY way to read the content of anything inside
+      // Microsoft 365 on this server" was a claim about every other registered
+      // tool, which this string cannot know: get-drive-item still returns
+      // @microsoft.graph.downloadUrl, and proxy scrubbing deliberately leaves
+      // URLs intact. What is true, and mechanism-backed, is the sentence about
+      // bytes -- the scrubber enforces that one.
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
     readOnlyHint: true,
     openWorldHint: true,
     proxyOnly: true,

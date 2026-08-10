@@ -70,7 +70,13 @@ function buildByteContentInstructions(registered: ReadonlySet<string>): string {
           'returns raw bytes to you. read-document mints a URL that is redeemed later with no ' +
           'Authorization header, so it refuses with identity_not_supported whenever Graph identity ' +
           "comes from the request (OAuth, OBO, or bearer mode) rather than from this server's own " +
-          'token cache; there is no byte-level fallback to reach for when it does.',
+          'token cache.',
+        // "there is no byte-level fallback to reach for when it does" was the
+        // third absence claim of this shape and false the same way: the scrubber
+        // strips bytes out of tool results, not download URLs out of them, and a
+        // registered drive tool can still hand back a pre-authenticated URL. The
+        // scrubber sentence above already says exactly what is guaranteed;
+        // extrapolating it into "no fallback exists" was the error.
       },
       {
         tools: ['get-download-url'],
