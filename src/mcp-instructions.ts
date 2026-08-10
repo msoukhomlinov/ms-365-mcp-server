@@ -3,7 +3,49 @@ export type McpInstructionsContext = {
   orgMode: boolean;
   readOnly: boolean;
   multiAccount: boolean;
+  /**
+   * --attachment-proxy: download-bytes, get-download-url and
+   * get-mail-message-mime are not registered, read-document is. The
+   * byte-content guidance below is the one paragraph whose every named tool
+   * changes with this flag, so it branches rather than qualifying.
+   */
+  attachmentProxy?: boolean;
 };
+
+/**
+ * Byte/document guidance. Two mutually exclusive branches rather than one
+ * hedged paragraph: under --attachment-proxy all three tools the non-proxy text
+ * names are unregistered, so no amount of qualification makes that text true —
+ * it would still be telling the model to call them. Everything shared between
+ * the modes (uploads) stays outside this branch.
+ */
+function buildByteContentInstructions(opts: McpInstructionsContext): string {
+  if (opts.attachmentProxy) {
+    return (
+      'Files / binary content: read documents with read-document, which returns markdown and takes a ' +
+      'relative Microsoft Graph byte path — a mail or event attachment ' +
+      '(/me/messages/{message-id}/attachments/{attachment-id}/$value; the /$value suffix is required, and ' +
+      'list-mail-attachments returns the ids), a raw message (/me/messages/{message-id}/$value), a drive or ' +
+      'SharePoint file (/drives/{drive-id}/items/{driveItem-id}/content), or another authenticated /$value ' +
+      'endpoint. Absolute URLs are not accepted. Use pages, offset and maxChars to read a long document in ' +
+      'parts. This server registers no tool that returns raw bytes, base64 content, or a download URL: ' +
+      'read-document is the only way to read a document here, with no byte-level fallback.'
+    );
+  }
+  return (
+    'Files / binary content: for large drive/SharePoint file content, prefer get-download-url to resolve a ' +
+    'pre-authenticated URL for out-of-band download. Use download-bytes for authenticated byte reads such as ' +
+    'mail attachments, profile photos, Teams hosted content, and meeting recordings. get-download-url covers ' +
+    'those authenticated byte endpoints too, but only when this server runs with --enable-attachment-urls ' +
+    '(HTTP mode, server-held credentials), where it mints a short-lived URL of its own that accepts a few ' +
+    'fetches (so a converter may probe and then convert the same URL, and a failed fetch is retried on it ' +
+    'rather than re-minted); without the flag, or when Graph identity comes from the request (OAuth, OBO, or ' +
+    'bearer mode), it refuses them and download-bytes is the fallback. In stdio mode, where minting is never ' +
+    'available, download-bytes-to-file writes those same authenticated bytes straight to a local absolute ' +
+    'path instead of returning base64 — the only out-of-band option there for large mail attachments and ' +
+    'meeting recordings. These tools take relative Microsoft Graph paths, not absolute URLs.'
+  );
+}
 
 function buildGeneralMcpInstructions(opts: McpInstructionsContext): string {
   const parts = [
@@ -13,7 +55,8 @@ function buildGeneralMcpInstructions(opts: McpInstructionsContext): string {
     'When you need an organizational user or recipient address, resolve it with list-users (or another directory tool); do not invent SMTP addresses.',
     'Directory $search on collections such as /users or /groups requires ConsistencyLevel: eventual when the tool exposes that header.',
     'Teams chat and channel messages: prefer HTML contentType in the body; plain text is often mangled by Graph.',
-    'Files / binary content: for large drive/SharePoint file content, prefer get-download-url to resolve a pre-authenticated URL for out-of-band download. Use download-bytes for authenticated byte reads such as mail attachments, profile photos, Teams hosted content, and meeting recordings. get-download-url covers those authenticated byte endpoints too, but only when this server runs with --enable-attachment-urls (HTTP mode, server-held credentials), where it mints a short-lived URL of its own that accepts a few fetches (so a converter may probe and then convert the same URL, and a failed fetch is retried on it rather than re-minted); without the flag, or when Graph identity comes from the request (OAuth, OBO, or bearer mode), it refuses them and download-bytes is the fallback. In stdio mode, where minting is never available, download-bytes-to-file writes those same authenticated bytes straight to a local absolute path instead of returning base64 — the only out-of-band option there for large mail attachments and meeting recordings. These tools take relative Microsoft Graph paths, not absolute URLs. For uploads, upload-file-content takes a base64 string body up to 4MB; use create-upload-session above that.',
+    buildByteContentInstructions(opts),
+    'For uploads, upload-file-content takes a base64 string body up to 4MB; use create-upload-session above that.',
   ];
   if (opts.readOnly) parts.push('This server is read-only; write operations are disabled.');
   if (opts.multiAccount)

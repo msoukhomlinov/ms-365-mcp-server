@@ -1,0 +1,410 @@
+/**
+ * Guidance text may never name a tool this configuration did not register.
+ *
+ * `--attachment-proxy` deletes three tools (download-bytes, get-download-url,
+ * get-mail-message-mime) and adds read-document. The descriptions, parameter
+ * descriptions and `initialize.instructions` are built from the same static
+ * strings in every mode, so every sentence telling the model to "call
+ * download-bytes" survives into a server that has no such tool. A model that
+ * follows the guidance calls a name that is not there.
+ *
+ * These tests assert the PROPERTY, not one string: collect every piece of text
+ * this server hands the model, extract every known tool name it mentions, and
+ * require each mentioned name to be registered. A hardcoded-string assertion
+ * would pass the day someone adds the next llmTip.
+ */
+import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  buildToolsRegistry,
+  proxySuppressedToolNames,
+  registerDiscoveryTools,
+  registerGraphTools,
+  selectUtilityTools,
+  UTILITY_TOOLS,
+  type UtilityToolGates,
+} from '../src/graph-tools.js';
+import { buildMcpServerInstructions } from '../src/mcp-instructions.js';
+import { mentionsToolName, stripStaleToolGuidance } from '../src/lib/guidance-text.js';
+import type GraphClient from '../src/graph-client.js';
+
+vi.mock('../src/logger.js', () => ({
+  default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), verbose: vi.fn() },
+  enableConsoleLogging: vi.fn(),
+}));
+
+const endpointsData = JSON.parse(
+  readFileSync(path.join(import.meta.dirname, '..', 'src', 'endpoints.json'), 'utf8')
+) as Array<{ toolName: string }>;
+
+/** Registered by registerAuthTools in every mode, so never a stale reference. */
+const AUTH_TOOL_NAMES = [
+  'login',
+  'logout',
+  'verify-login',
+  'list-accounts',
+  'select-account',
+  'remove-account',
+];
+
+/** Registered only by registerDiscoveryTools. */
+const DISCOVERY_TOOL_NAMES = ['search-tools', 'get-tool-schema', 'execute-tool'];
+
+/**
+ * Every tool name any build of this server can register. Single-word names
+ * (login, logout) are excluded: they are ordinary English and would match
+ * prose, and they are registered unconditionally anyway.
+ */
+const KNOWN_TOOL_NAMES: string[] = [
+  ...endpointsData.map((e) => e.toolName),
+  ...UTILITY_TOOLS.map((u) => u.name),
+  ...AUTH_TOOL_NAMES,
+  ...DISCOVERY_TOOL_NAMES,
+].filter((name) => name.includes('-'));
+
+/**
+ * Tool names mentioned in `text`. Matched on word boundaries so
+ * "download-bytes" does not match inside "download-bytes-to-file", and
+ * separator-agnostically because MCP clients render these names with
+ * underscores (the live server's list-mail-attachments tip reads
+ * "download_bytes" in the client).
+ */
+function mentionedToolNames(text: string): string[] {
+  const found = new Set<string>();
+  for (const name of KNOWN_TOOL_NAMES) {
+    const pattern = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/-/g, '[-_]');
+    if (new RegExp(`(?<![A-Za-z0-9_-])${pattern}(?![A-Za-z0-9_-])`).test(text)) {
+      found.add(name);
+    }
+  }
+  return [...found];
+}
+
+type Surface = { tool: string; where: string; text: string };
+
+/** Parameter descriptions, for both the raw-shape and z.object() registration forms. */
+function paramDescriptions(schema: unknown): Array<{ param: string; text: string }> {
+  const out: Array<{ param: string; text: string }> = [];
+  if (!schema || typeof schema !== 'object') return out;
+  const def = (schema as { _def?: { shape?: unknown } })._def;
+  let shape: Record<string, unknown> | undefined;
+  if (def && typeof def.shape === 'function') {
+    shape = (def.shape as () => Record<string, unknown>)();
+  } else if (def && def.shape && typeof def.shape === 'object') {
+    shape = def.shape as Record<string, unknown>;
+  } else {
+    shape = schema as Record<string, unknown>;
+  }
+  for (const [param, zodType] of Object.entries(shape ?? {})) {
+    const description = (zodType as { description?: unknown })?.description;
+    if (typeof description === 'string' && description.length > 0) {
+      out.push({ param, text: description });
+    }
+  }
+  return out;
+}
+
+/**
+ * Registers for real and captures what reached the MCP SDK. Only the SDK
+ * boundary is stubbed — the descriptions, llmTip assembly and every gate run
+ * as they do in production.
+ */
+type Handler = (params: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+
+function registerAndCollect(opts: {
+  discovery: boolean;
+  attachmentProxy: boolean;
+  httpMode: boolean;
+}): { names: Set<string>; surfaces: Surface[]; handlers: Map<string, Handler> } {
+  const server = new McpServer({ name: 'test', version: '1.0.0' });
+  const surfaces: Surface[] = [];
+  const names = new Set<string>([...AUTH_TOOL_NAMES]);
+  const handlers = new Map<string, Handler>();
+
+  const record = (name: string, description: string, schema: unknown, args: unknown[]) => {
+    names.add(name);
+    if (typeof description === 'string') {
+      surfaces.push({ tool: name, where: 'description', text: description });
+    }
+    for (const { param, text } of paramDescriptions(schema)) {
+      surfaces.push({ tool: name, where: `param:${param}`, text });
+    }
+    const last = args[args.length - 1];
+    if (typeof last === 'function') handlers.set(name, last as Handler);
+  };
+
+  vi.spyOn(server, 'tool').mockImplementation(((...args: unknown[]) => {
+    record(args[0] as string, args[1] as string, args[2], args);
+    return {} as never;
+  }) as never);
+  vi.spyOn(server, 'registerTool').mockImplementation(((...args: unknown[]) => {
+    const config = args[1] as { description?: string; inputSchema?: unknown };
+    record(args[0] as string, config?.description ?? '', config?.inputSchema, args);
+    return {} as never;
+  }) as never);
+
+  if (opts.discovery) {
+    // Discovery mode registers three meta-tools; the Graph tools and utilities
+    // it can reach are called through execute-tool rather than registered
+    // individually. They count as present for this property — naming one is not
+    // a stale reference — while the tools the flag removed are in neither set.
+    for (const name of buildToolsRegistry(
+      false,
+      true,
+      undefined,
+      undefined,
+      [],
+      opts.attachmentProxy
+    ).keys()) {
+      names.add(name);
+    }
+    for (const utility of selectUtilityTools({
+      httpMode: opts.httpMode,
+      attachmentProxy: opts.attachmentProxy,
+    })) {
+      names.add(utility.name);
+    }
+    registerDiscoveryTools(
+      server,
+      {} as GraphClient,
+      false, // readOnly
+      true, // orgMode
+      undefined, // authManager
+      false, // multiAccount
+      [], // accountNames
+      undefined, // enabledTools
+      undefined, // allowedScopes
+      opts.httpMode,
+      opts.attachmentProxy, // attachmentUrls -- proxy implies it
+      opts.attachmentProxy
+    );
+  } else {
+    registerGraphTools(
+      server,
+      {} as GraphClient,
+      false, // readOnly
+      undefined, // enabledToolsPattern
+      true, // orgMode
+      undefined, // authManager
+      false, // multiAccount
+      [], // accountNames
+      undefined, // allowedScopes
+      opts.httpMode,
+      opts.attachmentProxy
+    );
+  }
+
+  vi.restoreAllMocks();
+  return { names, surfaces, handlers };
+}
+
+/** Every mentioned-but-unregistered reference, as readable lines. */
+function staleReferences(names: Set<string>, surfaces: Surface[]): string[] {
+  const stale: string[] = [];
+  for (const surface of surfaces) {
+    for (const mentioned of mentionedToolNames(surface.text)) {
+      if (!names.has(mentioned)) {
+        stale.push(`${surface.tool} (${surface.where}) -> ${mentioned}`);
+      }
+    }
+  }
+  return [...new Set(stale)].sort();
+}
+
+const PROXY_GATES: UtilityToolGates = { httpMode: true, attachmentProxy: true };
+
+describe('guidance text under --attachment-proxy', () => {
+  it('names no unregistered tool in any registered tool description or parameter', () => {
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+    });
+
+    expect(names.has('read-document')).toBe(true);
+    expect(names.has('download-bytes')).toBe(false);
+    expect(surfaces.length).toBeGreaterThan(100);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  it('names no unregistered tool in discovery mode either', () => {
+    const { names, surfaces } = registerAndCollect({
+      discovery: true,
+      attachmentProxy: true,
+      httpMode: true,
+    });
+
+    expect(names.has('search-tools')).toBe(true);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  it('names no unregistered tool in the MCP instructions', () => {
+    const { names } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+    });
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      attachmentProxy: true,
+    });
+
+    expect(
+      staleReferences(names, [{ tool: 'instructions', where: 'text', text: instructions }])
+    ).toEqual([]);
+    expect(instructions).toContain('read-document');
+  });
+
+  it('still routes byte reads to the byte tools when no proxy is configured', () => {
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      attachmentProxy: false,
+    });
+
+    expect(instructions).toContain('get-download-url');
+    expect(instructions).toContain('download-bytes');
+    // stdio-only guidance is true in stdio mode and must not be scrubbed away.
+    expect(instructions).toContain('download-bytes-to-file');
+    expect(instructions).not.toContain('read-document');
+  });
+
+  it('keeps byte-tool guidance intact in a non-proxy Graph registration', () => {
+    const { names, surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: false,
+      httpMode: false,
+    });
+
+    expect(names.has('download-bytes')).toBe(true);
+    const attachmentsTip = surfaces.find(
+      (s) => s.tool === 'list-mail-attachments' && s.where === 'description'
+    );
+    expect(attachmentsTip?.text).toContain('download-bytes');
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  // In discovery mode the llmTips reach the model through these two handlers,
+  // not through a registered description, so the property has to be checked on
+  // what they return. Mocking the registry instead of the SDK boundary here
+  // would exercise none of the real assembly.
+  it('names no unregistered tool in search-tools or get-tool-schema results', async () => {
+    const { names, handlers } = registerAndCollect({
+      discovery: true,
+      attachmentProxy: true,
+      httpMode: true,
+    });
+
+    const search = await handlers.get('search-tools')!({
+      query: 'download mail attachment bytes photo hosted content drive file',
+      limit: 50,
+    });
+    const attachments = await handlers.get('get-tool-schema')!({
+      tool_name: 'list-mail-attachments',
+    });
+    const driveItem = await handlers.get('get-tool-schema')!({ tool_name: 'get-drive-item' });
+    const readDocument = await handlers.get('get-tool-schema')!({ tool_name: 'read-document' });
+
+    const surfaces: Surface[] = [
+      { tool: 'search-tools', where: 'result', text: search.content[0].text },
+      {
+        tool: 'get-tool-schema',
+        where: 'list-mail-attachments',
+        text: attachments.content[0].text,
+      },
+      { tool: 'get-tool-schema', where: 'get-drive-item', text: driveItem.content[0].text },
+      { tool: 'get-tool-schema', where: 'read-document', text: readDocument.content[0].text },
+    ];
+    expect(surfaces.every((s) => s.text.length > 0)).toBe(true);
+    expect(staleReferences(names, surfaces)).toEqual([]);
+  });
+
+  it('derives the suppressed set from the tool table rather than a literal list', () => {
+    const suppressed = proxySuppressedToolNames(PROXY_GATES);
+
+    // Every utility the flag drops, by its bytesToModel marking rather than by name.
+    for (const utility of UTILITY_TOOLS.filter((u) => u.bytesToModel)) {
+      expect(suppressed).toContain(utility.name);
+    }
+    // And the Graph tool it drops by the GET-/$value class rule.
+    expect(suppressed).toContain('get-mail-message-mime');
+    // Not a proxy-mode casualty: stdio-only, and its guidance says so.
+    expect(suppressed).not.toContain('download-bytes-to-file');
+    // Nothing is suppressed when the flag is off, so no other mode pays for this.
+    expect(proxySuppressedToolNames({ httpMode: true })).toEqual([]);
+  });
+
+  it('keeps the surviving guidance and states the replacement once', () => {
+    const { surfaces } = registerAndCollect({
+      discovery: false,
+      attachmentProxy: true,
+      httpMode: true,
+    });
+    const tip = surfaces.find(
+      (s) => s.tool === 'list-mail-attachments' && s.where === 'description'
+    )!.text;
+
+    // The non-tool half of the tip survives...
+    expect(tip).toContain('id, name, contentType, size, isInline');
+    // ...the $value requirement the dropped sentence carried is restored...
+    expect(tip).toContain('/$value');
+    expect(tip).toContain('read-document');
+    // ...and the replacement is stated once, not once per dropped sentence.
+    expect(tip.match(/No tool on this server returns raw bytes/g)).toHaveLength(1);
+  });
+});
+
+/**
+ * The sentence splitter is the one fragile part: cutting at the wrong period
+ * either loses true guidance or leaves half a stale sentence behind. Every
+ * period shape that appears in the tips it runs over is pinned here.
+ */
+describe('stripStaleToolGuidance', () => {
+  const suppressed = ['download-bytes', 'get-download-url'];
+
+  it('drops only the sentences naming a suppressed tool', () => {
+    const text =
+      'Lists attachments. Call download-bytes with target=/x/$value. IDs come from the body.';
+    expect(stripStaleToolGuidance(text, suppressed)).toBe(
+      'Lists attachments. IDs come from the body.'
+    );
+  });
+
+  it('leaves text untouched when nothing is suppressed or nothing matches', () => {
+    const text = 'Call download-bytes with target=/x/$value.';
+    expect(stripStaleToolGuidance(text, [])).toBe(text);
+    expect(stripStaleToolGuidance('Lists attachments.', suppressed)).toBe('Lists attachments.');
+  });
+
+  it('does not split on an unspaced or lowercase-following period', () => {
+    const text =
+      'Returns @microsoft.graph.downloadUrl and ProfilePhoto.ReadWrite.All applies. ' +
+      'Use get-download-url for the bytes.';
+    expect(stripStaleToolGuidance(text, suppressed)).toBe(
+      'Returns @microsoft.graph.downloadUrl and ProfilePhoto.ReadWrite.All applies.'
+    );
+  });
+
+  it('appends the replacement once however many sentences were dropped', () => {
+    const text =
+      'Metadata only. Call get-download-url for large files. Call download-bytes for small ones.';
+    expect(stripStaleToolGuidance(text, suppressed, 'Use read-document.')).toBe(
+      'Metadata only. Use read-document.'
+    );
+  });
+
+  it('matches tool names on word boundaries and either separator', () => {
+    // The live server's clients render these names with underscores.
+    expect(mentionsToolName('call download_bytes now', ['download-bytes'])).toBe(true);
+    // A longer name is not a mention of its own prefix.
+    expect(mentionsToolName('use download-bytes-to-file', ['download-bytes'])).toBe(false);
+    expect(mentionsToolName('use download-bytes-to-file', ['download-bytes-to-file'])).toBe(true);
+  });
+});

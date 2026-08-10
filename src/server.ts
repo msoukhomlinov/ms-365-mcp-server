@@ -283,6 +283,9 @@ class MicrosoftGraphServer {
           orgMode: Boolean(this.options.orgMode),
           readOnly: Boolean(this.options.readOnly),
           multiAccount: this.multiAccount,
+          // Same resolved condition the registration gates use, so the
+          // instructions cannot describe a different server than the one built.
+          attachmentProxy: this.attachmentProxyActive,
         }),
       }
     );
