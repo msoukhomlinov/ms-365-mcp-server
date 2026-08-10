@@ -2551,16 +2551,33 @@ async function executeGraphTool(
           }
 
           combinedResponse.value = allItems;
-          if (combinedResponse['@odata.count']) {
-            combinedResponse['@odata.count'] = allItems.length;
+          if (nextLink) {
+            // A surviving nextLink means the loop stopped on maxPages/maxItems,
+            // not on Graph running out of pages: the merge is partial. Stamp the
+            // CURRENT token (page one's is already spent) so the caller can
+            // resume, and leave Graph's own count alone — it is the only record
+            // of the true total. Unconditionally deleting the link here reported
+            // a truncated collection as complete, and rewriting the count to the
+            // items we happened to keep erased the total.
+            combinedResponse['@odata.nextLink'] = nextLink;
+          } else {
+            delete combinedResponse['@odata.nextLink'];
+            // Aggregation is complete, so allItems.length IS the collection size.
+            // Test for presence, not truthiness: `0` is a legitimate count and
+            // Graph sends `null` for some collections, both of which the old
+            // truthiness guard skipped. The key is only rewritten when it is
+            // already there — i.e. when the request carried $count=true — so a
+            // caller who never asked for a count never gets one.
+            if ('@odata.count' in combinedResponse) {
+              combinedResponse['@odata.count'] = allItems.length;
+            }
           }
-          delete combinedResponse['@odata.nextLink'];
           if (deltaLink) {
             combinedResponse['@odata.deltaLink'] = deltaLink;
           }
 
           logger.info(
-            `Pagination complete: collected ${allItems.length} items across ${pageCount} pages`
+            `Pagination ${nextLink ? 'truncated' : 'complete'}: collected ${allItems.length} items across ${pageCount} pages`
           );
         }
       } catch (e) {
