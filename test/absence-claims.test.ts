@@ -71,6 +71,7 @@ import path from 'node:path';
 import ts from 'typescript';
 import type { z } from 'zod';
 import {
+  isProxySuppressedGraphTool,
   PROXY_DOCUMENT_READ_GUIDANCE,
   resolveRegisteredToolNames,
   UTILITY_TOOLS,
@@ -96,24 +97,33 @@ const ABSENCE_PHRASING =
  * claim that one of those two justifications applies -- if neither does, fix the
  * text instead.
  */
+/*
+ * MECHANISM was withdrawn from the scrubber sentences it used to bless.
+ *
+ * "No tool returns raw bytes" was classified MECHANISM because
+ * installResponseScrubbing enforces it. It does not: proxy suppression matches
+ * only GET paths ending /$value, so graph-batch (POST /$batch, no presets)
+ * stays registered and can batch a GET of /me/messages/{id}/$value, and that
+ * RFC 5322 body is text/plain rather than wholly valid base64, so neither
+ * scrubber rule matches while its attachments ride inline. Both
+ * isProxySuppressedGraphTool's docstring and response-scrubbing.ts disclose
+ * this, which is what makes the classification -- not the disclosure -- the
+ * defect. A written justification for a false claim is worse than an
+ * unjustified one.
+ *
+ * The sentences now describe what the scrubber strips instead of promising what
+ * cannot happen, so they no longer match ABSENCE_PHRASING and need no entry
+ * here. A claim that holds only while some tool is unregistered is conditional,
+ * not mechanical, and does not belong in this list.
+ */
 const CLASSIFIED: Array<{
   fragment: string;
   kind: 'MECHANISM' | 'GATE' | 'OPERATOR';
   why: string;
 }> = [
-  {
-    fragment: 'This server runs with --attachment-proxy, where',
-    kind: 'MECHANISM',
-    why: 'The expand_not_allowed response is emitted only inside `if (getAttachmentProxy())`, the same condition that installs the scrubber, so the claim holds wherever the message can be produced.',
-  },
   // Classified per sentence, not per message: each claim earns its own
   // justification, so a second sentence smuggled into an already-allowed
   // message still has to be looked at.
-  {
-    fragment: 'an uninstalled scrubber cannot keep that promise silently',
-    kind: 'OPERATOR',
-    why: 'response-scrubbing.ts throws this at install time, before any request is served, so it reaches the operator starting the server and never a tool result.',
-  },
   {
     fragment: 'Cannot install the attachment-proxy response scrubber',
     kind: 'OPERATOR',
@@ -128,16 +138,6 @@ const CLASSIFIED: Array<{
     fragment: '--attachment-host requires --attachment-port',
     kind: 'OPERATOR',
     why: 'The neighbouring startup throw in server.ts, refused for the same reason and equally unreachable from a tool call.',
-  },
-  {
-    fragment: 'so no tool returns raw bytes',
-    kind: 'MECHANISM',
-    why: 'installResponseScrubbing strips contentBytes and base64 over 4 KB from every result, and is installed on the same condition that registers read-document.',
-  },
-  {
-    fragment: 'nothing base64 ever enters this conversation',
-    kind: 'MECHANISM',
-    why: 'Same scrubber. read-document itself returns converted text, and the scrubber covers anything else that would carry document bytes.',
   },
   {
     fragment: 'The only out-of-band way to save mail attachments',
@@ -344,11 +344,15 @@ describe('absence claims in model-facing guidance', () => {
     // The expand_not_allowed refusal: a tool-result string on a branch no
     // description or instruction pass can produce.
     const expandGuard = literals.filter((surface) =>
-      surface.text.includes('This server runs with --attachment-proxy, where')
+      surface.text.includes(
+        'strips contentBytes fields and large base64 values out of tool results'
+      )
     );
     expect(expandGuard.length).toBeGreaterThan(0);
     expect(expandGuard[0].where).toMatch(/^graph-tools\.ts:\d+$/);
-    expect(emitted).not.toContain('This server runs with --attachment-proxy, where');
+    expect(emitted).not.toContain(
+      'strips contentBytes fields and large base64 values out of tool results'
+    );
 
     // And the sweep is looking at a real corpus, not an empty one.
     expect(literals.length).toBeGreaterThan(500);
@@ -418,6 +422,74 @@ describe('absence claims in model-facing guidance', () => {
     ] as Array<[string, string]>) {
       expect(text, `${where} must name the identity limit`).toContain('identity_not_supported');
       expect(text, `${where} must name the modes`).toMatch(/OAuth, OBO, or bearer mode/);
+    }
+  });
+
+  /*
+   * The scrubber's guarantee is narrower than "no tool returns raw bytes", and
+   * that sentence was classified MECHANISM on the strength of it -- a written
+   * justification for a false claim, which is worse than the unclassified claim
+   * it replaced.
+   *
+   * The premise, from this repo rather than from our deployment: graph-batch is
+   * a real tool (endpoints.json, POST /$batch, `scopes: []`, no `presets`), and
+   * proxy suppression only matches GET paths ending /$value
+   * (isProxySuppressedGraphTool), so nothing keeps it out of a proxy server that
+   * runs without a preset or filter. A batched GET of /me/messages/{id}/$value
+   * returns RFC 5322 source, which is text/plain and not wholly valid base64, so
+   * neither scrubber rule matches it while its attachments ride inline as base64
+   * -- documented at graph-tools.ts (isProxySuppressedGraphTool's docstring) and
+   * again at response-scrubbing.ts, which says the wrapper "cannot see into" it.
+   *
+   * So the text describes what the mechanism does instead of promising what
+   * cannot happen. Describing a mechanism is verifiable; promising an absence is
+   * the thing that has now failed repeatedly.
+   */
+  it('registers graph-batch under proxy mode with no filter, so the premise holds', () => {
+    const registered = resolveRegisteredToolNames({
+      orgMode: true,
+      httpMode: true,
+      attachmentProxy: true,
+    });
+    expect(registered.has('graph-batch')).toBe(true);
+    // And the suppression rule genuinely cannot reach it.
+    expect(isProxySuppressedGraphTool('post', '/$batch')).toBe(false);
+    expect(isProxySuppressedGraphTool('get', '/me/messages/{message-id}/$value')).toBe(true);
+  });
+
+  it('promises no byte-free tool result, and describes the scrubber instead', () => {
+    const readDocument = UTILITY_TOOLS.find((utility) => utility.name === 'read-document')!;
+    const instructions = buildMcpServerInstructions({
+      orgMode: true,
+      readOnly: false,
+      multiAccount: false,
+      discovery: false,
+      registeredTools: resolveRegisteredToolNames({
+        orgMode: true,
+        httpMode: true,
+        attachmentProxy: true,
+      }),
+    });
+
+    // Every copy of the over-promise, including the handler response.
+    const corpus = [
+      ['read-document description', readDocument.description],
+      ['PROXY_DOCUMENT_READ_GUIDANCE', PROXY_DOCUMENT_READ_GUIDANCE],
+      ['instructions', instructions],
+      ...literalStrings().map((s) => [s.where, s.text] as [string, string]),
+    ] as Array<[string, string]>;
+    for (const [where, text] of corpus) {
+      expect(text, `${where} promises byte-free results`).not.toMatch(/no tool returns raw bytes/i);
+      expect(text, `${where} promises no base64 anywhere`).not.toMatch(/nothing base64/i);
+    }
+
+    // Replaced by a description of what is actually stripped.
+    for (const [where, text] of [
+      ['PROXY_DOCUMENT_READ_GUIDANCE', PROXY_DOCUMENT_READ_GUIDANCE],
+      ['instructions', instructions],
+    ] as Array<[string, string]>) {
+      expect(text, `${where} must name the field`).toContain('contentBytes');
+      expect(text, `${where} must name the shape rule`).toMatch(/base64/);
     }
   });
 

@@ -198,8 +198,8 @@ export function installResponseScrubbing(server: McpServer): void {
   if (!original) {
     throw new Error(
       'Cannot install the attachment-proxy response scrubber: no tools/call handler is registered ' +
-        'on this MCP server. Refusing to continue -- --attachment-proxy promises that no tool ' +
-        'returns raw bytes, and an uninstalled scrubber cannot keep that promise silently.'
+        'on this MCP server. Refusing to continue -- --attachment-proxy undertakes to strip byte ' +
+        'payloads from tool results, and an uninstalled scrubber cannot keep that undertaking silently.'
     );
   }
 

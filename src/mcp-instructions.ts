@@ -66,8 +66,8 @@ function buildByteContentInstructions(registered: ReadonlySet<string>): string {
           'required), a raw message (/me/messages/{message-id}/$value), a drive or SharePoint file ' +
           '(/drives/{drive-id}/items/{driveItem-id}/content), or another authenticated /$value ' +
           'endpoint. Absolute URLs are not accepted, and pages, offset and maxChars read a long ' +
-          'document in parts. Byte payloads are stripped from every tool result here, so no tool ' +
-          'returns raw bytes to you. read-document mints a URL that is redeemed later with no ' +
+          'document in parts. Byte payloads are stripped from tool results here: any contentBytes field, ' +
+          'and any large base64 value. read-document mints a URL that is redeemed later with no ' +
           'Authorization header, so it refuses with identity_not_supported whenever Graph identity ' +
           "comes from the request (OAuth, OBO, or bearer mode) rather than from this server's own " +
           'token cache.',

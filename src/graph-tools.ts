@@ -1534,7 +1534,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       // @microsoft.graph.downloadUrl, and proxy scrubbing deliberately leaves
       // URLs intact. What is true, and mechanism-backed, is the sentence about
       // bytes -- the scrubber enforces that one.
-      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes — this server fetches the document itself and converts it out of band, so nothing base64 ever enters this conversation. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says, with one limit: it mints a URL that is redeemed later with no Authorization header, so whenever Graph identity comes from the request (OAuth, OBO, or bearer mode) rather than the server token cache it refuses with identity_not_supported. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes: this server fetches the document itself and converts it out of band, so no document bytes travel back through this tool. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says, with one limit: it mints a URL that is redeemed later with no Authorization header, so whenever Graph identity comes from the request (OAuth, OBO, or bearer mode) rather than the server token cache it refuses with identity_not_supported. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
     readOnlyHint: true,
     openWorldHint: true,
     proxyOnly: true,
@@ -1878,7 +1878,15 @@ export const PROXY_DOCUMENT_READ_GUIDANCE =
   // it is installed on the same condition that registers read-document. Saying
   // "or a download URL" here was false -- nothing strips URLs and get-drive-item
   // still returns @microsoft.graph.downloadUrl.
-  'Byte payloads are stripped from every tool result here, so no tool returns raw bytes. ' +
+  // Describes the mechanism rather than promising an absence. "No tool returns
+  // raw bytes" was false: proxy suppression only matches GET paths ending
+  // /$value, so graph-batch (POST /$batch, no presets) stays registered and can
+  // batch a GET of /me/messages/{id}/$value, whose RFC 5322 body is text/plain
+  // and not wholly valid base64 -- neither scrubber rule matches it while its
+  // attachments ride inline. See isProxySuppressedGraphTool's docstring and
+  // response-scrubbing.ts, which both already disclose that gap.
+  'Byte payloads are stripped from tool results here: any contentBytes field, and any large base64 ' +
+  'value. ' +
   // Same qualification the tool's own description and initialize.instructions
   // carry. This text is appended to Graph tool descriptions, so without it a
   // model reading list-mail-attachments is sent to a tool that answers
@@ -2228,8 +2236,9 @@ async function executeGraphTool(
               expand: blocked,
               message:
                 `Expanding "${blocked}" inlines the raw attachment bytes (base64 contentBytes) into this ` +
-                `response, and $select does not suppress them. This server runs with --attachment-proxy, where ` +
-                `no tool returns raw bytes. Call this tool again WITHOUT that expand value to get the message ` +
+                `response, and $select does not suppress them. This server runs with --attachment-proxy, which ` +
+                `strips contentBytes fields and large base64 values out of tool results. Call this tool again ` +
+                `WITHOUT that expand value to get the message ` +
                 `or event itself; use list-mail-attachments (or the matching list tool) for each attachment's ` +
                 `id, name, contentType and size; and use read-document with the attachment's $value path to ` +
                 `read its content as markdown.`,

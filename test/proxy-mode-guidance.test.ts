@@ -364,7 +364,7 @@ describe('guidance text under --attachment-proxy', () => {
     expect(tip).toContain('/$value');
     expect(tip).toContain('read-document');
     // ...and the replacement is stated once, not once per dropped sentence.
-    expect(tip.match(/Byte payloads are stripped from every tool result/g)).toHaveLength(1);
+    expect(tip.match(/Byte payloads are stripped from tool results here/g)).toHaveLength(1);
   });
 });
 
@@ -540,10 +540,12 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
     )!.text;
     expect(tip).not.toMatch(/download[-_]bytes/i);
     expect(tip).toContain('read-document');
-    // The replacement carries the same absence claim as the instructions, so it
-    // is held to the same standard: raw bytes yes (scrubber), download URL no.
+    // The replacement describes the scrubber rather than promising an absence:
+    // graph-batch can still return a text/plain RFC 5322 body with base64
+    // attachments inline, which neither scrubber rule matches.
     expect(tip).not.toMatch(/or a download URL/i);
-    expect(tip).toMatch(/raw bytes/i);
+    expect(tip).not.toMatch(/no tool returns raw bytes/i);
+    expect(tip).toContain('contentBytes');
   });
 
   /*
@@ -609,7 +611,7 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
    * URLs are NOT stripped, and get-drive-item still returns
    * @microsoft.graph.downloadUrl, so claiming none is available was false.
    */
-  it('claims no raw bytes under proxy mode but does not deny download URLs', () => {
+  it('describes what the scrubber strips and denies neither URLs nor batch reads', () => {
     const registeredTools = resolveRegisteredToolNames({
       orgMode: true,
       httpMode: true,
@@ -626,8 +628,11 @@ describe('guidance under --attachment-proxy combined with an --enabled-tools fil
       registeredTools,
     });
 
-    // Scrubber-backed, so it may be stated.
-    expect(instructions).toMatch(/raw bytes/i);
+    // What the mechanism does, which is checkable, rather than what cannot
+    // happen, which the scrubber does not actually guarantee.
+    expect(instructions).toContain('contentBytes');
+    expect(instructions).toMatch(/large base64 value/);
+    expect(instructions).not.toMatch(/no tool returns raw bytes/i);
     // Not scrubber-backed: get-drive-item hands the model a download URL.
     expect(instructions).not.toMatch(/or a download URL/i);
     expect(instructions).not.toMatch(/mints a download URL/i);
