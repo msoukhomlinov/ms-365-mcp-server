@@ -141,9 +141,10 @@ describe('fetchAllPages and @odata.count', () => {
     expect(parsed.value).toEqual([]);
   });
 
-  it('rewrites a stale count to the aggregate across pages', async () => {
-    // Graph counted before the last page landed: count (2) is smaller than the
-    // 3 items actually returned. The merged body must not contradict itself.
+  it('passes Graph’s count through unchanged when it differs from the aggregate', async () => {
+    // $count describes the filtered collection, not the items in `value`, so the
+    // merge must not "correct" it to the item tally. Every non-fetchAllPages
+    // response already reports a count larger than its own page.
     mockFetch = mockPages(
       { '@odata.count': 2, '@odata.nextLink': NEXT_1, value: [{ id: '1' }, { id: '2' }] },
       { '@odata.count': 2, value: [{ id: '3' }] }
@@ -159,12 +160,12 @@ describe('fetchAllPages and @odata.count', () => {
       '2',
       '3',
     ]);
-    expect(parsed['@odata.count']).toBe(3);
+    expect(parsed['@odata.count']).toBe(2);
     expect(parsed['@odata.nextLink']).toBeUndefined();
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
-  it('replaces a null count with the aggregate', async () => {
+  it('passes a null count through rather than inventing an aggregate', async () => {
     mockFetch = mockPages(
       { '@odata.count': null, '@odata.nextLink': NEXT_1, value: [{ id: '1' }] },
       { value: [{ id: '2' }] }
@@ -175,7 +176,27 @@ describe('fetchAllPages and @odata.count', () => {
       fetchAllPages: true,
     });
 
-    expect(parsed['@odata.count']).toBe(2);
+    expect(parsed['@odata.count']).toBeNull();
+  });
+
+  it('keeps the pre-skip count when the request started after a $skip', async () => {
+    // $skip=20 over a 100-item collection: Graph reports 100, the merge collects
+    // the 80 remaining items. Rewriting the count to the tally would destroy the
+    // collection size the caller asked for.
+    mockFetch = mockPages(
+      { '@odata.count': 100, '@odata.nextLink': NEXT_1, value: [{ id: '1' }, { id: '2' }] },
+      { '@odata.count': 100, value: [{ id: '3' }] }
+    );
+
+    const parsed = await callAndParse(handlerFor('list-mail-messages'), {
+      count: true,
+      skip: 20,
+      fetchAllPages: true,
+    });
+
+    expect(String(mockFetch.mock.calls[0][0])).toContain('skip=20');
+    expect((parsed.value as unknown[]).length).toBe(3);
+    expect(parsed['@odata.count']).toBe(100);
   });
 
   it('does not invent a count the caller never requested', async () => {
