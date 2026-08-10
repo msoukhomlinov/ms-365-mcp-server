@@ -65,8 +65,24 @@ export interface ConvertRequest {
 }
 
 export type ConvertResult =
-  | { ok: true; markdown: string }
+  | { ok: true; markdown: string; contentStatus?: string }
   | { ok: false; code: string; message: string };
+
+/**
+ * The converter's own word for what it produced, when it offers one.
+ *
+ * A conversion can succeed and still yield no text: a scanned PDF has no text
+ * layer to extract, and a blank document has no text at all. Both arrive here
+ * as a success carrying `markdown: ""`, which is the one answer a model cannot
+ * act on -- it reads as a bug, so the model retries, varies `pages`, or calls
+ * the document blank. The converter distinguishes the cases in an OPTIONAL
+ * `content_status` field, so it is carried verbatim rather than interpreted:
+ * this module owns the transport, and the vocabulary belongs to whatever
+ * implements the contract. A status this server has no wording for still
+ * reaches the caller as a stated reason, which is what keeps a future
+ * converter's new status (a failed OCR pass, say) from regressing to silence.
+ */
+const CONTENT_STATUS_FIELD = 'content_status';
 
 /**
  * camelCase in, snake_case out.
@@ -282,6 +298,13 @@ export function interpretJsonRpcMessage(message: unknown, status: number): Conve
       code: 'proxy_error',
       message: `the proxy answered ${status} with a result carrying no markdown field`,
     };
+  }
+  const contentStatus = payload?.[CONTENT_STATUS_FIELD];
+  // Present-and-non-empty only: an absent field and an empty one both mean the
+  // converter said nothing, and `contentStatus: ''` downstream would read as a
+  // reason that is somehow blank.
+  if (typeof contentStatus === 'string' && contentStatus !== '') {
+    return { ok: true, markdown, contentStatus };
   }
   return { ok: true, markdown };
 }

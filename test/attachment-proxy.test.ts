@@ -17,7 +17,16 @@ vi.mock('../src/logger.js', () => ({
  * real one.
  */
 
-/** A success payload shaped like the real tool's return value. */
+/**
+ * A success payload shaped like the real tool's return value.
+ *
+ * `content_status` is carried through to `ConvertResult.contentStatus`
+ * verbatim, which is why every success assertion below expects it: the field is
+ * the converter's own word for what it produced, and the one case it has to
+ * survive for is a success carrying `markdown: ""` -- see
+ * `attachment-proxy-no-text.test.ts`. Interpreting `'ok'` here would mean this
+ * module knowing one implementation's vocabulary, which the contract refuses.
+ */
 function convertPayload(markdown: string) {
   return {
     markdown,
@@ -84,6 +93,7 @@ describe('AttachmentProxyClient.convertToMarkdown', () => {
     expect(await client.convertToMarkdown({ uri: 'http://m365:3001/attachment?t=abc' })).toEqual({
       ok: true,
       markdown: '# Invoice\n\nTotal: $12',
+      contentStatus: 'ok',
     });
   });
 
@@ -94,6 +104,7 @@ describe('AttachmentProxyClient.convertToMarkdown', () => {
     expect(await client.convertToMarkdown({ uri: 'http://m365:3001/attachment?t=abc' })).toEqual({
       ok: true,
       markdown: '# Invoice',
+      contentStatus: 'ok',
     });
   });
 
@@ -175,6 +186,7 @@ describe('AttachmentProxyClient.convertToMarkdown', () => {
     expect(await client.convertToMarkdown({ uri: 'http://m365:3001/attachment?t=abc' })).toEqual({
       ok: true,
       markdown: '# Correct',
+      contentStatus: 'ok',
     });
   });
 });
@@ -431,6 +443,7 @@ describe('AttachmentProxyClient transport failures', () => {
       expect(await client.convertToMarkdown({ uri: 'u' })).toEqual({
         ok: true,
         markdown: '# quick',
+        contentStatus: 'ok',
       });
       // A timer still pending here would keep a 60 s handle alive per call.
       expect(vi.getTimerCount()).toBe(0);
