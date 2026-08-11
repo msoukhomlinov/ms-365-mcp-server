@@ -1,6 +1,16 @@
 /**
- * The choke point that makes "no tool returns raw bytes" a property of the
- * server rather than of a list of tools.
+ * The choke point that applies the byte rule of `scrubByteFields` to every
+ * `tools/call` result on its way out, instead of tool by tool. What that makes a
+ * property of this wrapper is its *reach*: no tool has to opt in, and a tool
+ * added tomorrow is covered without anyone editing a list. It does not make the
+ * rule itself complete -- see **Coverage** below.
+ *
+ * This used to open by claiming it made "no tool returns raw bytes" a property
+ * of the server. That guarantee was withdrawn in 3025efe (PR #19) as false; the
+ * reasoning is recorded above `CLASSIFIED` in `test/absence-claims.test.ts`. The
+ * Coverage note below was already the accurate account of the same file, so the
+ * opening sentence was not merely incomplete -- it asserted what the rest of
+ * this comment goes on to refute.
  *
  * Modelled on `normalize-tool-schema.ts`, which decorates `tools/list` the same
  * way, with one deliberate difference: that one falls back to a no-op and a
@@ -30,8 +40,13 @@
  *   - `graph-batch` accepts arbitrary sub-requests and can smuggle a GET
  *     against a suppressed path; that is a general bypass tracked separately,
  *     not something this wrapper can see into.
- *   - RFC 5322 MIME content (`get-mail-message-mime`-style) is text/plain, not
- *     base64, so this rule cannot match it -- that tool is suppressed instead.
+ *   - A non-JSON text body is not base64, so this rule cannot match it. It
+ *     arrives under `rawResponse` rather than `contentBytes`, which rule 1 does
+ *     not name either. `get-mail-message-mime` is the RFC 5322 case and is
+ *     suppressed instead, but suppression is GET plus a path ending `/$value`,
+ *     and `get-meeting-transcript-content` (`text/vtt`) and
+ *     `get-onenote-page-content` end in `/content` -- so they stay registered in
+ *     proxy mode with neither rule reaching their bodies.
  *   - A minted ticket URL is neither `contentBytes` nor long base64, so this
  *     rule cannot match it either; `redactAttachmentSecrets` handles that.
  *   - A tool result that is not an object at all -- no `content` or
