@@ -17,12 +17,15 @@ import { api as betaApi } from './generated/client-beta.js';
 import { api } from './generated/client.js';
 import GraphClient from './graph-client.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
+import { getAttachmentProxy } from './lib/attachment-proxy-runtime.js';
 import { MAX_UPLOAD_BYTES } from './attachment-route.js';
 import {
   buildAttachmentUrl,
   type DownloadProbe,
   isPlainGraphPath,
   isUnalteredGraphPath,
+  MAX_REDEMPTIONS,
+  TICKET_PARAM,
   TicketStoreFullError,
 } from './lib/attachment-tickets.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
@@ -874,6 +877,13 @@ interface UtilityTool {
   // When true, this tool writes to the server's local filesystem and is only
   // registered in stdio mode, or over HTTP with --http-local-file-tools.
   stdioOnly?: boolean;
+  // Registered ONLY under --attachment-proxy. Without a configured proxy the tool has nothing
+  // to call, so registering it would advertise a capability that answers an error to every call.
+  proxyOnly?: boolean;
+  // Puts raw resource bytes into the model's context, so NOT registered under
+  // --attachment-proxy. download-bytes-to-file is deliberately unmarked: its bytes go to a
+  // local file and never to the model.
+  bytesToModel?: boolean;
 }
 
 interface DisabledToolScope {
@@ -919,6 +929,7 @@ function collectDeniedToolPolicies(options: {
   enabledToolsRegex?: RegExp;
   allowedScopesValue?: string;
   httpMode: boolean;
+  attachmentProxy?: boolean;
 }): Map<string, DeniedToolPolicy> {
   const deniedTools = new Map<string, DeniedToolPolicy>();
   const allowedScopes = parseAllowedScopes(options.allowedScopesValue);
@@ -926,6 +937,13 @@ function collectDeniedToolPolicies(options: {
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
     if (!options.orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+      continue;
+    }
+
+    if (
+      options.attachmentProxy &&
+      isProxySuppressedGraphTool(tool.method, endpointConfig?.pathPattern)
+    ) {
       continue;
     }
 
@@ -960,6 +978,8 @@ function collectDeniedToolPolicies(options: {
   for (const utility of UTILITY_TOOLS) {
     if (options.readOnly && !utility.readOnlyHint) continue;
     if (options.httpMode && utility.stdioOnly) continue;
+    if (options.attachmentProxy && utility.bytesToModel) continue;
+    if (!options.attachmentProxy && utility.proxyOnly) continue;
     if (options.enabledToolsRegex && !options.enabledToolsRegex.test(utility.name)) {
       deniedTools.set(utility.name, {
         toolName: utility.name,
@@ -1304,6 +1324,213 @@ export async function mintDownloadUrl(
   };
 }
 
+// What read-document will mint for. A single pass over the raw target is enough because
+// isPlainGraphPath already guarantees that parsing the target changes nothing, so the path
+// that is matched here is the path that gets fetched.
+//
+// Narrower than get-download-url on purpose: read-document takes bytes endpoints only. A mail
+// or event attachment must end in /$value (the attachment resource itself is JSON carrying
+// base64 contentBytes, which would stream out through the redemption route unscrubbed), a
+// recording must end in /content, and a drive or SharePoint item must name its /content.
+const READ_DOCUMENT_TARGET_PATTERNS: readonly RegExp[] = [
+  /^\/drives\/[^/]+\/items\/[^/]+\/content$/,
+  /^\/(?:me|users\/[^/]+|groups\/[^/]+|sites\/[^/]+)\/drive\/items\/[^/]+\/content$/,
+  /^\/(?:groups\/[^/]+|sites\/[^/]+)\/drives\/[^/]+\/items\/[^/]+\/content$/,
+  /^\/drives\/[^/]+\/root:\/.+:\/content$/,
+  /^\/(?:me|users\/[^/]+|groups\/[^/]+|sites\/[^/]+)\/drive\/root:\/.+:\/content$/,
+  /^\/(?:groups\/[^/]+|sites\/[^/]+)\/drives\/[^/]+\/root:\/.+:\/content$/,
+  /^(?:\/me|\/users\/[^/]+)\/onlineMeetings\/[^/]+\/recordings\/[^/]+\/content$/,
+  /^\/communications\/calls\/[^/]+\/recordings\/[^/]+\/content$/,
+  /\/\$value$/,
+];
+
+/**
+ * The path read-document would mint for, or null when `target` is not a Graph byte resource it
+ * can mint for.
+ *
+ * A raw space or non-ASCII letter (a OneDrive file called "Q3 résumé.docx" addressed by
+ * `root:/...:/content`) is not a plain path as the mint gate defines it, because URL parsing
+ * rewrites it. Rather than refuse the most common kind of document name, the parser's own
+ * rewrite is applied up front: `isUnalteredGraphPath` confirms parsing changes the spelling and
+ * nothing else (a fragment, a dot segment or a backslash would change the meaning and fail it),
+ * and the percent-encoded form it yields is what the request would have been sent as anyway.
+ */
+function normalizeMintTarget(target: string): string | null {
+  let candidate = target;
+  if (
+    !isPlainGraphPath(candidate) &&
+    candidate.startsWith('/') &&
+    isUnalteredGraphPath(candidate)
+  ) {
+    candidate = new URL(`https://graph.invalid/v1.0${candidate}`).pathname.slice('/v1.0'.length);
+  }
+  return isPlainGraphPath(candidate) && READ_DOCUMENT_TARGET_PATTERNS.some((p) => p.test(candidate))
+    ? candidate
+    : null;
+}
+
+/** Whether `target` is a Graph byte resource read-document can mint a ticket for. */
+export function isMintableTarget(target: string): boolean {
+  return normalizeMintTarget(target) !== null;
+}
+
+/** The three facts every read-document failure carries, known or not. */
+interface AttachmentFacts {
+  name: string | null;
+  contentType: string | null;
+  size: number | null;
+}
+
+const UNKNOWN_ATTACHMENT: AttachmentFacts = { name: null, contentType: null, size: null };
+
+/** Fixed text standing in for a redacted ticket URL or ticket id. */
+const REDACTED_ATTACHMENT_URL = '<attachment url redacted>';
+
+/**
+ * Strip a minted ticket's live credential out of proxy-supplied text before any of it can
+ * reach the model.
+ *
+ * The proxy is handed the ticket URL as its `uri` argument, and a converter's error text
+ * ordinarily echoes back the address it failed to fetch ("could not reach <uri>: 404").
+ * Whatever the proxy returns in `message` (or, in principle, `markdown`) would otherwise
+ * reach the caller verbatim, putting a live redeemable URL in the model's context.
+ *
+ * The full URL is stripped first so a clean echo collapses to one placeholder, then the bare
+ * ticket id, because the id is the actual credential: the redemption route authorises on `t`
+ * alone. Matching the id as a bare substring also catches a URL echoed truncated,
+ * percent-encoded or with its query reordered, since an id is entirely within
+ * `[A-Za-z0-9_-]` and survives all of those unchanged.
+ */
+function redactAttachmentSecrets(text: string, ticketId: string, ticketUrl: string): string {
+  return text
+    .split(ticketUrl)
+    .join(REDACTED_ATTACHMENT_URL)
+    .split(ticketId)
+    .join(REDACTED_ATTACHMENT_URL);
+}
+
+/**
+ * One error shape for every read-document failure.
+ *
+ * `name`/`contentType`/`size` are always present, null included. An agent that cannot read
+ * a document can still tell the user what it saw -- "a 195 KB PDF called report.pdf that the
+ * converter refused" is an answer; "an error" is not. Present-and-null rather than omitted,
+ * because an absent key reads to a model as "not applicable" instead of "not known".
+ */
+function readDocumentError(
+  code: string,
+  message: string,
+  attachment: AttachmentFacts,
+  proxyCode?: string,
+  contentStatus?: string
+): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          error: code,
+          ...(proxyCode ? { proxyCode } : {}),
+          ...(contentStatus ? { contentStatus } : {}),
+          message,
+          name: attachment.name,
+          contentType: attachment.contentType,
+          size: attachment.size,
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * Why a successful conversion produced nothing, in a sentence.
+ *
+ * The two statuses spelled out are the ones a caller can act on differently -- a scan is a
+ * document whose text exists but is unreachable without OCR, a blank document has no text to
+ * reach. Every other status, including one that does not exist yet, is reported verbatim
+ * rather than flattened, so a converter that grows a new status reaches the agent as a stated
+ * reason with no edit here.
+ */
+function describeEmptyConversion(contentStatus?: string): string {
+  if (contentStatus === 'no_text_layer') {
+    return (
+      'The converter reports that this document has no text layer to extract — typically a scan ' +
+      'or an image-only PDF. That status describes the document rather than the read, so the same ' +
+      'read reports it again. Report it as a document whose text could not be extracted, not as a ' +
+      'blank one.'
+    );
+  }
+  if (contentStatus === 'empty_document') {
+    return 'The document converted successfully and contains no text. It is empty, not unreadable.';
+  }
+  if (contentStatus) {
+    return (
+      `The converter extracted no text and reported status ${contentStatus}. Treat it as a ` +
+      `document that could not be read rather than an empty one, and report that status as the reason.`
+    );
+  }
+  return (
+    'The converter extracted no text and gave no reason for it. Report that the document could ' +
+    'not be read rather than describing it as empty.'
+  );
+}
+
+/**
+ * Error codes this server promises. Anything else the proxy says is surfaced as `proxy_error`
+ * with the proxy's own code beside it, unaltered: the contract names a code, not a code list,
+ * and flattening an unrecognised one into `conversion_failed` would state a vocabulary this
+ * server does not own and erase the only string an operator could search the proxy's source for.
+ */
+const CONTRACT_ERROR_CODES = new Set([
+  'unsupported_format',
+  'too_large',
+  'password_required',
+  'conversion_failed',
+  'fetch_failed',
+  'proxy_unreachable',
+  'invalid_target',
+  'no_capacity',
+  // Server-origin, like invalid_target and no_capacity: raised when the proxy succeeded and
+  // the document had no text to give. Its sibling scopes the same emptiness to a requested
+  // slice, claiming nothing about the document.
+  'no_text_content',
+  'no_text_in_selection',
+]);
+
+/**
+ * `name`/`contentType`/`size` for a mail or event attachment, from Graph's own metadata, for
+ * the failure envelope only. Read after a failure rather than before minting, so a successful
+ * read costs no extra Graph call.
+ *
+ * Only for mail and event attachments ending in `/$value`: those are the only resources
+ * carrying all three base fields, and asking a message or a photo for
+ * `$select=name,contentType,size` is a guaranteed 400. Values are used exactly as Graph states
+ * them, with no inference. Every failure is swallowed into `UNKNOWN_ATTACHMENT`: this runs on
+ * a path where the caller already holds a real error that a second one would only obscure.
+ */
+async function probeAttachmentFacts(
+  target: string,
+  graphClient: Pick<GraphClient, 'makeRequest'>,
+  accessToken: string | undefined
+): Promise<AttachmentFacts> {
+  if (!MAIL_EVENT_ATTACHMENT_VALUE.test(target)) return UNKNOWN_ATTACHMENT;
+  try {
+    const meta = (await graphClient.makeRequest(
+      `${target.slice(0, -'/$value'.length)}?$select=name,contentType,size`,
+      { accessToken }
+    )) as Record<string, unknown> | null;
+    if (!meta || typeof meta !== 'object') return UNKNOWN_ATTACHMENT;
+    return {
+      name: typeof meta.name === 'string' ? meta.name : null,
+      size: typeof meta.size === 'number' ? meta.size : null,
+      contentType: typeof meta.contentType === 'string' ? meta.contentType : null,
+    };
+  } catch {
+    return UNKNOWN_ATTACHMENT;
+  }
+}
+
 export const UTILITY_TOOLS: readonly UtilityTool[] = [
   {
     name: 'get-upload-url',
@@ -1402,6 +1629,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
     readOnlyHint: true,
     openWorldHint: true,
+    bytesToModel: true,
     buildSchema: (ctx) => {
       const schema: Record<string, z.ZodTypeAny> = {
         target: z
@@ -1673,6 +1901,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       'Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content that exposes one (drive/SharePoint file content). The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. Returns { downloadUrl, name?, size?, contentType? }. Mail file attachments (/messages/{id}/attachments/{id}/$value), meeting recordings and other $value byte endpoints have no pre-authenticated URL from Graph itself, but call this tool for them anyway: a server running with --enable-attachment-urls mints its own single-use URL for them, and one without it answers with the reason and points at download-bytes.',
     readOnlyHint: true,
     openWorldHint: true,
+    bytesToModel: true,
     buildSchema: (ctx) => {
       const schema: Record<string, z.ZodTypeAny> = {
         target: z
@@ -1953,7 +2182,342 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
     },
   },
+  {
+    name: 'read-document',
+    method: 'POST',
+    path: 'tool:read-document',
+    searchKeywords:
+      'read attachment read document convert to markdown pdf docx xlsx pptx eml msg extract text from attachment open attachment',
+    description:
+      'Read any Microsoft 365 document as markdown: mail and event attachments, OneDrive and SharePoint files, and raw message MIME. Give it the Graph byte path (list-mail-attachments returns the ids) and it returns text, never bytes: this server fetches the document itself and converts it out of band, so no document bytes travel back through this tool. Supports paging via pages/offset/maxChars for long documents. Reach for it whenever you need what a Microsoft 365 document says, with one limit: it mints a URL that is redeemed later with no Authorization header, so whenever Graph identity comes from the request (OAuth, OBO, or bearer mode) rather than the server token cache it refuses with identity_not_supported. For anything OUTSIDE Microsoft 365 — a public web URL, a link found in an email body — use the document converter tool directly instead.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    proxyOnly: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Relative Microsoft Graph byte path starting with "/". ' +
+              '/me/messages/{message-id}/attachments/{attachment-id}/$value (mail attachment; list-mail-attachments returns the ids); ' +
+              '/me/events/{event-id}/attachments/{attachment-id}/$value (event attachment); ' +
+              '/me/messages/{message-id}/$value (the whole message as RFC 5322 source); ' +
+              '/drives/{drive-id}/items/{driveItem-id}/content (drive or SharePoint file). ' +
+              'Absolute URLs are not accepted.'
+          ),
+        pages: z
+          .string()
+          .optional()
+          .describe(
+            'Page selection for paged formats, e.g. "1-5" or "2,4,9". Omit for the whole document.'
+          ),
+        offset: z
+          .number()
+          .optional()
+          .describe('Character offset to resume from, for continuing a long read.'),
+        maxChars: z
+          .number()
+          .optional()
+          .describe('Maximum characters of markdown to return in this call.'),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, ctx) => {
+      const target = params.target;
+      if (typeof target !== 'string' || target.length === 0) {
+        return readDocumentError(
+          'invalid_target',
+          'target is required and must be a non-empty relative Microsoft Graph path starting with "/".',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      const proxy = getAttachmentProxy();
+      const minting = getAttachmentMinting();
+      if (!proxy || !minting) {
+        return readDocumentError(
+          'proxy_unreachable',
+          'This server has no document proxy configured, so no document can be read. It must be started with --attachment-proxy and --http.',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      // A ticket grants an authenticated GET of exactly one Graph path with this server's own
+      // token, so the set of paths a ticket can name is the whole of what the capability is
+      // worth. `isMintableTarget` is that gate.
+      const mintTarget = normalizeMintTarget(target);
+      if (mintTarget === null) {
+        return readDocumentError(
+          'invalid_target',
+          `target must be a plain relative Microsoft Graph byte path this server can mint for: a mail or event attachment ` +
+            `(/me/messages/{message-id}/attachments/{attachment-id}/$value), a drive or SharePoint file content path ` +
+            `(/drives/{drive-id}/items/{driveItem-id}/content), a meeting recording content path, or any other ` +
+            `authenticated /$value endpoint (/me/messages/{message-id}/$value for the raw message). Absolute URLs, ` +
+            `query strings, fragments and dot segments are not accepted. Got ${JSON.stringify(target)}.`,
+          UNKNOWN_ATTACHMENT
+        );
+      }
+      const restrictedTarget = userProfilePassthroughError(mintTarget, ctx.userFields);
+      if (restrictedTarget) return restrictedTarget;
+
+      const accountParam = params.account as string | undefined;
+
+      // The identity guard get-download-url carries, restated because read-document mints
+      // too. Both halves matter: isOAuthModeEnabled() is false in plain bearer mode and in
+      // --obo, both of which still run inside a request context holding the CALLER's token,
+      // while a redeemed ticket is fetched with the SERVER's. read-document refuses these
+      // modes outright rather than minting a ticket that carries the caller's token.
+      if (ctx.authManager?.isOAuthModeEnabled() || getRequestTokens()) {
+        return readDocumentError(
+          'identity_not_supported',
+          'read-document is unavailable when Graph identity comes from the request (OAuth, OBO, or bearer mode): the minted URL is redeemed later with no Authorization header, so the document would be fetched as a different identity than the one that asked for it.',
+          UNKNOWN_ATTACHMENT
+        );
+      }
+
+      const accountModeError = await checkAccountParamInBearerMode(accountParam, ctx.authManager);
+      if (accountModeError) {
+        return readDocumentError('identity_not_supported', accountModeError, UNKNOWN_ATTACHMENT);
+      }
+
+      // Exactly one retry: two attempts, numbered for the warn line below.
+      const MAX_ATTEMPTS = 2;
+
+      /**
+       * One attempt: one FRESH mint, one conversion.
+       *
+       * Fresh per attempt, not per call. A failed fetch still spends a redemption and the
+       * proxy may have spent more than one before failing, so a retry on the same ticket can
+       * meet a 404 that has nothing to do with why the first attempt failed.
+       *
+       * Redaction happens per attempt, against THIS attempt's own ticket id and URL: a retry
+       * mints a different ticket, and redacting only the last one would leave the first
+       * attempt's id exposed in a message that attempt produced.
+       */
+      const attempt = async (
+        attemptNumber: number
+      ): Promise<
+        | { ok: true; markdown: string; contentStatus?: string }
+        | { ok: false; code: string; message: string }
+      > => {
+        const minted = await mintDownloadUrl(mintTarget, accountParam, ctx.authManager, {
+          maxRedemptions: MAX_REDEMPTIONS,
+          probeWith: ctx.graphClient,
+        });
+        const first = minted?.content?.[0];
+        const mintedText = first?.type === 'text' ? first.text : '';
+        let ticketUrl: string | undefined;
+        let mintError: string | undefined;
+        try {
+          const parsed = JSON.parse(mintedText) as { downloadUrl?: string; error?: string };
+          ticketUrl = parsed.downloadUrl;
+          mintError = parsed.error;
+        } catch {
+          // fall through to the generic message
+        }
+        if (!minted || minted.isError || !ticketUrl) {
+          const message = mintError ?? 'Could not mint a download URL for this document.';
+          return {
+            ok: false,
+            code: /^No ticket slots available/.test(message) ? 'no_capacity' : 'invalid_target',
+            message,
+          };
+        }
+        const ticketId = new URL(ticketUrl).searchParams.get(TICKET_PARAM) ?? ticketUrl;
+        const startedAtMs = Date.now();
+        const outcome = await proxy.client.convertToMarkdown({
+          uri: ticketUrl,
+          ...(typeof params.pages === 'string' ? { pages: params.pages } : {}),
+          ...(typeof params.offset === 'number' ? { offset: params.offset } : {}),
+          ...(typeof params.maxChars === 'number' ? { maxChars: params.maxChars } : {}),
+        });
+        if (!outcome.ok && outcome.code === 'proxy_unreachable') {
+          // The ONE warn for this failure, deliberately not duplicated by the client
+          // (`AttachmentProxyClient` logs the same condition at debug). Only this layer knows
+          // the attempt number, and "attempt 1 of 2" versus "still unreachable after retry" is
+          // what tells an operator a blip from a wedge.
+          const attemptNote =
+            attemptNumber >= MAX_ATTEMPTS
+              ? `attempt ${attemptNumber} of ${MAX_ATTEMPTS}, still unreachable after retry`
+              : `attempt ${attemptNumber} of ${MAX_ATTEMPTS}`;
+          logger.warn(
+            `Attachment proxy unreachable (${attemptNote}): ${proxy.url} did not answer after ` +
+              `${Date.now() - startedAtMs}ms (${outcome.message})`
+          );
+        }
+        // Redacted on both branches: the proxy was handed the live ticket URL and nothing
+        // stops it echoing that URL, or just the id, inside a converted document or an error
+        // message. `outcome.code` is redacted too, defensively: today it is always a contract
+        // code or the literal 'proxy_error', so this is a no-op on the current contract.
+        if (outcome.ok) {
+          return {
+            ok: true,
+            markdown: redactAttachmentSecrets(outcome.markdown, ticketId, ticketUrl),
+            ...(outcome.contentStatus
+              ? {
+                  contentStatus: redactAttachmentSecrets(
+                    outcome.contentStatus,
+                    ticketId,
+                    ticketUrl
+                  ),
+                }
+              : {}),
+          };
+        }
+        return {
+          ok: false,
+          code: redactAttachmentSecrets(outcome.code, ticketId, ticketUrl),
+          message: redactAttachmentSecrets(outcome.message, ticketId, ticketUrl),
+        };
+      };
+
+      let outcome = await attempt(1);
+      // Only for the transport class. A proxy that ANSWERED (too_large, password_required, ...)
+      // will answer the same way again, so retrying would double the conversion cost for no
+      // new information; a connection that never landed might.
+      if (!outcome.ok && outcome.code === 'proxy_unreachable') {
+        outcome = await attempt(2);
+      }
+
+      // Probed only when there is a failure to describe, and with the server's own token:
+      // identity here always comes from the token cache, the guard above refused every other
+      // mode.
+      const failureFacts = async (): Promise<AttachmentFacts> => {
+        let accessToken: string | undefined;
+        try {
+          accessToken = await ctx.authManager?.getTokenForAccount(accountParam);
+        } catch {
+          accessToken = undefined;
+        }
+        return probeAttachmentFacts(mintTarget, ctx.graphClient, accessToken);
+      };
+
+      if (outcome.ok) {
+        // A success with nothing in it is reported as a failure to read, not as a read that
+        // returned nothing. The proxy did its job; the document has no text to hand over, and
+        // an empty string cannot say so -- it is indistinguishable from a bug, so a model
+        // retries it, varies the paging arguments, or tells the user the document is blank.
+        // Trimmed rather than length-checked: a lone newline is no more text than "".
+        if (outcome.markdown.trim() === '') {
+          // `content_status` is the converter describing the DOCUMENT, so it survives slicing
+          // untouched. An empty RESULT only describes the document when nothing was sliced
+          // away: `pages` and `offset` are advertised continuation parameters, so a caller
+          // that already read pages 1-4 can legitimately ask for a blank page 5, and answering
+          // that with "the document is empty or unreadable" contradicts text already held.
+          // offset 0 selects nothing away, and maxChars truncates from the start rather than
+          // selecting a position, so neither makes a read sliced.
+          const sliced =
+            typeof params.pages === 'string' ||
+            (typeof params.offset === 'number' && params.offset > 0);
+          if (sliced && !outcome.contentStatus) {
+            return readDocumentError(
+              'no_text_in_selection',
+              'The pages or offset you asked for hold no text. That is a statement about the ' +
+                'requested slice only: text you already read from earlier pages or offsets still ' +
+                'stands, and the selection is most likely past the end. Stop paging here rather ' +
+                'than reporting the document as empty or unreadable.',
+              await failureFacts()
+            );
+          }
+          return readDocumentError(
+            'no_text_content',
+            describeEmptyConversion(outcome.contentStatus),
+            await failureFacts(),
+            undefined,
+            outcome.contentStatus
+          );
+        }
+        return { content: [{ type: 'text', text: outcome.markdown }] };
+      }
+
+      const known = CONTRACT_ERROR_CODES.has(outcome.code);
+      return readDocumentError(
+        known ? outcome.code : 'proxy_error',
+        outcome.message,
+        await failureFacts(),
+        known ? undefined : outcome.code
+      );
+    },
+  },
 ];
+
+/**
+ * Is this a GET whose Graph path ends in `/$value`?
+ *
+ * Narrower than "does this tool return raw bytes to the model", deliberately; do not read that
+ * broader claim off this function. `/$value` is Graph's own spelling for "the raw representation
+ * of this resource", so a GET ending there returns bytes by construction, and a rule over that
+ * shape covers an endpoint added later with no edit here. Today it selects
+ * `get-mail-message-mime`; the only other `$value` endpoint in endpoints.json is a PUT
+ * (upload-my-profile-photo), which writes bytes rather than returning them.
+ *
+ * It does NOT cover every raw-byte read this server exposes. Known gaps:
+ *  - `graph-batch` (POST `/$batch`) accepts arbitrary sub-requests and can batch a GET of a
+ *    suppressed `/$value` path, returning the same bytes this function keeps out.
+ *  - `get-meeting-recording-content`, `get-meeting-transcript-content` and the OneNote page
+ *    content tools are raw reads whose paths do not end in `/$value`.
+ *
+ * get-mail-message-mime cannot be left to the response scrubber: it declares
+ * `acceptType: "text/plain"` and returns RFC 5322 source, not base64, so neither scrubber rule
+ * matches while every attachment rides inline.
+ */
+export function isProxySuppressedGraphTool(
+  method: string,
+  pathPattern: string | undefined
+): boolean {
+  return method.toUpperCase() === 'GET' && /\/\$value$/.test(pathPattern ?? '');
+}
+
+/** Every gate that can keep a utility tool out of the registered set. */
+export interface UtilityToolGates {
+  readOnly?: boolean;
+  httpMode?: boolean;
+  /** Raw --enabled-tools / --preset pattern. An uncompilable pattern is ignored, as at registration. */
+  enabledTools?: string;
+  /** --attachment-proxy: byte-returning tools out, read-document in. */
+  attachmentProxy?: boolean;
+}
+
+function compileToolFilter(pattern?: string): RegExp | undefined {
+  if (!pattern) return undefined;
+  try {
+    return new RegExp(pattern, 'i');
+  } catch {
+    // Registration logs and then ignores an invalid pattern, exposing everything. Mirror that
+    // here so a predicate built from these gates can never disagree with what registers.
+    return undefined;
+  }
+}
+
+/**
+ * The single definition of which utility tools a given configuration registers. Both
+ * registration paths (registerGraphTools and registerDiscoveryTools) select through this, and
+ * so does the startup check that warns when a flag is on but the only tool that can act on it
+ * was filtered away: duplicating these conditions is how that warning drifts from the server.
+ */
+export function selectUtilityTools(gates: UtilityToolGates): UtilityTool[] {
+  const enabledToolsRegex = compileToolFilter(gates.enabledTools);
+  return UTILITY_TOOLS.filter((utility) => {
+    if (gates.readOnly && !utility.readOnlyHint) return false;
+    if (gates.httpMode && utility.stdioOnly) return false;
+    if (gates.attachmentProxy && utility.bytesToModel) return false;
+    if (!gates.attachmentProxy && utility.proxyOnly) return false;
+    if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) return false;
+    return true;
+  });
+}
+
+export function utilityToolWillRegister(name: string, gates: UtilityToolGates): boolean {
+  return selectUtilityTools(gates).some((utility) => utility.name === name);
+}
 
 function registerUtilityToolWithMcp(
   server: McpServer,
@@ -2169,6 +2733,107 @@ function unalteredTargetError(target: string) {
   };
 }
 
+/**
+ * Navigation properties whose expansion inlines base64 content into the parent resource.
+ *
+ * Property NAMES, not (tool, property) pairs. The same navigation property is expandable from
+ * every tool that reaches the same entity -- get-mail-message, list-mail-messages, the delta
+ * tools, execute-tool -- so a pair list would have to be re-derived every time an endpoint is
+ * added, and would be wrong the first time one was missed.
+ *
+ * Known gap: `graph-batch` (POST `/$batch`) accepts arbitrary sub-request URLs, e.g.
+ * `{ url: "/me/messages/{id}?$expand=attachments" }`, and this guard only inspects the
+ * top-level `expand`/`$expand` parameters `findByteInliningExpand` is handed, so a batch payload
+ * can smuggle the same byte-inlining expand. Suppressing a general-purpose batch tool is a
+ * capability decision, not a class-rule fix; see the same gap on `isProxySuppressedGraphTool`.
+ */
+const BYTE_INLINING_NAV_PROPERTIES = new Set(['attachments', 'hostedcontents']);
+
+/**
+ * Every occurrence of `expand=` (with or without a leading `$`, any casing) inside `text`,
+ * together with the value that follows it up to the matching unbalanced `)` or the end of the
+ * string.
+ *
+ * OData nests a sub-resource's own query options inside `(...)` after the navigation property,
+ * e.g. `instances($expand=attachments)` for a recurring event's expanded instances. Its head is
+ * `instances`, so `attachments` living inside the parens is never seen by a check that only
+ * looks before the first `(`.
+ *
+ * A balanced scan rather than a single regex, so a captured value that itself contains `(...)`
+ * is not truncated at the first `)`; the scan stops only at the `)` that closes the enclosing
+ * group. Combined with the recursion in `scanForByteInliningHead`, detection is
+ * depth-independent.
+ */
+function extractNestedExpandValues(text: string): string[] {
+  const values: string[] = [];
+  const pattern = /\$?expand\s*=\s*/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    let depth = 0;
+    let end = start;
+    while (end < text.length) {
+      const ch = text[end];
+      if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        if (depth === 0) break;
+        depth--;
+      }
+      end++;
+    }
+    values.push(text.slice(start, end));
+  }
+  return values;
+}
+
+/**
+ * The offending token within one `expand` entry, or null.
+ *
+ * Handles every spelling a caller can produce: a comma-separated list inside one string, an
+ * OData nested option suffix (`attachments($select=name)`), a type-cast path segment
+ * (`attachments/microsoft.graph.fileAttachment`), any casing, surrounding whitespace, and a
+ * `$expand` nested inside another property's parenthesised options at any depth. Splitting on
+ * `,` also splits inside a nested option list, which is fine for detection: the head token of
+ * `attachments($select=id,name)` is always in the first fragment.
+ */
+function scanForByteInliningHead(text: string): string | null {
+  for (const piece of text.split(',')) {
+    const trimmed = piece.trim();
+    if (!trimmed) continue;
+    const head = trimmed.split('(')[0].split('/')[0].trim().toLowerCase();
+    if (BYTE_INLINING_NAV_PROPERTIES.has(head)) return trimmed;
+  }
+  for (const nested of extractNestedExpandValues(text)) {
+    const found = scanForByteInliningHead(nested);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * The offending `$expand` entry, or null.
+ *
+ * Reads `$expand` and `expand` independently -- never with `??` -- and scans every entry found
+ * under EITHER key. Every tool's input schema is `.passthrough()`, so a caller can hand this
+ * function both keys at once, e.g. `{ $expand: [], expand: ['attachments'] }`; picking one over
+ * the other would let a present but empty `$expand` mask a harmful `expand`.
+ */
+export function findByteInliningExpand(params: Record<string, unknown>): string | null {
+  const rawValues = [params.$expand, params.expand].filter(
+    (raw) => raw !== undefined && raw !== null
+  );
+  for (const raw of rawValues) {
+    const entries = Array.isArray(raw) ? raw : [raw];
+    for (const entry of entries) {
+      if (typeof entry !== 'string') continue;
+      const found = scanForByteInliningHead(entry);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 async function executeGraphTool(
   tool: (typeof api.endpoints)[0],
   config: EndpointConfig | undefined,
@@ -2203,6 +2868,39 @@ async function executeGraphTool(
       ],
       isError: true,
     };
+  }
+
+  // Refused once, here, because this is where both paths land: the handler registerGraphTools
+  // installs on every tool, and discovery's execute-tool. Guarding the schema instead would
+  // cover the tools one at a time and miss the next one added.
+  if (getAttachmentProxy()) {
+    const blocked = findByteInliningExpand(params);
+    if (blocked) {
+      logger.warn(
+        `Refusing ${tool.alias}: expand "${blocked}" would inline attachment bytes (--attachment-proxy)`
+      );
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'expand_not_allowed',
+              tool: tool.alias,
+              expand: blocked,
+              message:
+                `Expanding "${blocked}" inlines the raw attachment bytes (base64 contentBytes) into this ` +
+                `response, and $select does not suppress them. This server runs with --attachment-proxy, which ` +
+                `strips contentBytes fields and large base64 values out of tool results. Call this tool again ` +
+                `WITHOUT that expand value to get the message ` +
+                `or event itself; use list-mail-attachments (or the matching list tool) for each attachment's ` +
+                `id, name, contentType and size; and use read-document with the attachment's $value path to ` +
+                `read its content as markdown.`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
   const requestId = randomUUID();
@@ -2978,6 +3676,8 @@ export interface GraphToolRegistrationOptions {
   allowedScopes?: string;
   httpMode?: boolean;
   userFields?: string;
+  /** --attachment-proxy: byte-returning tools out, read-document in. */
+  attachmentProxy?: boolean;
 }
 
 export function registerGraphTools(
@@ -2995,6 +3695,7 @@ export function registerGraphTools(
     allowedScopes: allowedScopesValue,
     httpMode = false,
     userFields: userFieldsValue,
+    attachmentProxy = false,
   } = options;
   const userFields = parseUserFields(userFieldsValue);
   let enabledToolsRegex: RegExp | undefined;
@@ -3018,12 +3719,19 @@ export function registerGraphTools(
     enabledToolsRegex,
     allowedScopesValue,
     httpMode,
+    attachmentProxy,
   });
 
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
     if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
       logger.info(`Skipping work account tool ${tool.alias} - not in org mode`);
+      skippedCount++;
+      continue;
+    }
+
+    if (attachmentProxy && isProxySuppressedGraphTool(tool.method, endpointConfig?.pathPattern)) {
+      logger.info(`Skipping raw-byte tool ${tool.alias} - --attachment-proxy is set`);
       skippedCount++;
       continue;
     }
@@ -3213,10 +3921,12 @@ export function registerGraphTools(
     accountNames,
     userFields,
   };
-  for (const utility of UTILITY_TOOLS) {
-    if (readOnly && !utility.readOnlyHint) continue;
-    if (httpMode && utility.stdioOnly) continue;
-    if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
+  for (const utility of selectUtilityTools({
+    readOnly,
+    httpMode,
+    enabledTools: enabledToolsPattern,
+    attachmentProxy,
+  })) {
     try {
       registerUtilityToolWithMcp(server, utility, utilityCtx);
       registeredCount++;
@@ -3241,7 +3951,8 @@ export function buildToolsRegistry(
   orgMode: boolean,
   enabledToolsRegex?: RegExp,
   allowedScopesValue?: string,
-  disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = []
+  disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = [],
+  attachmentProxy: boolean = false
 ): Map<string, { tool: (typeof api.endpoints)[0]; config: EndpointConfig | undefined }> {
   const toolsMap = new Map<
     string,
@@ -3253,6 +3964,10 @@ export function buildToolsRegistry(
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
 
     if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+      continue;
+    }
+
+    if (attachmentProxy && isProxySuppressedGraphTool(tool.method, endpointConfig?.pathPattern)) {
       continue;
     }
 
@@ -3398,6 +4113,7 @@ export function registerDiscoveryTools(
     allowedScopes: allowedScopesValue,
     httpMode = false,
     userFields: userFieldsValue,
+    attachmentProxy = false,
   } = options;
   const userFields = parseUserFields(userFieldsValue);
   let enabledToolsRegex: RegExp | undefined;
@@ -3419,25 +4135,22 @@ export function registerDiscoveryTools(
     enabledToolsRegex,
     allowedScopesValue,
     httpMode,
+    attachmentProxy,
   });
   const toolsRegistry = buildToolsRegistry(
     readOnly,
     orgMode,
     enabledToolsRegex,
     allowedScopesValue,
-    disabledByAllowedScopes
+    disabledByAllowedScopes,
+    attachmentProxy
   );
   if (disabledByAllowedScopes.length > 0) {
     logger.info(
       `Discovery mode: allowed scopes disabled ${disabledByAllowedScopes.length} Graph tools: ${formatDisabledToolsForLog(disabledByAllowedScopes)}`
     );
   }
-  const utilityTools = UTILITY_TOOLS.filter((u) => {
-    if (readOnly && !u.readOnlyHint) return false;
-    if (httpMode && u.stdioOnly) return false;
-    if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
-    return true;
-  });
+  const utilityTools = selectUtilityTools({ readOnly, httpMode, enabledTools, attachmentProxy });
   const searchIndex = buildDiscoverySearchIndex(toolsRegistry, utilityTools);
   const totalCount = toolsRegistry.size + utilityTools.length;
   logger.info(
@@ -3483,9 +4196,19 @@ export function registerDiscoveryTools(
     return null;
   };
 
+  // The example comes from the tools this configuration actually selected: naming download-bytes
+  // would point at a tool --attachment-proxy has unregistered. The document/byte reader is the
+  // useful example in either mode, and exactly one of them is ever registered.
+  const utilityExample =
+    utilityTools.find((utility) => utility.proxyOnly || utility.bytesToModel)?.name ??
+    utilityTools[0]?.name;
+  const utilitiesPhrase = utilityExample
+    ? `${utilityTools.length} server utilities like ${utilityExample}`
+    : `${utilityTools.length} server utilities`;
+
   server.tool(
     'search-tools',
-    `Search through ${totalCount} tools (${toolsRegistry.size} Microsoft Graph API operations + ${utilityTools.length} server utilities like download-bytes). Ranks results by BM25 over tool name, llmTip, description, and path. After picking a tool, call get-tool-schema for parameters, then execute-tool.`,
+    `Search through ${totalCount} tools (${toolsRegistry.size} Microsoft Graph API operations + ${utilitiesPhrase}). Ranks results by BM25 over tool name, llmTip, description, and path. After picking a tool, call get-tool-schema for parameters, then execute-tool.`,
     {
       query: z
         .string()

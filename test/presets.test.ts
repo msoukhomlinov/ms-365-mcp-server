@@ -127,11 +127,43 @@ describe('utility tools in presets', () => {
   // Regression guard: utility tools (download-bytes, get-download-url, parse-teams-url) live in
   // code, not endpoints.json, and used to belong to no preset - so any --preset filter stripped
   // them. A newly added utility tool without preset membership fails this test.
-  it('every utility tool is reachable from at least one named preset', () => {
+  //
+  // A proxyOnly tool (read-document, registered only under --attachment-proxy) has no unflagged
+  // reach by design, so it is checked under its own gate; collapsing the two would fail this test
+  // for every tool shaped like it, for a property that was never broken.
+  it('every utility tool is reachable from at least one named preset under its own gate', () => {
     for (const util of UTILITY_TOOLS) {
-      const reachable = namedPresets.some((preset) => inPreset(preset, util.name));
+      const reachable = namedPresets.some((preset) =>
+        util.proxyOnly
+          ? new RegExp(getCombinedPresetPattern([preset], { attachmentProxy: true }), 'i').test(
+              util.name
+            )
+          : inPreset(preset, util.name)
+      );
       expect(reachable, `utility tool ${util.name} is in no preset`).toBe(true);
     }
+  });
+
+  describe('--attachment-proxy', () => {
+    const withProxy = (preset: string) =>
+      new RegExp(getCombinedPresetPattern([preset], { attachmentProxy: true }), 'i');
+
+    it('adds read-document to every preset that carries the byte readers', () => {
+      for (const preset of namedPresets) {
+        if (preset === 'teams-write') continue;
+        expect(withProxy(preset).test('read-document'), preset).toBe(true);
+      }
+    });
+
+    it('leaves the send-only preset free of any document reader', () => {
+      expect(withProxy('teams-write').test('read-document')).toBe(false);
+    });
+
+    it('adds nothing without the flag', () => {
+      for (const preset of namedPresets) {
+        expect(inPreset(preset, 'read-document'), preset).toBe(false);
+      }
+    });
   });
 
   // download-bytes and download-bytes-to-file are universal Graph binary readers (base64 vs stream

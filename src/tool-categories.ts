@@ -149,7 +149,10 @@ export const TOOL_CATEGORIES: Record<string, ToolCategory> = {
 
 export function getCombinedPresetPattern(
   presets: string[],
-  { attachmentUrls = false }: { attachmentUrls?: boolean } = {}
+  {
+    attachmentUrls = false,
+    attachmentProxy = false,
+  }: { attachmentUrls?: boolean; attachmentProxy?: boolean } = {}
 ): string {
   const patterns = presets.map((preset) => {
     const category = TOOL_CATEGORIES[preset];
@@ -169,6 +172,16 @@ export function getCombinedPresetPattern(
     !patterns.some((p) => new RegExp(p).test('get-download-url'))
   ) {
     patterns.push('^get-download-url$');
+  }
+  // Under --attachment-proxy read-document replaces the byte readers every preset except a
+  // send-only one carries (download-bytes is universal), so it joins every such preset for
+  // the same reason, enumerated the same way: a list of presets would miss every future one.
+  if (
+    attachmentProxy &&
+    presets.some((p) => !PRESET_META[p]?.omitUniversalUtilities) &&
+    !patterns.some((p) => new RegExp(p).test('read-document'))
+  ) {
+    patterns.push('^read-document$');
   }
   return patterns.join('|');
 }
