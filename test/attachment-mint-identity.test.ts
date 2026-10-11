@@ -259,3 +259,21 @@ describe('a minted ticket is redeemed as the identity that asked', () => {
     expect(parse(result as never).error).toMatch(/do not expose a pre-authenticated/i);
   });
 });
+
+/**
+ * The descriptions are what an LLM reads to decide what to call, so a description that is wrong
+ * in either direction is a real failure: the agent rules out a call that would succeed on a
+ * flag-enabled server, or makes one that cannot succeed without the flag.
+ */
+describe('download guidance stays true in both deployment modes', () => {
+  it('get-download-url keeps the drive/SharePoint advice and names the flag for the minted case', () => {
+    const tool = UTILITY_TOOLS.find((t) => t.name === 'get-download-url')!;
+    expect(tool.description).toContain('drive/SharePoint file content');
+    expect(tool.description).toContain('--enable-attachment-urls');
+  });
+
+  it('download-bytes keeps the drive/SharePoint advice', () => {
+    const tool = UTILITY_TOOLS.find((t) => t.name === 'download-bytes')!;
+    expect(tool.description).toContain('prefer get-download-url');
+  });
+});
