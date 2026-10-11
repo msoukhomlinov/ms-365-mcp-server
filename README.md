@@ -20,8 +20,7 @@ To route Graph traffic through a proxy of your own (one that terminates the clie
 
 ## Prerequisites
 
-- Node.js >= 20 (recommended)
-- Node.js 14+ may work with dependency warnings
+- Node.js >= 22
 
 ## Features
 

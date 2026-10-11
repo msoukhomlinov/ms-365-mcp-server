@@ -120,7 +120,7 @@ az webapp create \
   --name mcp-server \
   --resource-group your-rg \
   --plan your-plan \
-  --runtime "NODE:20-lts" \
+  --runtime "NODE:22-lts" \
   --assign-identity
 
 az webapp config appsettings set --name mcp-server --resource-group your-rg \
