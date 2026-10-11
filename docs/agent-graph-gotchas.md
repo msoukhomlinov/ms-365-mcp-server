@@ -20,13 +20,17 @@ own MCP client adds.
    check you didn't send `id`.
 
 2. **`expand` is for navigation properties only.** `body`, `sender`, `from` and `subject` are
-   NOT expandable — ask for them in `select` instead. `expand` takes an array of strings;
-   `select` takes a comma-separated string. Expanding a non-navigation property fails with Graph
+   NOT expandable — ask for them in `select` instead. `select` and `expand` each take a
+   comma-separated string or an array of strings. An unsupported `expand` value may also be
+   silently ignored rather than rejected. Expanding a non-navigation property fails with Graph
    400 `Parsing OData Select and Expand failed: ... is not a navigation property or complex property. Only navigation properties can be expanded.`
 
 3. **`search` takes ONE pair of double quotes around the WHOLE expression.**
    Right: `"search": "\"from:jane@example.com AND subject:flooring\""`
-   Wrong: `"search": "\"from:jane@example.com\" AND subject:flooring"` → Graph 400
+   Wrong: `"search": "\"from:jane@example.com\" AND subject:flooring"` → Graph 400 (the mail
+   tools rewrite this per-clause quoting into the right form before sending, but don't rely on
+   it, and directory `search` on users/groups gets no such repair)
+   A `search` with no searchable text is refused with `invalid_search`.
    `search` cannot be combined with `filter`, and `skip` does not work with `search`.
 
 4. **`search` cannot be combined with `orderby` either — a separate error from the one above.**
@@ -176,7 +180,8 @@ To Do — always list the lists first, tasks live under a list:
 ## Writes and the `confirm` gate
 
 If the server is deployed with `MS365_MCP_REQUIRE_CONFIRM=true` (an opt-in, per-deployment
-setting — off by default), every mail, calendar, contact, and task mutation is rejected with
+setting — off by default), every write tool (POST, PATCH, PUT, DELETE; read-only POST queries
+excepted) is rejected with
 `{"error": "confirmation_required"}` unless the call includes `confirm: true`. The parameter is
 `confirm`, not `confirmed`. Get the user's approval for the specific action first; never set
 `confirm: true` just to clear the error.
@@ -227,14 +232,23 @@ make this call; don't retype it. Copy the attachment `id` exactly, character-for
 this result — don't retype or shorten it, and don't reuse one from earlier in the conversation,
 get a fresh one from the listing you just made. See mistake 6.
 
-**This server does not convert documents to text.** No tool here turns a PDF, Word, PowerPoint,
-Excel, OpenDocument or RTF attachment into markdown, so don't tell the user you can read one.
-Reaching an attachment's content means moving its raw bytes somewhere, and which of the three
-tools below can do that depends on how the server was started.
+**Unless the server was started with `--attachment-proxy`, it does not convert documents to
+text.** Then no tool turns a PDF, Word, PowerPoint, Excel, OpenDocument or RTF attachment into
+markdown, so don't tell the user you can read one. Reaching an attachment's content means moving
+its raw bytes somewhere, and which of the three tools below can do that depends on how the
+server was started.
+
+**If `read-document` is in your tool list, use it instead of everything below.** It takes the
+same `/$value` (attachment) or `/content` (drive file) path and returns markdown. It exists only
+under `--attachment-proxy` (HTTP mode), which also removes `download-bytes`, `get-download-url`
+and `get-mail-message-mime`; it refuses with `identity_not_supported` when Graph identity comes
+from the request (OAuth, OBO, or bearer mode).
 
 ### `get-download-url` — a URL fetched out-of-band
 
-Always registered, but what it can actually resolve varies by resource and by deployment:
+Registered on the drive-backed presets (`files`, `onedrive`, `personal`, `work`, `search`), and
+under every preset except `teams-write` when started with `--enable-attachment-urls`. What it
+can actually resolve varies by resource and by deployment:
 
 - **OneDrive and SharePoint files: always works, no configuration.** It returns Graph's own
   pre-authenticated `@microsoft.graph.downloadUrl` for a driveItem, which streams the bytes with
@@ -245,7 +259,8 @@ Always registered, but what it can actually resolve varies by resource and by de
 - **Mail attachments, event attachments, meeting recordings and other `/$value` endpoints: only
   if the operator opted in.** Graph publishes no pre-authenticated URL for these, so the server
   has to mint one of its own — and it only does that when started with
-  `--enable-attachment-urls`, **in HTTP mode**, using credentials the server itself holds.
+  `--enable-attachment-urls`, **in HTTP mode**. This works in bearer, OBO and OAuth modes too:
+  the minted URL carries the caller's own token.
 
 Where minting is enabled, the same `/$value` path you'd hand `download-bytes` returns a URL
 served by this server rather than by Graph:
@@ -258,6 +273,9 @@ served by this server rather than by Graph:
   }
 }
 ```
+
+The target must end in `/$value` for an attachment or `/content` for a meeting recording, with
+no query string; anything else is refused with a message saying so.
 
 → `{ downloadUrl, expiresAt, singleUse: true, note }`. It is good for exactly **one** fetch and
 expires quickly (120 seconds by default, 300 at most), so pass it straight to whatever will
@@ -274,34 +292,25 @@ Meeting recordings do not expose a pre-authenticated download URL. Use download-
 $value byte endpoints do not expose a pre-authenticated download URL. Use download-bytes to read these bytes.
 ```
 
-And on a server that _does_ pass the flag but takes its Graph identity from the request — plain
-HTTP bearer mode, `--obo`, or OAuth — minting is refused on purpose:
-
-```text
-Server-minted download URLs are unavailable when Graph identity comes from the request (OAuth, OBO, or bearer mode): the URL is redeemed later without an Authorization header, so the bytes would be fetched as a different identity than the one that asked for them. Use download-bytes.
-```
-
-Read any of those four as "this deployment can't give me a URL for this resource," and move on to
+Read any of those as "this deployment can't give me a URL for this resource," and move on to
 the options below. Don't re-send the same call.
 
-**Don't rule this tool out from its own description.** The `get-download-url` description states
-flatly that mail attachments and meeting recordings do not expose a pre-authenticated URL and
-points you at `download-bytes`; it describes Graph's behaviour and doesn't mention the minting
-flag. On a server started with `--enable-attachment-urls` the call succeeds regardless. One
-attempt is cheap and the refusal above is short and unambiguous.
+**Try it for attachments and recordings even though Graph itself has no such URL.** The
+`get-download-url` description says to call it for them anyway: on a server started with
+`--enable-attachment-urls` the call succeeds. One attempt is cheap and the refusal above is
+short and unambiguous.
 
-### `download-bytes-to-file` — straight to the server's disk (stdio only)
+### `download-bytes-to-file` — straight to the server's disk (stdio, or HTTP with an opt-in flag)
 
 For a file the user wants **saved** rather than read, this writes the authenticated bytes to an
 absolute `outputPath` on the server's own filesystem and returns
 `{ path, contentType, bytesWritten }` — never base64 through your context, so it's the right
-choice regardless of file size. It won't overwrite an existing file. **stdio deployments only:
-it isn't registered at all over HTTP.**
+choice regardless of file size. It won't overwrite an existing file. **Always registered in stdio mode;
+over HTTP it exists only if the server was started with `--http-local-file-tools`.**
 
-That makes it the mirror image of minting, and the pairing is worth remembering: minted
-attachment URLs are HTTP-mode-only, `download-bytes-to-file` is stdio-only. No single deployment
-offers both, so for a mail attachment's bytes at most one out-of-band route exists on whatever
-server you're talking to.
+Minted attachment URLs are HTTP-mode-only, so on a typical stdio deployment this is the only
+out-of-band route for a mail attachment's bytes, and on a typical HTTP one it's minting. A
+deployment that sets both flags offers both.
 
 ### `download-bytes` — base64 into your context, last resort
 
@@ -325,14 +334,14 @@ dead end: `get-download-url` refuses with one of the errors above and you end up
   `select`, `list-mail-attachments` includes `contentBytes` — the entire file as base64, inline
   in the listing result. That's the same cost as `download-bytes` with no chance to read `size`
   and back out first. Use `get-download-url` (out-of-band, where the deployment supports it),
-  `download-bytes-to-file` (saving to disk, stdio only), or `download-bytes` (small plain-text
+  `download-bytes-to-file` (saving to disk, stdio or `--http-local-file-tools`), or `download-bytes` (small plain-text
   files read into context) on the attachment's own `/$value` path instead; all three take the
   attachment `id` from a normal, `select`ed listing call.
 
 ### What to say when you can't read an attachment
 
-For document formats this is the **common** case, not the exception: nothing in this server
-extracts text, so a PDF, Word, PowerPoint or Excel attachment is unreadable to you unless
+For document formats without `read-document` this is the **common** case, not the exception:
+nothing else in this server extracts text, so a PDF, Word, PowerPoint or Excel attachment is unreadable to you unless
 something outside the server converts it. Say so in one sentence, name the file and its size,
 and offer the alternative:
 
@@ -346,8 +355,8 @@ If you can't read it, say so.
 
 - `-32602 Input validation error` → the arguments didn't validate against the tool's schema at
   all — the SDK returns this same code whether the problem is a wrong parameter **name** (see
-  mistake 1), a wrong **type** for a correctly-named parameter (e.g. passing `expand` as a plain
-  string instead of an array of strings — see mistake 2), a missing required field, or a value
+  mistake 1), a wrong **type** for a correctly-named parameter (e.g. passing `top` as a word instead of a
+  number), a missing required field, or a value
   outside an allowed set. Don't assume it's always the mistake-1 naming issue and reflexively
   rename something. Read the validation details in the error response, or fetch the tool's
   schema once, to see the actual names, required fields, types, and allowed values. Don't
