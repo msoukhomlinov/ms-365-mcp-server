@@ -1478,6 +1478,15 @@ function describeEmptyConversion(contentStatus?: string): string {
 }
 
 /**
+ * blocked_host is deliberately unexplained by the converter. The commonest cause here is the
+ * signing mode of this server and the converter's profile disagreeing, so say so.
+ */
+const BLOCKED_HOST_HINT =
+  ' (Operator hint: a signed URL, MS365_MCP_ATTACHMENT_URL_KEY set, is rejected by a keyless ' +
+  'converter profile, and an unsigned one is blocked by a converter profile that needs a key. ' +
+  'Check that both sides use the same mode, and the converter origin and CIDR.)';
+
+/**
  * Error codes this server promises. Anything else the proxy says is surfaced as `proxy_error`
  * with the proxy's own code beside it, unaltered: the contract names a code, not a code list,
  * and flattening an unrecognised one into `conversion_failed` would state a vocabulary this
@@ -2442,7 +2451,9 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       const known = CONTRACT_ERROR_CODES.has(outcome.code);
       return readDocumentError(
         known ? outcome.code : 'proxy_error',
-        outcome.message,
+        outcome.code === 'blocked_host'
+          ? `${outcome.message}${BLOCKED_HOST_HINT}`
+          : outcome.message,
         await failureFacts(),
         known ? undefined : outcome.code
       );

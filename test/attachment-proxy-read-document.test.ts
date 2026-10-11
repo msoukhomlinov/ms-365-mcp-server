@@ -188,6 +188,24 @@ describe('read-document', () => {
     expect(redemptionsLeft(store, uri.searchParams.get('t')!)).toBe(3);
   });
 
+  it.each([
+    { mode: 'keyed', key: 'shared-hmac-key', signed: true },
+    { mode: 'keyless', key: '', signed: false },
+  ])('mints a $mode URL: dgk/dgx/dgs present is $signed', async ({ key, signed }) => {
+    configureAttachmentMinting({ store, config: { ...URL_CONFIG, key } });
+    const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'x' });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    await call(await connect(), { target: MAIL_ATTACHMENT });
+
+    const uri = new URL(requests[0].uri);
+    for (const param of ['dgk', 'dgx', 'dgs']) {
+      expect(uri.searchParams.has(param)).toBe(signed);
+    }
+    expect(uri.pathname).toBe('/attachment');
+    expect(uri.searchParams.get('t')).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
   it('refuses a target outside the mintable grammar as invalid_target', async () => {
     const { client: proxy, requests } = stubProxy({ ok: true, markdown: 'never reached' });
     configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
@@ -643,6 +661,22 @@ describe('read-document failure handling', () => {
     expect(body.name).toBe('report.pdf');
     expect(body.contentType).toBe('application/pdf');
     expect(body.size).toBe(195663);
+  });
+
+  it('adds the signing-mode hint to blocked_host and only to blocked_host', async () => {
+    const { client: proxy } = stubProxy({
+      ok: false,
+      code: 'blocked_host',
+      message: 'blocked_host: the URL was not fetched',
+    });
+    configureAttachmentProxy({ client: proxy, url: 'http://docglean:8080/mcp' });
+
+    const body = JSON.parse(await call(await connect(), { target: MAIL_ATTACHMENT }));
+
+    expect(body.error).toBe('proxy_error');
+    expect(body.proxyCode).toBe('blocked_host');
+    expect(body.message).toContain('blocked_host: the URL was not fetched');
+    expect(body.message).toContain('MS365_MCP_ATTACHMENT_URL_KEY');
   });
 
   it('passes a code outside the contract through as proxy_error, verbatim', async () => {

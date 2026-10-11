@@ -702,8 +702,8 @@ When running as an MCP server, the following options can be used:
                   Also adds get-download-url to any --preset that lacks it (except teams-write)
 --attachment-proxy <url> Route every document read through an MCP document-conversion proxy
                   (registers read-document, unregisters download-bytes, get-download-url and
-                  get-mail-message-mime; implies --enable-attachment-urls and REQUIRES a URL
-                  signing key; see "Reading documents through a conversion proxy")
+                  get-mail-message-mime; implies --enable-attachment-urls; the URL is signed
+                  only if a signing key is set; see "Reading documents through a conversion proxy")
 --attachment-port <port> Serve /attachment on its own listener on this port instead of on the
                   MCP app, so a fetcher that can read attachments cannot also reach /mcp
                   (requires --enable-attachment-urls; see "Splitting the attachment listener")
@@ -838,7 +838,8 @@ per-request.
 The signing key is optional. Without one, minted URLs are just `/attachment?t=<ticket>` and
 any HTTP client can fetch them; the ticket alone authorises redemption. Set a key only if
 the fetcher verifies the `dgk`/`dgx`/`dgs` signature (see below), such as a docglean-mcp
-sidecar, which will refuse an unsigned URL. Setting `_KEY_ID` without a key, or a `_KEY_FILE` that is
+sidecar with a keyed profile. Under `--attachment-proxy` the key is optional too, but it must
+match the converter's profile (see "Reading documents through a conversion proxy"). Setting `_KEY_ID` without a key, or a `_KEY_FILE` that is
 empty or unreadable, fails at startup.
 
 ### Splitting the attachment listener
@@ -993,10 +994,10 @@ For a step-by-step setup from a mail attachment to Markdown, with a compose file
   tells the model to call a tool this mode removed is dropped and replaced by one pointing at
   `read-document`. Without the flag nothing changes.
 - **Configuration.** The flag implies `--enable-attachment-urls`, because the proxy fetches the
-  bytes back from this server. `MS365_MCP_ATTACHMENT_URL_BASE` is required as above, and so is
-  **the signing key**: the proxy verifies the `dgk`/`dgx`/`dgs` signature before it dials a
-  private address, so without a key the server refuses to start rather than mint URLs the proxy
-  would reject.
+  bytes back from this server. `MS365_MCP_ATTACHMENT_URL_BASE` is required as above. The signing
+  key is **optional**: without one the URL is the bare `/attachment?t=<ticket>`, with one it also
+  carries `dgk`/`dgx`/`dgs`. The mode must match the converter's profile, see "Signing mode and
+  the docglean profile" below.
   It cannot be combined with `--toon` or `MS365_MCP_OUTPUT_FORMAT=toon`: the scrubber reads JSON,
   so TOON output would reach the model unscrubbed, and startup refuses the pair.
 - **Identity.** `read-document` mints a URL that is redeemed later with no `Authorization`
@@ -1018,7 +1019,9 @@ For a step-by-step setup from a mail attachment to Markdown, with a compose file
   URLs), since `$select` does not suppress the inlined bytes.
 
 The converter should sit where it can reach only the attachment listener. Following the split
-described above, with the proxy on a network that has no route to the MCP port:
+described above, with the proxy on a network that has no route to the MCP port. This is the
+unsigned setup, the recommended one; it needs a docglean build that includes the unsigned-ticket
+change (not yet released). The keyed alternative follows the example.
 
 ```yaml
 services:
@@ -1027,12 +1030,10 @@ services:
     networks: { agent-net: { ipv4_address: 10.89.0.2 }, convert-net: { ipv4_address: 10.89.1.2 } }
     environment:
       MS365_MCP_ATTACHMENT_URL_BASE: http://m365-mcp:3001
-      MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key
       MS365_MCP_ATTACHMENT_PROXY_TOKEN: ${DOCGLEAN_TOKEN} # sent to docglean as its bearer
       MS365_MCP_TOKEN_CACHE_PATH: /data/.token-cache.json
       MS365_MCP_SELECTED_ACCOUNT_PATH: /data/.selected-account.json
       MS365_MCP_USE_KEYTAR: '0'
-    secrets: [attachment_url_key]
     volumes: ['m365-data:/data']
     command: >
       --http 10.89.0.2:3000 --trust-proxy-auth
@@ -1044,10 +1045,9 @@ services:
     environment:
       DOCGLEAN_MCP_BEARER_TOKEN: ${DOCGLEAN_TOKEN}
       DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ORIGIN: http://m365-mcp:3001 # the attachment port
-      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_FILE: /run/secrets/attachment_url_key
       DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ALLOW_CIDRS: '["10.89.1.2/32"]' # the attachment listener
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_UNSIGNED_TICKET_PATH: /attachment # unsigned profile
       DOCGLEAN_MCP_ALLOW_INSECURE_SIGNED_ORIGIN: 'true' # the origin is plain http
-    secrets: [attachment_url_key]
 
 networks:
   agent-net:
@@ -1058,22 +1058,19 @@ networks:
 
 volumes:
   m365-data:
-
-secrets:
-  attachment_url_key:
-    file: ./secrets/attachment_url_key
 ```
 
 Things the example depends on:
 
-- **One key file, two readers.** Both containers mount the same file. docglean runs as uid
-  10001, so the file must be readable by that user. The key id (default `1` on both sides) and
-  the TTL line up out of the box: this server mints for 120 s by default and never more than
-  300 s, which is docglean's default `_MAX_TTL_S`. If you raise either, raise the other.
+- **The unsigned profile.** `_UNSIGNED_TICKET_PATH=/attachment` lets docglean accept exactly
+  `<origin>/attachment?t=<43-character ticket>` from the one pinned address, with no key. The
+  ticket is the credential (single-use, 120 s by default), and the `/32` pin keeps the fetch on
+  the attachment listener. docglean refuses an unsigned profile whose `_ALLOW_CIDRS` is not a
+  single host.
 - **The bearer token.** docglean binds `0.0.0.0` and refuses to start without
   `DOCGLEAN_MCP_BEARER_TOKEN`. This server sends the same value from
   `MS365_MCP_ATTACHMENT_PROXY_TOKEN`; without it every read is a `proxy_error`.
-- **The signed origin.** `_ORIGIN` must be the attachment base, scheme, host and port, exactly as
+- **The origin.** `_ORIGIN` must be the attachment base, scheme, host and port, exactly as
   `MS365_MCP_ATTACHMENT_URL_BASE` has it (here port 3001, not 3000). `_ALLOW_CIDRS` is a `/32` of
   the address that name resolves to for docglean, which is the attachment listener's address on
   the shared network, not the MCP address. `_ALLOW_INSECURE_SIGNED_ORIGIN` is needed because
@@ -1087,6 +1084,32 @@ Things the example depends on:
   lets it run on the server's own account. It also removes all authentication from `/mcp`,
   which is why the listener split matters.
 
+#### Signing mode and the docglean profile
+
+The two sides must agree, and the converter will not say which way they differ:
+
+| ms-365 setting                            | URL minted                        | docglean profile that accepts it                      |
+| ----------------------------------------- | --------------------------------- | ----------------------------------------------------- |
+| no `MS365_MCP_ATTACHMENT_URL_KEY`/`_FILE` | `/attachment?t=<ticket>`          | unsigned: `_UNSIGNED_TICKET_PATH=/attachment`, no key |
+| key set                                   | the same plus `dgk`, `dgx`, `dgs` | keyed: `_KEY_FILE` and `_KEY_ID` matching ms-365's    |
+
+- A keyed ms-365 pointed at a keyless docglean profile is rejected: a keyless profile refuses any
+  URL carrying `dgk`, `dgx` or `dgs` rather than ignoring them.
+- A keyless ms-365 pointed at a keyed-only docglean profile (a key, no `_UNSIGNED_TICKET_PATH`)
+  gets `blocked_host`, because the bare URL is not signed. A profile with both accepts both.
+- Either mismatch surfaces as `proxy_error` with `proxyCode: blocked_host`; this server appends a
+  hint naming the signing mode to that message.
+
+**Keyed alternative.** If your docglean predates the unsigned-ticket change, keep a key. On the
+ms-365 service add `MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key` (and
+`secrets: [attachment_url_key]`), and on the docglean service replace the `_UNSIGNED_TICKET_PATH`
+line with the same secret plus `_KEY_FILE: /run/secrets/attachment_url_key`, and define
+`attachment_url_key: { file: ./secrets/attachment_url_key }` under `secrets:`. Both containers mount the
+same file, and docglean runs as uid 10001, so it must be readable by that user. The key id
+(default `1` on both sides) and the TTL line up out of the box: this server mints for 120 s by
+default and never more than 300 s, which is docglean's default `_MAX_TTL_S`; if you raise one,
+raise the other. A runnable version is the override in `docs/e2e/docker-compose.keyed.yml`.
+
 `read-document` returns the Markdown and nothing else. docglean's `next_offset` is not passed
 on, so to continue a long document the caller computes the next `offset` itself (the previous
 `offset` plus the characters it received); each continuation is a fresh fetch and conversion.
@@ -1094,9 +1117,9 @@ on, so to continue a long document the caller computes the next `offset` itself 
 Errors come back as JSON with `isError`. Of the converter's codes, only `unsupported_format`,
 `too_large`, `password_required`, `conversion_failed` and `fetch_failed` pass through under their
 own name. Any other code arrives as `proxy_error`, with the converter's code at the start of
-`message` and in `proxyCode`. That includes `blocked_host`, which docglean gives for a signed
-URL it will not dial, and deliberately without saying why, so compare the origin, key, key id and
-CIDR above when you see it. This server adds its own codes: `proxy_unreachable` (retried
+`message` and in `proxyCode`. That includes `blocked_host`, which docglean gives for a URL it will
+not dial, and deliberately without saying why, so check the signing mode first (above), then the
+origin, key, key id and CIDR. This server appends a hint to that message. This server adds its own codes: `proxy_unreachable` (retried
 once), `invalid_target`, `no_capacity`, `identity_not_supported`, `no_text_content` and
 `no_text_in_selection`.
 

@@ -55,7 +55,7 @@ program
   )
   .option(
     '--attachment-proxy <url>',
-    "HTTP mode only. Route every document read through an MCP document-conversion proxy at this URL. Registers read-document (target, pages, offset, maxChars -> markdown) and UNREGISTERS download-bytes, get-download-url and get-mail-message-mime. Implies --enable-attachment-urls, because the proxy fetches the bytes back from this server's own attachment listener; MS365_MCP_ATTACHMENT_URL_BASE and MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) are therefore required too, the key included: the proxy verifies the URL signature before it fetches. The proxy must expose an MCP tool convert_to_markdown(uri, pages?, offset?, max_chars?) over stateless Streamable HTTP. Equivalent env var: MS365_MCP_ATTACHMENT_PROXY; bearer credential, if the proxy needs one, in MS365_MCP_ATTACHMENT_PROXY_TOKEN."
+    "HTTP mode only. Route every document read through an MCP document-conversion proxy at this URL. Registers read-document (target, pages, offset, maxChars -> markdown) and UNREGISTERS download-bytes, get-download-url and get-mail-message-mime. Implies --enable-attachment-urls, because the proxy fetches the bytes back from this server's own attachment listener; MS365_MCP_ATTACHMENT_URL_BASE is therefore required too. MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) is optional: without it the URL is the bare /attachment?t=<ticket>, with it the URL is signed, and the converter profile must use the same mode. The proxy must expose an MCP tool convert_to_markdown(uri, pages?, offset?, max_chars?) over stateless Streamable HTTP. Equivalent env var: MS365_MCP_ATTACHMENT_PROXY; bearer credential, if the proxy needs one, in MS365_MCP_ATTACHMENT_PROXY_TOKEN."
   )
   .option(
     '--attachment-port <port>',
