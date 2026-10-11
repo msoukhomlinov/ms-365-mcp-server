@@ -253,10 +253,9 @@ describe('startup warnings around --attachment-proxy', () => {
     expect(warnings().some((m) => m.includes('read-document is NOT registered'))).toBe(false);
   });
 
-  // The signing key is optional for --enable-attachment-urls alone, but the proxy verifies the
-  // URL signature before it fetches, so an unsigned URL would fail every read at the proxy.
-  // Refusing at startup names the missing variable once, to the person who can set it.
-  it('refuses to start without a URL signing key, naming the variable', async () => {
+  // The converter accepts an unsigned /attachment?t=<ticket> URL from one pinned origin, so the
+  // proxy no longer needs a signing key to start; a configured key still signs the URL.
+  it('starts without a URL signing key', async () => {
     const port = await reserveFreePort();
     process.env.MS365_MCP_ATTACHMENT_URL_BASE = `http://127.0.0.1:${port}`;
     delete process.env.MS365_MCP_ATTACHMENT_URL_KEY;
@@ -269,9 +268,21 @@ describe('startup warnings around --attachment-proxy', () => {
         attachmentProxy: 'http://docglean:8080/mcp',
         enableAttachmentUrls: true,
       })
-    ).rejects.toThrow(
-      /--attachment-proxy requires a URL signing key.*MS365_MCP_ATTACHMENT_URL_KEY/s
-    );
+    ).resolves.toBeUndefined();
+  });
+
+  it('still starts with a URL signing key', async () => {
+    const port = await reserveFreePort();
+    process.env.MS365_MCP_ATTACHMENT_URL_BASE = `http://127.0.0.1:${port}`;
+
+    await expect(
+      start({
+        http: `127.0.0.1:${port}`,
+        trustProxyAuth: true,
+        attachmentProxy: 'http://docglean:8080/mcp',
+        enableAttachmentUrls: true,
+      })
+    ).resolves.toBeUndefined();
   });
 
   it('still starts keyless for --enable-attachment-urls without the proxy', async () => {

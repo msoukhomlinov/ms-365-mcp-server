@@ -133,7 +133,10 @@ function startFakeProxy(
   });
 }
 
-describe('--attachment-proxy end to end', () => {
+describe.each([
+  { mode: 'keyed', key: 'shared-hmac-key' as string | undefined },
+  { mode: 'keyless', key: undefined as string | undefined },
+])('--attachment-proxy end to end ($mode)', ({ key }) => {
   const savedEnv = { ...process.env };
   let started: MicrosoftGraphServer[] = [];
   let proxy: Server | null = null;
@@ -183,7 +186,9 @@ describe('--attachment-proxy end to end', () => {
     [mcpPort, attachmentPort, proxyPort] = await reserveFreePorts(3);
 
     process.env.MS365_MCP_RATE_LIMIT_DISABLED = 'true';
-    process.env.MS365_MCP_ATTACHMENT_URL_KEY = 'shared-hmac-key';
+    delete process.env.MS365_MCP_ATTACHMENT_URL_KEY_FILE;
+    if (key) process.env.MS365_MCP_ATTACHMENT_URL_KEY = key;
+    else delete process.env.MS365_MCP_ATTACHMENT_URL_KEY;
     process.env.MS365_MCP_ATTACHMENT_URL_BASE = `http://127.0.0.1:${attachmentPort}`;
     process.env.MS365_MCP_ATTACHMENT_PROXY_TOKEN = 'proxy-bearer-token';
 
@@ -252,13 +257,17 @@ describe('--attachment-proxy end to end', () => {
     // that shipped on 2026-08-07 was a clean, well-formed, EMPTY 200.
     expect(result.content[0].text.length).toBeGreaterThan(DOCUMENT_BYTES.length);
 
-    // The proxy was really dialled, once, with a real signed ticket URL...
+    // The proxy was really dialled, once, with a real ticket URL...
     expect(seen.uris).toHaveLength(1);
     const uri = new URL(seen.uris[0]);
     expect(uri.port).toBe(String(attachmentPort));
     expect(uri.pathname).toBe('/attachment');
     expect(uri.searchParams.get('t')).toBeTruthy();
-    expect(uri.searchParams.get('dgs')).toBeTruthy();
+    // Signed only when a key is configured; keyless mints the bare /attachment?t= form.
+    for (const param of ['dgk', 'dgx', 'dgs']) {
+      expect(uri.searchParams.has(param)).toBe(Boolean(key));
+    }
+    expect([...uri.searchParams.keys()].length).toBe(key ? 4 : 1);
     // ...and its pull-back really reached the :3001 listener.
     expect(seen.statuses).toEqual([200]);
     // The bearer credential rode along.

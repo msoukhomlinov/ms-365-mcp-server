@@ -1180,17 +1180,6 @@ class MicrosoftGraphServer {
       const attachmentConfig = loadAttachmentUrlConfig(
         Boolean(this.options.enableAttachmentUrls) || this.attachmentProxyActive
       );
-      // The signing key is optional for plain --enable-attachment-urls but not here: the
-      // proxy verifies the URL signature before it dials a private address, so keyless URLs
-      // would make every read-document call fail at the proxy rather than at startup.
-      if (this.attachmentProxyActive && !attachmentConfig?.key) {
-        throw new Error(
-          '--attachment-proxy requires a URL signing key: set MS365_MCP_ATTACHMENT_URL_KEY ' +
-            '(or MS365_MCP_ATTACHMENT_URL_KEY_FILE). The proxy verifies the signature on the ' +
-            'URL it is handed before fetching it, so an unsigned URL is never read. The key is ' +
-            'optional only for --enable-attachment-urls without --attachment-proxy.'
-        );
-      }
       let attachmentApp: express.Express | null = null;
       if (attachmentConfig) {
         const ticketStore = new AttachmentTicketStore(attachmentConfig.ttlSeconds);
