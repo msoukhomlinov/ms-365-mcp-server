@@ -111,6 +111,44 @@ export function forceAttachment(header: string | null): string {
   return 'attachment';
 }
 
+/** Types a Graph response carries when it knows nothing better; a probed type may replace them. */
+const GENERIC_CONTENT_TYPES = new Set(['application/octet-stream', 'application/binary', '']);
+
+function isGenericContentType(contentType: string): boolean {
+  return GENERIC_CONTENT_TYPES.has(contentType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * What Node's setHeader accepts in a value: tab, printable ASCII and Latin-1. Anything past
+ * U+00FF throws synchronously. A probed `name` or `contentType` comes from Graph's metadata
+ * JSON, not from a header that already survived the wire, so it has to be checked first.
+ */
+const HEADER_SAFE_CHAR = /^[\t\x20-\x7e\x80-\xff]*$/;
+
+/**
+ * `attachment` naming a probed filename. `name` is untrusted. The mandatory `filename=` is
+ * header-safe with the quote-breaking characters dropped (keeping at least an extension when
+ * nothing else survives, which is what a format resolver reads); `filename*=` carries the real
+ * name, percent-encoded to RFC 5987's attr-char set, whenever the name is not header-safe.
+ */
+function dispositionForProbedName(name: string): string {
+  const safe = name
+    .replace(/[\r\n"\\]/g, '')
+    .replace(/[^\t\x20-\x7e\x80-\xff]/g, '')
+    .trim();
+  const extension = /(\.[A-Za-z0-9]{1,10})$/.exec(name)?.[1] ?? '';
+  const fallback = safe && safe !== extension ? safe : extension ? `attachment${extension}` : safe;
+  let value = `attachment; filename="${fallback || 'attachment'}"`;
+  if (!HEADER_SAFE_CHAR.test(name)) {
+    const encoded = encodeURIComponent(name).replace(
+      /['()*]/g,
+      (char) => '%' + char.charCodeAt(0).toString(16).toUpperCase()
+    );
+    value += `; filename*=UTF-8''${encoded}`;
+  }
+  return value;
+}
+
 function refuse(res: Response): void {
   res.status(404).type('text/plain').send(NOT_FOUND_BODY);
 }
@@ -189,7 +227,17 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       }
 
       res.status(200);
-      res.setHeader('content-type', stream.contentType);
+      // Graph's own header wins unless it is the generic default; then the type Graph's
+      // metadata gave at mint time, if it can be sent as a header. The stream is what Graph
+      // answers now, the probe ran once at mint time and may be stale.
+      const probed =
+        ticket.probedContentType && HEADER_SAFE_CHAR.test(ticket.probedContentType)
+          ? ticket.probedContentType
+          : undefined;
+      res.setHeader(
+        'content-type',
+        probed && isGenericContentType(stream.contentType) ? probed : stream.contentType
+      );
       if (stream.contentLength !== null) {
         res.setHeader('content-length', String(stream.contentLength));
       }
@@ -197,7 +245,12 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
       // endpoint serves untrusted bytes from a mailbox, and a browser that
       // wandered onto the URL must not render an inline text/html attachment as
       // a page on this origin.
-      res.setHeader('content-disposition', forceAttachment(stream.contentDisposition));
+      res.setHeader(
+        'content-disposition',
+        !stream.contentDisposition && ticket.probedName
+          ? dispositionForProbedName(ticket.probedName)
+          : forceAttachment(stream.contentDisposition)
+      );
       res.setHeader('cache-control', 'no-store');
       res.setHeader('x-content-type-options', 'nosniff');
 
