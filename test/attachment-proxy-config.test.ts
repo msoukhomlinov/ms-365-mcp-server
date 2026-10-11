@@ -98,6 +98,29 @@ describe('--attachment-proxy / MS365_MCP_ATTACHMENT_PROXY', () => {
     }
   });
 
+  it.each([
+    ['--toon', { toon: true }, undefined],
+    ['MS365_MCP_OUTPUT_FORMAT=toon', {}, 'toon'],
+  ])('refuses %s together with the proxy, which cannot scrub TOON', (_name, opts, env) => {
+    if (env) process.env.MS365_MCP_OUTPUT_FORMAT = env;
+    try {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        attachmentProxy: 'http://docglean:8080/mcp',
+        ...opts,
+      });
+      parseArgs();
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      delete process.env.MS365_MCP_OUTPUT_FORMAT;
+    }
+  });
+
+  it('still allows --toon without the proxy', () => {
+    commanderMocks.mockCommand.opts.mockReturnValue({ toon: true });
+    expect(parseArgs().toon).toBe(true);
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
   it('leaves everything alone when neither flag nor env is present', () => {
     const options = parseArgs();
     expect(options.attachmentProxy).toBeUndefined();

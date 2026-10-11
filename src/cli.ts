@@ -417,6 +417,18 @@ export function parseArgs(): CommandOptions {
     options.toon = true;
   }
 
+  // The response scrubber walks parsed JSON. TOON text does not parse, so under the proxy it
+  // would be passed through whole and contentBytes would reach the model unscrubbed. Refused
+  // here, for the flag and the env var alike, rather than silently weakening the guarantee.
+  if (options.attachmentProxy !== undefined && options.toon) {
+    console.error(
+      'Error: --attachment-proxy cannot be combined with --toon / MS365_MCP_OUTPUT_FORMAT=toon. ' +
+        'The byte scrubber cannot read TOON output, so attachment bytes would reach the model ' +
+        'unscrubbed. Use the default JSON output with --attachment-proxy.'
+    );
+    process.exit(1);
+  }
+
   // Dynamic registration defaults to true in HTTP mode.
   // CLI flags `--enable-dynamic-registration` / `--no-dynamic-registration` take
   // precedence; otherwise `MS365_MCP_DISABLE_DCR=true|1` opts the deployment out

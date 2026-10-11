@@ -996,6 +996,8 @@ expose `convert_to_markdown(uri, pages?, offset?, max_chars?)` over stateless St
   **the signing key**: the proxy verifies the `dgk`/`dgx`/`dgs` signature before it dials a
   private address, so without a key the server refuses to start rather than mint URLs the proxy
   would reject.
+  It cannot be combined with `--toon` or `MS365_MCP_OUTPUT_FORMAT=toon`: the scrubber reads JSON,
+  so TOON output would reach the model unscrubbed, and startup refuses the pair.
 - **Identity.** `read-document` mints a URL that is redeemed later with no `Authorization`
   header. In OAuth, OBO and plain `--http` bearer modes, where Graph identity comes from the
   request, it answers `identity_not_supported`.
