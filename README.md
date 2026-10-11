@@ -701,6 +701,10 @@ When running as an MCP server, the following options can be used:
 --enable-attachment-urls Let get-download-url mint a server-served URL for byte resources Graph
                   exposes no pre-authenticated URL for (see "Server-Minted Attachment URLs").
                   Also adds get-download-url to any --preset that lacks it (except teams-write)
+--attachment-proxy <url> Route every document read through an MCP document-conversion proxy
+                  (registers read-document, unregisters download-bytes, get-download-url and
+                  get-mail-message-mime; implies --enable-attachment-urls and REQUIRES a URL
+                  signing key; see "Reading documents through a conversion proxy")
 --attachment-port <port> Serve /attachment on its own listener on this port instead of on the
                   MCP app, so a fetcher that can read attachments cannot also reach /mcp
                   (requires --enable-attachment-urls; see "Splitting the attachment listener")
@@ -733,6 +737,7 @@ Environment variables:
 - `MS365_MCP_MESSAGE_SIGNOFF_SUFFIX=<text>`: Signoff appended to outgoing messages. Default: none. CLI equivalent: `--message-signoff-suffix <text>`. `--no-message-signoff` disables both (see Message Signoff below)
 - `MS365_MCP_RATE_LIMIT_DISABLED=true|1`: Disable per-IP rate limiting in HTTP mode (default: enabled — 30 req/min on `/authorize`, `/token`, `/register`; 120 req/min on `/mcp`)
 - `MS365_MCP_TRUST_PROXY_HOPS=<n>`: Number of trusted reverse-proxy hops in HTTP mode (default `1`). Accurate per-IP rate limiting depends on this matching your deployment — set to the number of proxies in front of the server, `0` to use the raw socket peer IP, or a comma-separated subnet list
+- `MS365_MCP_ATTACHMENT_PROXY=<url>`: The document-conversion proxy's MCP endpoint, e.g. `http://docglean:8080/mcp` (alternative to --attachment-proxy; HTTP mode only). `MS365_MCP_ATTACHMENT_PROXY_TOKEN` holds a bearer credential if the proxy needs one
 - `MS365_MCP_ATTACHMENT_PORT=<port>`: Serve the attachment route on its own listener on this port (alternative to --attachment-port; requires `--enable-attachment-urls`)
 - `MS365_MCP_ATTACHMENT_HOST=<host>`: Interface the `MS365_MCP_ATTACHMENT_PORT` listener binds (alternative to --attachment-host; requires `--attachment-port`). Defaults to the host `--http` bound — which for a wildcard `--http` means both ports answer everywhere and the port split isolates nothing. See "Splitting the attachment listener"
 - `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file over HTTP (alternative to --http-local-file-tools; same restrictions)
@@ -782,6 +787,18 @@ credential.
 **This grants no authority the calling agent did not already have.** Every target that can
 be minted is one `download-bytes` would fetch for the same caller on the same account. The
 ticket only moves those bytes out of the context window and into a direct transfer.
+
+A ticket is single-use by default, and `get-download-url` always mints one that way. A caller
+whose flow fetches one document more than once opts in to a small finite budget instead:
+`read-document` (below) asks for up to 3 fetches, because a converter that probes a URL and then
+converts it fetches twice, and a failed fetch would otherwise leave a dead URL. Every fetch counts
+whether or not it produced bytes, fetches are one at a time, and an unknown, exhausted, expired or
+in-flight ticket all get the same 404.
+
+For mail and event attachments the mint also asks Graph what the attachment is. When the byte
+response carries only a generic `Content-Type`, the redemption route serves the type and filename
+Graph reported at mint time instead; a type Graph leaves null is not guessed, and a failed lookup
+never blocks the mint.
 
 ### Uploading attachments the same way
 
@@ -961,6 +978,56 @@ expired `MS365_MCP_OAUTH_TOKEN` has to be replaced by the operator.
 
 Tickets live in the memory of the process that minted them, so a URL has to be redeemed
 on the same instance. Behind a load balancer that means one replica or sticky routing.
+
+### Reading documents through a conversion proxy
+
+`--attachment-proxy <url>` (or `MS365_MCP_ATTACHMENT_PROXY`; HTTP mode only) hands document
+reading to an MCP conversion proxy such as [docglean-mcp](https://github.com/msoukhomlinov/docglean-mcp),
+so a PDF or Word attachment reaches the model as markdown rather than base64. The proxy must
+expose `convert_to_markdown(uri, pages?, offset?, max_chars?)` over stateless Streamable HTTP.
+
+- **Tools.** `read-document` (`target`, `pages`, `offset`, `maxChars`) is registered, and
+  `download-bytes`, `get-download-url` and `get-mail-message-mime` are not. Tool descriptions,
+  tips, discovery results and the server instructions are rewritten to match: a sentence that
+  tells the model to call a tool this mode removed is dropped and replaced by one pointing at
+  `read-document`. Without the flag nothing changes.
+- **Configuration.** The flag implies `--enable-attachment-urls`, because the proxy fetches the
+  bytes back from this server. `MS365_MCP_ATTACHMENT_URL_BASE` is required as above, and so is
+  **the signing key**: the proxy verifies the `dgk`/`dgx`/`dgs` signature before it dials a
+  private address, so without a key the server refuses to start rather than mint URLs the proxy
+  would reject.
+- **Identity.** `read-document` mints a URL that is redeemed later with no `Authorization`
+  header. In OAuth, OBO and plain `--http` bearer modes, where Graph identity comes from the
+  request, it answers `identity_not_supported`.
+- **Targets.** A relative Graph path only. A mail or event attachment needs its `/$value`
+  suffix (the bare attachment path is the metadata resource, whose JSON carries `contentBytes`),
+  a drive or SharePoint file needs `/content`, and `/me/messages/{id}/$value` reads a whole
+  message. Absolute URLs, `.`/`..` segments, queries, fragments and percent-encoded separators are
+  refused; a raw space or non-ASCII letter in a OneDrive file name is accepted and percent-encoded.
+- **Scrubber.** Every tool result has any field named `contentBytes`, and any string over 4096
+  characters that is wholly valid base64, replaced by a marker and logged. This describes what
+  is stripped, not a promise that no tool can return bytes: `graph-batch` can still batch a GET of
+  a `/$value` path. `$expand` of `attachments` or `hostedContents` is refused with
+  `expand_not_allowed` (under any casing of the option, and inside `graph-batch` sub-request
+  URLs), since `$select` does not suppress the inlined bytes.
+
+The converter should sit where it can reach only the attachment listener. Following the split
+described above, with the proxy on a network that has no route to the MCP port:
+
+```yaml
+services:
+  m365-mcp:
+    networks: { agent-net: { ipv4_address: 10.89.0.2 }, convert-net: { ipv4_address: 10.89.1.2 } }
+    environment:
+      MS365_MCP_ATTACHMENT_URL_BASE: http://m365-mcp:3001
+      MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key
+    command: >
+      --http 10.89.0.2:3000 --trust-proxy-auth
+      --attachment-proxy http://docglean:8080/mcp
+      --attachment-port 3001 --attachment-host 10.89.1.2
+  docglean:
+    networks: [convert-net]
+```
 
 ## Token Storage
 
