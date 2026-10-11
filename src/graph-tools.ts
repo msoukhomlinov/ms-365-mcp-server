@@ -1275,7 +1275,7 @@ export async function mintDownloadUrl(
           type: 'text',
           text: JSON.stringify({
             error:
-              'target must be a plain relative Graph path: no fragment, no query, no "." or ".." segments, and no percent-encoded separators.',
+              'target must be a plain relative Graph path: no fragment, no query, no "//", no "." or ".." segments, and nothing the URL parser would rewrite (such as a backslash or a raw space). Percent-escapes are kept as written.',
           }),
         },
       ],
