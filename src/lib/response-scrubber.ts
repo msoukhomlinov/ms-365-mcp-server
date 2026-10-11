@@ -9,13 +9,11 @@
  * testable in isolation, and anything it imported would become a way for the
  * rule to fail for reasons unrelated to bytes.
  *
- * It used to say it carried the invariant *no tool on this server returns raw
- * bytes to the model*. That guarantee was withdrawn in 3025efe (PR #19) as
- * false, and the reasoning is recorded above `CLASSIFIED` in
- * `test/absence-claims.test.ts`. What this module decides is whether a *value*
- * in a parsed tool result looks like a byte payload; which tools are registered
- * at all, and which byte paths therefore stay reachable, is decided elsewhere
- * and is not something a shape rule can promise. See the **Coverage** note in
+ * It does not carry the invariant *no tool on this server returns raw bytes to the model*,
+ * and nothing here should be read as promising it. This module decides whether a *value* in a
+ * parsed tool result looks like a byte payload; which tools are registered at all, and which
+ * byte paths therefore stay reachable, is decided elsewhere (`isProxySuppressedGraphTool` in
+ * `graph-tools.ts`) and is not something a shape rule can promise. See the **Coverage** note in
  * `response-scrubbing.ts` for the paths this rule does not reach.
  *
  * **Why a shape rule and not a field-name list.** Three distinct paths to the

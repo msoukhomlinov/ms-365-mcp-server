@@ -5,12 +5,9 @@
  * added tomorrow is covered without anyone editing a list. It does not make the
  * rule itself complete -- see **Coverage** below.
  *
- * This used to open by claiming it made "no tool returns raw bytes" a property
- * of the server. That guarantee was withdrawn in 3025efe (PR #19) as false; the
- * reasoning is recorded above `CLASSIFIED` in `test/absence-claims.test.ts`. The
- * Coverage note below was already the accurate account of the same file, so the
- * opening sentence was not merely incomplete -- it asserted what the rest of
- * this comment goes on to refute.
+ * It does not make "no tool returns raw bytes" a property of the server, and nothing here
+ * should be read as promising it: proxy suppression (`isProxySuppressedGraphTool`) matches only
+ * GET paths ending `/$value`, so the Coverage note below lists the paths that stay reachable.
  *
  * Modelled on `normalize-tool-schema.ts`, which decorates `tools/list` the same
  * way, with one deliberate difference: that one falls back to a no-op and a
