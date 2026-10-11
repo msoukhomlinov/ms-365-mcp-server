@@ -3,7 +3,8 @@
  * pre-authenticated download URL of their own.
  *
  * A ticket is a capability and nothing else: it names one Graph path and one
- * identity, it is redeemable once, and it expires. The identity is an account
+ * identity, it is redeemable once unless the minting caller asked for a small
+ * finite count (see `maxRedemptions`), and it expires. The identity is an account
  * in this server's own token cache, or, when Graph identity came from the
  * request, the token that request read with. That token stays in the record
  * and never reaches the URL. Holding a ticket therefore authorises exactly one
@@ -145,6 +146,30 @@ export type AttachmentTicket = TicketIdentity &
     readonly expiresAtMs: number;
   };
 
+/**
+ * Most redemptions a single download ticket can be minted for. Sized to the flow that
+ * needs more than one: probe a document, convert it, retry one failure.
+ */
+export const MAX_REDEMPTIONS = 3;
+
+/** Mutable store entry. `AttachmentTicket` is the part a redeemer may see. */
+type StoredTicket = AttachmentTicket & {
+  /** Redemptions not yet handed out. Reaches 0 only as the entry is deleted. */
+  remaining: number;
+  /** A redemption is holding this ticket; see `redeem`. */
+  inFlight: boolean;
+};
+
+/**
+ * An exclusive hold on one redemption of one ticket. The redeeming route must call
+ * `release()` on every exit path: a lease that is never released pins a multi-use ticket
+ * for the rest of its TTL, which fails closed (later fetches 404) but wastes its budget.
+ */
+export type AttachmentTicketLease = AttachmentTicket & {
+  /** Drop the exclusive hold. Idempotent, and safe after the ticket is gone. */
+  release(): void;
+};
+
 /** Upload metadata a minting tool supplies; the store adds nothing to it. */
 export type UploadSpec = { readonly name: string; readonly contentType: string };
 
@@ -170,7 +195,7 @@ export class TicketStoreFullError extends Error {
 }
 
 export class AttachmentTicketStore {
-  private readonly tickets = new Map<string, AttachmentTicket>();
+  private readonly tickets = new Map<string, StoredTicket>();
 
   constructor(private readonly ttlSeconds: number) {}
 
@@ -185,35 +210,67 @@ export class AttachmentTicketStore {
     target: string,
     identity: TicketIdentity,
     nowMs: number,
-    purpose: TicketPurpose = { purpose: 'download' }
+    purpose: TicketPurpose = { purpose: 'download' },
+    maxRedemptions = 1
   ): { id: string; expiresAtMs: number } {
+    if (
+      !Number.isInteger(maxRedemptions) ||
+      maxRedemptions < 1 ||
+      maxRedemptions > MAX_REDEMPTIONS
+    ) {
+      throw new RangeError(`maxRedemptions must be an integer from 1 to ${MAX_REDEMPTIONS}`);
+    }
     this.sweep(nowMs);
     if (this.tickets.size >= MAX_LIVE_TICKETS) {
       throw new TicketStoreFullError(MAX_LIVE_TICKETS);
     }
     const id = randomBytes(TICKET_BYTES).toString('base64url');
     const expiresAtMs = nowMs + this.ttlSeconds * 1000;
-    this.tickets.set(id, { ...identity, ...purpose, target, expiresAtMs });
+    this.tickets.set(id, {
+      ...identity,
+      ...purpose,
+      target,
+      expiresAtMs,
+      remaining: maxRedemptions,
+      inFlight: false,
+    });
     return { id, expiresAtMs };
   }
 
-  /** Mint a ticket redeemed with this server's own token for `accountName`. */
+  /**
+   * Mint a ticket redeemed with this server's own token for `accountName`.
+   * `maxRedemptions` (1 to MAX_REDEMPTIONS, default 1) is how many attempts it is good for.
+   */
   mint(
     target: string,
     accountName: string | undefined,
-    nowMs: number = Date.now()
+    nowMs: number = Date.now(),
+    maxRedemptions = 1
   ): { id: string; expiresAtMs: number } {
-    return this.add(target, { kind: 'server-account', accountName }, nowMs);
+    return this.add(
+      target,
+      { kind: 'server-account', accountName },
+      nowMs,
+      undefined,
+      maxRedemptions
+    );
   }
 
-  /** Mint a ticket redeemed with `accessToken` and nothing else. */
+  /** Mint a ticket redeemed with `accessToken` and nothing else; `maxRedemptions` as for `mint`. */
   mintWithToken(
     target: string,
     accessToken: string,
-    nowMs: number = Date.now()
+    nowMs: number = Date.now(),
+    maxRedemptions = 1
   ): { id: string; expiresAtMs: number } {
     if (!accessToken) throw new Error('A request-token ticket needs a token');
-    return this.add(target, { kind: 'request-token', accessToken }, nowMs);
+    return this.add(
+      target,
+      { kind: 'request-token', accessToken },
+      nowMs,
+      undefined,
+      maxRedemptions
+    );
   }
 
   /** Mint an upload ticket attached as this server's own token for `accountName`. */
@@ -244,26 +301,45 @@ export class AttachmentTicketStore {
   }
 
   /**
-   * Return the ticket and burn it, or undefined.
+   * Take one redemption of a ticket, or return undefined.
    *
-   * One `undefined` for every failure -- unknown id, already redeemed, expired.
-   * The caller answers 404 to all three, so a probe cannot use the response to
-   * tell "never existed" from "already used", which would confirm a guessed id.
+   * One `undefined` for every failure -- unknown id, exhausted, expired, and "another
+   * request is redeeming it right now". The caller answers 404 to all of them, so a probe
+   * cannot use the response to tell "never existed" from "real, but spent". The in-flight
+   * case matters most: it is the only refusal an attacker could provoke, by racing a
+   * legitimate fetch, and it has to look like the rest.
    *
-   * The delete happens before the value is returned rather than in the caller,
-   * so an exception on the streaming path cannot leave a redeemed ticket live.
+   * Every redemption costs one whether or not it produced bytes, so a target that fails
+   * every time cannot be re-fetched without limit. The budget is spent here, and the last
+   * one deletes the entry as it is handed out: a single-use ticket is burnt before the
+   * value is returned, exactly as it always was, and an exception on the streaming path
+   * cannot leave a counted redemption available again.
+   *
+   * The method is synchronous, so test-and-set on `inFlight` is atomic against every other
+   * request in the process: at most one response is in flight per ticket. A request
+   * refused for that reason spends nothing.
    */
-  redeem(id: string, nowMs: number = Date.now()): AttachmentTicket | undefined {
+  redeem(id: string, nowMs: number = Date.now()): AttachmentTicketLease | undefined {
     this.sweep(nowMs);
-    const ticket = this.tickets.get(id);
-    if (!ticket) return undefined;
-    this.tickets.delete(id);
-    // No second expiry check here: `sweep` above ran against this same `nowMs`
-    // and already removed anything at or past its expiry, so a surviving entry
-    // is live by construction. A re-check would be unreachable code asserting a
-    // guarantee the sweep already provides -- and because both use one captured
-    // timestamp, there is no sweep/get race for it to cover.
-    return ticket;
+    const stored = this.tickets.get(id);
+    if (!stored || stored.inFlight) return undefined;
+
+    stored.inFlight = true;
+    stored.remaining -= 1;
+    if (stored.remaining <= 0) this.tickets.delete(id);
+
+    const { remaining: _remaining, inFlight: _inFlight, ...ticket } = stored;
+    let released = false;
+    return {
+      ...ticket,
+      // Once only: a repeat after a later lease took over must not drop that lease's hold.
+      // Harmless once the entry is deleted or swept: it mutates an object nothing reaches.
+      release: () => {
+        if (released) return;
+        released = true;
+        stored.inFlight = false;
+      },
+    };
   }
 
   /** Live ticket count, for tests and diagnostics. Never logged with ids. */

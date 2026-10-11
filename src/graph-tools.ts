@@ -1150,10 +1150,13 @@ async function mintUploadUrl(
   };
 }
 
-async function mintDownloadUrl(
+export async function mintDownloadUrl(
   target: string,
   accountParam: string | undefined,
-  authManager: AuthManager | undefined
+  authManager: AuthManager | undefined,
+  // Default is one fetch. A caller whose flow probes, converts or paginates one URL opts in
+  // to a small finite count; get-download-url itself never does.
+  options: { maxRedemptions?: number } = {}
 ): Promise<CallToolResult | null> {
   const minting = getAttachmentMinting();
   if (!minting) return null;
@@ -1224,11 +1227,12 @@ async function mintDownloadUrl(
     };
   }
 
+  const maxRedemptions = options.maxRedemptions ?? 1;
   let ticket: { id: string; expiresAtMs: number };
   try {
     ticket = requestToken
-      ? minting.store.mintWithToken(target, requestToken)
-      : minting.store.mint(target, accountParam);
+      ? minting.store.mintWithToken(target, requestToken, undefined, maxRedemptions)
+      : minting.store.mint(target, accountParam, undefined, maxRedemptions);
   } catch (error) {
     if (error instanceof TicketStoreFullError) {
       return {
@@ -1246,8 +1250,12 @@ async function mintDownloadUrl(
         text: JSON.stringify({
           downloadUrl: buildAttachmentUrl(minting.config, ticket.id),
           expiresAt: new Date(ticket.expiresAtMs).toISOString(),
-          singleUse: true,
-          note: 'Served by this server, not by Microsoft Graph. Valid for one fetch until it expires.',
+          singleUse: maxRedemptions === 1,
+          ...(maxRedemptions > 1 && { maxFetches: maxRedemptions }),
+          note:
+            maxRedemptions === 1
+              ? 'Served by this server, not by Microsoft Graph. Valid for one fetch until it expires.'
+              : `Served by this server, not by Microsoft Graph. Valid for up to ${maxRedemptions} fetch attempts, successful or not, one at a time, until it expires.`,
         }),
       },
     ],
