@@ -24,6 +24,7 @@ import GraphClient from './graph-client.js';
 import {
   registerDiscoveryTools,
   registerGraphTools,
+  resolveRegisteredToolNames,
   utilityToolWillRegister,
 } from './graph-tools.js';
 import { configureAttachmentMinting } from './lib/attachment-minting.js';
@@ -330,26 +331,6 @@ class MicrosoftGraphServer {
   }
 
   private createMcpServer(): McpServer {
-    const server = new McpServer(
-      {
-        name: 'Microsoft365MCP',
-        version: this.version,
-      },
-      {
-        instructions: buildMcpServerInstructions({
-          discovery: Boolean(this.options.discovery),
-          orgMode: Boolean(this.options.orgMode),
-          readOnly: Boolean(this.options.readOnly),
-          multiAccount: this.multiAccount,
-        }),
-      }
-    );
-
-    const shouldRegisterAuthTools = !this.options.http || this.options.enableAuthTools;
-    if (shouldRegisterAuthTools) {
-      registerAuthTools(server, this.authManager);
-    }
-
     const registrationOptions = {
       readOnly: this.options.readOnly,
       enabledTools: this.options.enabledTools,
@@ -362,6 +343,30 @@ class MicrosoftGraphServer {
       userFields: this.options.userFields,
       attachmentProxy: this.attachmentProxyActive,
     };
+
+    const server = new McpServer(
+      {
+        name: 'Microsoft365MCP',
+        version: this.version,
+      },
+      {
+        instructions: buildMcpServerInstructions({
+          discovery: Boolean(this.options.discovery),
+          orgMode: Boolean(this.options.orgMode),
+          readOnly: Boolean(this.options.readOnly),
+          multiAccount: this.multiAccount,
+          // The registered set, not the flags that shape it: --attachment-proxy being on does not
+          // prove read-document registered, since an --enabled-tools filter can drop it. Same gates
+          // as the registration calls below.
+          registeredTools: resolveRegisteredToolNames(registrationOptions),
+        }),
+      }
+    );
+
+    const shouldRegisterAuthTools = !this.options.http || this.options.enableAuthTools;
+    if (shouldRegisterAuthTools) {
+      registerAuthTools(server, this.authManager);
+    }
 
     if (this.options.discovery) {
       registerDiscoveryTools(server, this.graphClient!, registrationOptions);
