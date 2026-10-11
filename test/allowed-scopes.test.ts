@@ -56,7 +56,13 @@ vi.mock('@modelcontextprotocol/sdk/server/auth/router.js', () => ({
   mcpAuthRouter: vi.fn(() => (_req: unknown, _res: unknown, next?: () => void) => next?.()),
 }));
 
-vi.mock('../src/graph-tools.js', () => graphToolMocks);
+// Partial mock: only the two registration entry points are stubbed, because this test is about
+// what server.ts passes them. Everything else stays real, so server.ts importing another helper
+// from graph-tools.ts cannot break this file.
+vi.mock('../src/graph-tools.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/graph-tools.js')>()),
+  ...graphToolMocks,
+}));
 
 vi.mock('../src/oauth-provider.js', () => ({
   MicrosoftOAuthProvider: vi.fn(),
