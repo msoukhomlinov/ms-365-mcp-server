@@ -18,7 +18,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { findByteInliningExpand, registerGraphTools } from '../src/graph-tools.js';
+import {
+  findByteInliningExpand,
+  findByteInliningExpandInBatch,
+  registerGraphTools,
+} from '../src/graph-tools.js';
 import {
   configureAttachmentProxy,
   resetAttachmentProxy,
@@ -91,25 +95,78 @@ describe('findByteInliningExpand', () => {
     expect(findByteInliningExpand({ expand: ['instances($expand=organizer)'] })).toBeNull();
   });
 
-  it('does NOT see $expand smuggled inside a graph-batch sub-request URL -- a documented, accepted gap', () => {
-    // graph-batch's params carry no top-level `expand`/`$expand` key at all;
-    // the byte-inlining expand lives inside a sub-request URL string instead.
-    // This function only ever looks at params.$expand / params.expand, so it
-    // cannot see this without parsing every sub-request URL -- and the human
-    // has ruled that closing this is a capability decision (whether to
-    // restrict or parse a general-purpose batch tool), not a class-rule fix
-    // for this function. Pinned here so the gap is enforced, not just
-    // described in the docstring above BYTE_INLINING_NAV_PROPERTIES.
-    const batchParams = {
-      requests: [
-        {
-          id: '1',
-          method: 'GET',
-          url: '/me/messages/AAA?$expand=attachments',
-        },
-      ],
-    };
-    expect(findByteInliningExpand(batchParams)).toBeNull();
+  it('matches the key the way the executor does: any case, with or without the $', () => {
+    // The executor's query loop folds every one of these onto a real `$expand` that is sent to
+    // Graph, so a guard reading only the literal `expand`/`$expand` let them inline bytes.
+    for (const key of ['Expand', '$EXPAND', 'EXPAND', '$Expand', 'eXpAnD']) {
+      expect(findByteInliningExpand({ [key]: ['attachments'] })).toBe('attachments');
+      expect(findByteInliningExpand({ [key]: 'organizer,attachments' })).toBe('attachments');
+    }
+  });
+
+  it('scans every matching key, so an empty one cannot mask a case-variant one', () => {
+    expect(findByteInliningExpand({ $expand: [], EXPAND: ['attachments'] })).toBe('attachments');
+    expect(findByteInliningExpand({ $expand: '', Expand: 'attachments' })).toBe('attachments');
+    expect(findByteInliningExpand({ expand: ['organizer'], $Expand: ['attachments'] })).toBe(
+      'attachments'
+    );
+    expect(findByteInliningExpand({ expand: [], $EXPAND: [] })).toBeNull();
+  });
+
+  it('reads a value the way the executor stringifies it', () => {
+    expect(findByteInliningExpand({ expand: [['attachments']] })).toBe('attachments');
+    expect(findByteInliningExpand({ expand: [' attachments'] })).toBe('attachments');
+    expect(findByteInliningExpand({ expand: ['Attachments($select=name)', 'organizer'] })).toBe(
+      'Attachments($select=name)'
+    );
+    expect(findByteInliningExpand({ expand: ['a($expand=b($expand=Attachments))'] })).toBe(
+      'Attachments'
+    );
+    expect(findByteInliningExpand({ expand: 'organizer, hostedContents' })).toBe('hostedContents');
+  });
+
+  it('leaves an unrelated parameter alone even when it merely contains the word', () => {
+    expect(findByteInliningExpand({ expandExtendedProperties: true })).toBeNull();
+    expect(findByteInliningExpand({ notexpand: ['attachments'] })).toBeNull();
+    expect(findByteInliningExpand({ select: 'attachments' })).toBeNull();
+  });
+});
+
+describe('findByteInliningExpandInBatch', () => {
+  const batch = (url: string) => ({ requests: [{ id: '1', method: 'GET', url }] });
+
+  it('finds a byte-inlining expand in a sub-request URL, as an object or a JSON string', () => {
+    expect(findByteInliningExpandInBatch(batch('/me/messages/AAA?$expand=attachments'))).toBe(
+      'attachments'
+    );
+    expect(
+      findByteInliningExpandInBatch(
+        JSON.stringify(batch('/me/messages/AAA?$select=id&$expand=attachments($select=name)'))
+      )
+    ).toBe('attachments($select=name)');
+  });
+
+  it('matches the option name and value in any case, percent-encoding or nesting', () => {
+    for (const url of [
+      '/me/messages/AAA?$EXPAND=ATTACHMENTS',
+      '/me/messages/AAA?expand=attachments',
+      '/me/messages/AAA?%24expand=attachments',
+      '/me/messages/AAA?%2524expand=attachments',
+      '/me/messages/AAA?$expand=organizer%2Cattachments',
+      '/me/events/AAA?$expand=instances($expand=attachments)',
+      '/me/messages/AAA?$expand=%20attachments',
+    ]) {
+      expect(findByteInliningExpandInBatch(batch(url)), url).not.toBeNull();
+    }
+  });
+
+  it('leaves harmless sub-requests alone', () => {
+    expect(findByteInliningExpandInBatch(batch('/me/messages/AAA?$expand=organizer'))).toBeNull();
+    expect(findByteInliningExpandInBatch(batch('/me/messages/AAA?$select=attachments'))).toBeNull();
+    expect(findByteInliningExpandInBatch(batch('/me/messages/AAA'))).toBeNull();
+    expect(findByteInliningExpandInBatch('not json')).toBeNull();
+    expect(findByteInliningExpandInBatch(undefined)).toBeNull();
+    expect(findByteInliningExpandInBatch({ requests: 'x' })).toBeNull();
   });
 });
 
@@ -118,7 +175,7 @@ describe('the guard in executeGraphTool', () => {
     graphRequest: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: '{}' }] }),
   } as unknown as GraphClient;
 
-  async function connect(proxyOn: boolean): Promise<Client> {
+  async function connect(proxyOn: boolean, tools = '^get-mail-message$'): Promise<Client> {
     if (proxyOn) {
       configureAttachmentProxy({
         client: {
@@ -131,7 +188,7 @@ describe('the guard in executeGraphTool', () => {
     }
     const server = new McpServer({ name: 'test', version: '1.0.0' });
     registerGraphTools(server, graphClient, {
-      enabledTools: '^get-mail-message$',
+      enabledTools: tools,
       httpMode: true,
       attachmentProxy: proxyOn,
     });
@@ -164,6 +221,48 @@ describe('the guard in executeGraphTool', () => {
     // The refusal has to name the alternative, or the model just tries again.
     expect(body.message).toContain('read-document');
     expect(graphClient.graphRequest).not.toHaveBeenCalled();
+  });
+
+  it.each(['Expand', '$EXPAND', 'EXPAND', '$Expand'])(
+    'refuses a case-variant %s key in proxy mode, and never dials Graph',
+    async (key) => {
+      const client = await connect(true);
+      const result = (await client.callTool({
+        name: 'get-mail-message',
+        arguments: { messageId: 'AAA', $expand: [], [key]: ['attachments'] },
+      })) as { isError?: boolean; content: Array<{ text: string }> };
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('expand_not_allowed');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    }
+  );
+
+  it('refuses a graph-batch sub-request that expands attachments, and never dials Graph', async () => {
+    const client = await connect(true, '^graph-batch$');
+    const result = (await client.callTool({
+      name: 'graph-batch',
+      arguments: {
+        body: {
+          requests: [{ id: '1', method: 'GET', url: '/me/messages/AAA?$Expand=attachments' }],
+        },
+      },
+    })) as { isError?: boolean; content: Array<{ text: string }> };
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).error).toBe('expand_not_allowed');
+    expect(graphClient.graphRequest).not.toHaveBeenCalled();
+  });
+
+  it('lets a harmless graph-batch through in proxy mode', async () => {
+    const client = await connect(true, '^graph-batch$');
+    const result = (await client.callTool({
+      name: 'graph-batch',
+      arguments: { body: { requests: [{ id: '1', method: 'GET', url: '/me/messages/AAA' }] } },
+    })) as { isError?: boolean };
+
+    expect(result.isError).toBeFalsy();
+    expect(graphClient.graphRequest).toHaveBeenCalled();
   });
 
   it('allows expand: ["attachments"] when the flag is off', async () => {

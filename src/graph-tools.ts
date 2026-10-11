@@ -2741,11 +2741,9 @@ function unalteredTargetError(target: string) {
  * tools, execute-tool -- so a pair list would have to be re-derived every time an endpoint is
  * added, and would be wrong the first time one was missed.
  *
- * Known gap: `graph-batch` (POST `/$batch`) accepts arbitrary sub-request URLs, e.g.
- * `{ url: "/me/messages/{id}?$expand=attachments" }`, and this guard only inspects the
- * top-level `expand`/`$expand` parameters `findByteInliningExpand` is handed, so a batch payload
- * can smuggle the same byte-inlining expand. Suppressing a general-purpose batch tool is a
- * capability decision, not a class-rule fix; see the same gap on `isProxySuppressedGraphTool`.
+ * `graph-batch` (POST `/$batch`) carries its expand in sub-request URLs
+ * (`{ url: "/me/messages/{id}?$expand=attachments" }`), not in a top-level parameter;
+ * `findByteInliningExpandInBatch` reads those with the same scan.
  */
 const BYTE_INLINING_NAV_PROPERTIES = new Set(['attachments', 'hostedcontents']);
 
@@ -2811,23 +2809,90 @@ function scanForByteInliningHead(text: string): string | null {
   return null;
 }
 
+const ODATA_PARAMS = [
+  'filter',
+  'select',
+  'expand',
+  'orderby',
+  'skip',
+  'skiptoken',
+  'top',
+  'count',
+  'search',
+  'format',
+];
+
+/**
+ * The lower-case bare name (`top`, `expand`, ...) when `paramName` is an OData system query
+ * option under any `$`/case spelling (`$TOP`, `Expand`), else undefined. The executor's query
+ * loop and the byte-inlining expand guard both resolve names through this, so a guard cannot
+ * miss a spelling the executor still sends to Graph as `$expand`.
+ */
+export function odataParamName(paramName: string): string | undefined {
+  const bare = (paramName.startsWith('$') ? paramName.slice(1) : paramName).toLowerCase();
+  return ODATA_PARAMS.includes(bare) ? bare : undefined;
+}
+
 /**
  * The offending `$expand` entry, or null.
  *
- * Reads `$expand` and `expand` independently -- never with `??` -- and scans every entry found
- * under EITHER key. Every tool's input schema is `.passthrough()`, so a caller can hand this
- * function both keys at once, e.g. `{ $expand: [], expand: ['attachments'] }`; picking one over
- * the other would let a present but empty `$expand` mask a harmful `expand`.
+ * Scans EVERY key of `params` that the executor would send to Graph as `$expand` (`expand`,
+ * `$expand`, `Expand`, `$EXPAND`, ... via `odataParamName`, the executor's own normalisation),
+ * and every entry under each of them -- never `??` or first-match. Every tool's input schema is
+ * `.passthrough()`, so a caller can hand several spellings at once, e.g.
+ * `{ $expand: [], EXPAND: ['attachments'] }`; picking one would let a present but empty
+ * `$expand` mask a harmful `EXPAND`. A value is stringified the way the executor does
+ * (`${value}`), so a nested array reads the same to both.
  */
 export function findByteInliningExpand(params: Record<string, unknown>): string | null {
-  const rawValues = [params.$expand, params.expand].filter(
-    (raw) => raw !== undefined && raw !== null
-  );
-  for (const raw of rawValues) {
-    const entries = Array.isArray(raw) ? raw : [raw];
-    for (const entry of entries) {
-      if (typeof entry !== 'string') continue;
-      const found = scanForByteInliningHead(entry);
+  for (const [key, raw] of Object.entries(params)) {
+    if (odataParamName(key) !== 'expand' || raw === undefined || raw === null) continue;
+    const found = scanForByteInliningHead(`${raw}`);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Percent-decode until stable (bounded), so `%2524expand` cannot hide behind one layer. */
+function fullyPercentDecode(text: string): string {
+  let current = text;
+  for (let i = 0; i < 4; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      return current;
+    }
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * The offending expand in a `$batch` payload's sub-request URLs, or null. `body` is the object
+ * or JSON string graph-batch receives. Each URL is percent-decoded, its query split on `&`, and
+ * every expand-named option (same normalisation as the executor) scanned like a top-level one.
+ */
+export function findByteInliningExpandInBatch(body: unknown): string | null {
+  let parsed = body;
+  if (typeof body === 'string') {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.requests)) return null;
+  for (const request of parsed.requests) {
+    if (!isPlainObject(request) || typeof request.url !== 'string') continue;
+    const decoded = fullyPercentDecode(request.url);
+    const queryAt = decoded.indexOf('?');
+    if (queryAt < 0) continue;
+    for (const option of decoded.slice(queryAt + 1).split('&')) {
+      const eq = option.indexOf('=');
+      if (eq < 0 || odataParamName(option.slice(0, eq).trim()) !== 'expand') continue;
+      const found = scanForByteInliningHead(option.slice(eq + 1));
       if (found) return found;
     }
   }
@@ -2874,7 +2939,9 @@ async function executeGraphTool(
   // installs on every tool, and discovery's execute-tool. Guarding the schema instead would
   // cover the tools one at a time and miss the next one added.
   if (getAttachmentProxy()) {
-    const blocked = findByteInliningExpand(params);
+    const blocked =
+      findByteInliningExpand(params) ??
+      (/^\/\$batch$/i.test(tool.path) ? findByteInliningExpandInBatch(params.body) : null);
     if (blocked) {
       logger.warn(
         `Refusing ${tool.alias}: expand "${blocked}" would inline attachment bytes (--attachment-proxy)`
@@ -2976,23 +3043,13 @@ async function executeGraphTool(
       }
 
       // Ok, so, MCP clients (such as claude code) doesn't support $ in parameter names,
-      // and others might not support __, so we strip them in hack.ts and restore them here
-      const odataParams = [
-        'filter',
-        'select',
-        'expand',
-        'orderby',
-        'skip',
-        'skiptoken',
-        'top',
-        'count',
-        'search',
-        'format',
-      ];
-      // Handle both "top" and "$top" formats - strip $ if present, then re-add it
+      // and others might not support __, so we strip them in hack.ts and restore them here.
+      // Handle both "top" and "$top" formats - strip $ if present, then re-add it. The
+      // attachment-proxy expand guard shares odataParamName, so the two cannot disagree.
       const bareParamName = paramName.startsWith('$') ? paramName.slice(1) : paramName;
-      const isOdataParam = odataParams.includes(bareParamName.toLowerCase());
-      const normalizedParamName = isOdataParam ? bareParamName.toLowerCase() : bareParamName;
+      const odataName = odataParamName(paramName);
+      const isOdataParam = odataName !== undefined;
+      const normalizedParamName = odataName ?? bareParamName;
       const fixedParamName = isOdataParam ? `$${normalizedParamName}` : paramName;
       // Convert kebab-case param names to camelCase for path param matching.
       // endpoints.json uses {message-id} but hack.ts extracts :messageId (camelCase) from the path.
