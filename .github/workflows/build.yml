@@ -2,7 +2,15 @@ name: Build
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ main, integration/hermes-family ]
+  # A pull_request run builds refs/pull/N/merge, i.e. the PR merged into the base as
+  # it stood when that run started. Two PRs open at once can therefore both be green
+  # while the branch they land on is red (this happened with #19 and #20, repaired
+  # after the fact by #21). Building integration/hermes-family on push checks the
+  # branch content that actually ships. main is deliberately absent: release.yml
+  # already runs this same chain on push to main.
+  push:
+    branches: [ integration/hermes-family ]
   workflow_dispatch:
 
 jobs:
