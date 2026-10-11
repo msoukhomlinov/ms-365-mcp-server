@@ -984,6 +984,8 @@ on the same instance. Behind a load balancer that means one replica or sticky ro
 reading to an MCP conversion proxy such as [docglean-mcp](https://github.com/msoukhomlinov/docglean-mcp),
 so a PDF or Word attachment reaches the model as markdown rather than base64. The proxy must
 expose `convert_to_markdown(uri, pages?, offset?, max_chars?)` over stateless Streamable HTTP.
+For a step-by-step setup from a mail attachment to Markdown, with a compose file, see
+[docs/e2e-attachment-to-markdown.md](docs/e2e-attachment-to-markdown.md).
 
 - **Tools.** `read-document` (`target`, `pages`, `offset`, `maxChars`) is registered, and
   `download-bytes`, `get-download-url` and `get-mail-message-mime` are not. Tool descriptions,
@@ -999,7 +1001,10 @@ expose `convert_to_markdown(uri, pages?, offset?, max_chars?)` over stateless St
   so TOON output would reach the model unscrubbed, and startup refuses the pair.
 - **Identity.** `read-document` mints a URL that is redeemed later with no `Authorization`
   header. In OAuth, OBO and plain `--http` bearer modes, where Graph identity comes from the
-  request, it answers `identity_not_supported`.
+  request, it answers `identity_not_supported`. It needs the server's own cached account, which
+  in HTTP mode means `--trust-proxy-auth` (the flag that makes the server skip the bearer check
+  on `/mcp` and read with its token cache) and a prior `--login`. Reachability is then the only
+  authentication on `/mcp`, so keep the port off any network the converter can reach.
 - **Targets.** A relative Graph path only. A mail or event attachment needs its `/$value`
   suffix (the bare attachment path is the metadata resource, whose JSON carries `contentBytes`),
   a drive or SharePoint file needs `/content`, and `/me/messages/{id}/$value` reads a whole
@@ -1018,17 +1023,82 @@ described above, with the proxy on a network that has no route to the MCP port:
 ```yaml
 services:
   m365-mcp:
+    image: ms-365-mcp-server # build or pull your own
     networks: { agent-net: { ipv4_address: 10.89.0.2 }, convert-net: { ipv4_address: 10.89.1.2 } }
     environment:
       MS365_MCP_ATTACHMENT_URL_BASE: http://m365-mcp:3001
       MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key
+      MS365_MCP_ATTACHMENT_PROXY_TOKEN: ${DOCGLEAN_TOKEN} # sent to docglean as its bearer
+      MS365_MCP_TOKEN_CACHE_PATH: /data/.token-cache.json
+      MS365_MCP_SELECTED_ACCOUNT_PATH: /data/.selected-account.json
+      MS365_MCP_USE_KEYTAR: '0'
+    secrets: [attachment_url_key]
+    volumes: ['m365-data:/data']
     command: >
       --http 10.89.0.2:3000 --trust-proxy-auth
       --attachment-proxy http://docglean:8080/mcp
       --attachment-port 3001 --attachment-host 10.89.1.2
   docglean:
+    image: docglean-mcp # built from its repo; no image is published
     networks: [convert-net]
+    environment:
+      DOCGLEAN_MCP_BEARER_TOKEN: ${DOCGLEAN_TOKEN}
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ORIGIN: http://m365-mcp:3001 # the attachment port
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_FILE: /run/secrets/attachment_url_key
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ALLOW_CIDRS: '["10.89.1.2/32"]' # the attachment listener
+      DOCGLEAN_MCP_ALLOW_INSECURE_SIGNED_ORIGIN: 'true' # the origin is plain http
+    secrets: [attachment_url_key]
+
+networks:
+  agent-net:
+    ipam: { config: [{ subnet: 10.89.0.0/24 }] }
+  convert-net:
+    internal: true
+    ipam: { config: [{ subnet: 10.89.1.0/24 }] }
+
+volumes:
+  m365-data:
+
+secrets:
+  attachment_url_key:
+    file: ./secrets/attachment_url_key
 ```
+
+Things the example depends on:
+
+- **One key file, two readers.** Both containers mount the same file. docglean runs as uid
+  10001, so the file must be readable by that user. The key id (default `1` on both sides) and
+  the TTL line up out of the box: this server mints for 120 s by default and never more than
+  300 s, which is docglean's default `_MAX_TTL_S`. If you raise either, raise the other.
+- **The bearer token.** docglean binds `0.0.0.0` and refuses to start without
+  `DOCGLEAN_MCP_BEARER_TOKEN`. This server sends the same value from
+  `MS365_MCP_ATTACHMENT_PROXY_TOKEN`; without it every read is a `proxy_error`.
+- **The signed origin.** `_ORIGIN` must be the attachment base, scheme, host and port, exactly as
+  `MS365_MCP_ATTACHMENT_URL_BASE` has it (here port 3001, not 3000). `_ALLOW_CIDRS` is a `/32` of
+  the address that name resolves to for docglean, which is the attachment listener's address on
+  the shared network, not the MCP address. `_ALLOW_INSECURE_SIGNED_ORIGIN` is needed because
+  the origin is `http://`.
+- **The login.** `--trust-proxy-auth` reads the account the server cached, so sign in once with
+  the same volume and environment before starting it, for example
+  `docker compose run --rm --no-deps m365-mcp --login`, then `--verify-login` to check. Running
+  `--login` this way with the proxy variables set has not been verified.
+- **`--trust-proxy-auth`.** Without it `/mcp` demands a bearer token, the request then carries
+  the caller's identity, and `read-document` answers `identity_not_supported`. The flag is what
+  lets it run on the server's own account. It also removes all authentication from `/mcp`,
+  which is why the listener split matters.
+
+`read-document` returns the Markdown and nothing else. docglean's `next_offset` is not passed
+on, so to continue a long document the caller computes the next `offset` itself (the previous
+`offset` plus the characters it received); each continuation is a fresh fetch and conversion.
+
+Errors come back as JSON with `isError`. Of the converter's codes, only `unsupported_format`,
+`too_large`, `password_required`, `conversion_failed` and `fetch_failed` pass through under their
+own name. Any other code arrives as `proxy_error`, with the converter's code at the start of
+`message` and in `proxyCode`. That includes `blocked_host`, which docglean gives for a signed
+URL it will not dial, and deliberately without saying why, so compare the origin, key, key id and
+CIDR above when you see it. This server adds its own codes: `proxy_unreachable` (retried
+once), `invalid_target`, `no_capacity`, `identity_not_supported`, `no_text_content` and
+`no_text_in_selection`.
 
 ## Token Storage
 
