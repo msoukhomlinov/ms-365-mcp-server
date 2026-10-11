@@ -138,71 +138,78 @@ export function createAttachmentHandler(deps: AttachmentRouteDeps): Handler {
     // An upload ticket presented to the download route is burnt and refused:
     // one ticket, one purpose, and the refusal is indistinguishable from any other.
     if (!ticket || ticket.purpose !== 'download') {
+      ticket?.release();
       refuse(res);
       return;
     }
 
-    // Re-checked here, not because the store is untrusted, but because this is the last
-    // point before a fetch runs under the ticket's token: a target that reaches it
-    // malformed should fail closed rather than resolve to whatever the path concatenation
-    // makes of it.
-    if (!isPlainGraphPath(ticket.target)) {
-      logger.error('Attachment redemption refused: ticket target is not a plain Graph path');
-      refuse(res);
-      return;
-    }
-
-    const graphClient = deps.getGraphClient();
-    if (!graphClient) {
-      // Redeemed but unservable: the ticket is already burnt, deliberately.
-      // Re-adding it would make this path a way to keep a ticket alive.
-      logger.error('Attachment redemption failed: Graph client is not initialised');
-      res.status(503).type('text/plain').send('Service unavailable');
-      return;
-    }
-
-    let stream: Awaited<ReturnType<GraphClient['downloadStream']>>;
+    // A multi-use ticket stays live after this redemption, so the hold is dropped on every
+    // exit path, including an exception, rather than stranding it for the rest of its TTL.
     try {
-      const accessToken =
-        ticket.kind === 'request-token'
-          ? ticket.accessToken
-          : await deps.authManager.getTokenForAccount(ticket.accountName);
-      // downloadStream falls back to AuthManager when handed no token, which for a
-      // request-token ticket would fetch as whatever account this server has cached.
-      if (!accessToken) throw new Error('No access token for this ticket');
-      stream = await graphClient.downloadStream(ticket.target, { accessToken });
-    } catch (error) {
-      // The target path is logged; the ticket id and token never are. The path is
-      // what an operator needs to diagnose a failure and is not itself a capability --
-      // reaching it still requires a Graph token.
-      logger.error(
-        `Attachment redemption failed for ${ticket.target}: ${(error as Error).message}`
-      );
-      res.status(502).type('text/plain').send('Upstream fetch failed');
-      return;
-    }
+      // Re-checked here, not because the store is untrusted, but because this is the last
+      // point before a fetch runs under the ticket's token: a target that reaches it
+      // malformed should fail closed rather than resolve to whatever the path concatenation
+      // makes of it.
+      if (!isPlainGraphPath(ticket.target)) {
+        logger.error('Attachment redemption refused: ticket target is not a plain Graph path');
+        refuse(res);
+        return;
+      }
 
-    res.status(200);
-    res.setHeader('content-type', stream.contentType);
-    if (stream.contentLength !== null) {
-      res.setHeader('content-length', String(stream.contentLength));
-    }
-    // Graph's own filename when it gave one. `attachment` either way: this
-    // endpoint serves untrusted bytes from a mailbox, and a browser that
-    // wandered onto the URL must not render an inline text/html attachment as
-    // a page on this origin.
-    res.setHeader('content-disposition', forceAttachment(stream.contentDisposition));
-    res.setHeader('cache-control', 'no-store');
-    res.setHeader('x-content-type-options', 'nosniff');
+      const graphClient = deps.getGraphClient();
+      if (!graphClient) {
+        // Redeemed but unservable: the redemption is already spent, deliberately.
+        // Refunding it would make this path a way to keep a ticket alive.
+        logger.error('Attachment redemption failed: Graph client is not initialised');
+        res.status(503).type('text/plain').send('Service unavailable');
+        return;
+      }
 
-    try {
-      await pipeline(Readable.fromWeb(stream.body as never), res);
-    } catch (error) {
-      // Headers are already sent, so there is no status left to change. Destroy
-      // rather than end, so the peer sees a truncated transfer instead of a
-      // short body that looks complete.
-      logger.error(`Attachment stream aborted for ${ticket.target}: ${(error as Error).message}`);
-      res.destroy();
+      let stream: Awaited<ReturnType<GraphClient['downloadStream']>>;
+      try {
+        const accessToken =
+          ticket.kind === 'request-token'
+            ? ticket.accessToken
+            : await deps.authManager.getTokenForAccount(ticket.accountName);
+        // downloadStream falls back to AuthManager when handed no token, which for a
+        // request-token ticket would fetch as whatever account this server has cached.
+        if (!accessToken) throw new Error('No access token for this ticket');
+        stream = await graphClient.downloadStream(ticket.target, { accessToken });
+      } catch (error) {
+        // The target path is logged; the ticket id and token never are. The path is
+        // what an operator needs to diagnose a failure and is not itself a capability --
+        // reaching it still requires a Graph token.
+        logger.error(
+          `Attachment redemption failed for ${ticket.target}: ${(error as Error).message}`
+        );
+        res.status(502).type('text/plain').send('Upstream fetch failed');
+        return;
+      }
+
+      res.status(200);
+      res.setHeader('content-type', stream.contentType);
+      if (stream.contentLength !== null) {
+        res.setHeader('content-length', String(stream.contentLength));
+      }
+      // Graph's own filename when it gave one. `attachment` either way: this
+      // endpoint serves untrusted bytes from a mailbox, and a browser that
+      // wandered onto the URL must not render an inline text/html attachment as
+      // a page on this origin.
+      res.setHeader('content-disposition', forceAttachment(stream.contentDisposition));
+      res.setHeader('cache-control', 'no-store');
+      res.setHeader('x-content-type-options', 'nosniff');
+
+      try {
+        await pipeline(Readable.fromWeb(stream.body as never), res);
+      } catch (error) {
+        // Headers are already sent, so there is no status left to change. Destroy
+        // rather than end, so the peer sees a truncated transfer instead of a
+        // short body that looks complete.
+        logger.error(`Attachment stream aborted for ${ticket.target}: ${(error as Error).message}`);
+        res.destroy();
+      }
+    } finally {
+      ticket.release();
     }
   };
 }
@@ -268,6 +275,7 @@ export function createAttachmentUploadHandler(deps: AttachmentRouteDeps): Handle
 
     const ticket = deps.store.redeem(raw);
     if (!ticket || ticket.purpose !== 'upload') {
+      ticket?.release();
       refuse(res);
       return;
     }
