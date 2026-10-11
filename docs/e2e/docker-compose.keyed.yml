@@ -1,0 +1,26 @@
+# Keyed alternative to docker-compose.yml: URLs carry dgk/dgx/dgs, docglean verifies them.
+# Layer it on the default file (Compose 2.24+ for !reset):
+#   docker compose -f docker-compose.yml -f docker-compose.keyed.yml up -d
+# Needs ./secrets/attachment_url_key (see the appendix of the walkthrough).
+
+x-m365-keyed: &m365-keyed
+  environment:
+    MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key
+    MS365_MCP_ATTACHMENT_URL_KEY_ID: '1'
+  secrets: [attachment_url_key]
+
+services:
+  docglean:
+    environment:
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_FILE: /run/secrets/attachment_url_key
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_ID: '1'
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_MAX_TTL_S: '300'
+      # Keyed only: drop the unsigned shape so a bare URL is refused too.
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_UNSIGNED_TICKET_PATH: !reset null
+    secrets: [attachment_url_key]
+  m365: *m365-keyed
+  m365-mint: *m365-keyed
+
+secrets:
+  attachment_url_key:
+    file: ./secrets/attachment_url_key

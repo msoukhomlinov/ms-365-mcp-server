@@ -1,10 +1,10 @@
 # E2E runbook: Outlook attachment to Markdown
 
-Proves: M365 mail attachment -> ms-365-mcp-server (`--attachment-proxy`) -> signed URL -> docglean-mcp -> Markdown.
+Proves: M365 mail attachment -> ms-365-mcp-server (`--attachment-proxy`) -> ticket URL -> docglean-mcp -> Markdown.
 
 This walkthrough has not been run end to end; steps marked "not verified" are inferred from the code and the converter's docs. Never paste keys, tokens or device codes into chat or tickets.
 
-It follows the `ms-365-mcp-server` source on this branch and the `docglean-mcp` source on its `main`. For the configuration behind it, see "Reading documents through a conversion proxy" in the [README](../README.md#reading-documents-through-a-conversion-proxy).
+It follows the `ms-365-mcp-server` source on this branch. The default (unsigned) setup needs a `docglean-mcp` build that includes the unsigned-ticket change, which is not yet released; the keyed appendix works against a docglean `main` build. For the configuration behind it, see "Reading documents through a conversion proxy" in the [README](../README.md#reading-documents-through-a-conversion-proxy).
 
 ## 0. Prerequisites
 
@@ -20,14 +20,22 @@ Work directory: the compose file is [`e2e/docker-compose.yml`](e2e/docker-compos
 cd docs/e2e
 ```
 
-## 1. Shared signing key and tokens (files only)
+## 1. Tokens (files only), and which signing mode
 
-One key signs on the ms-365 side and verifies on the docglean side. Both read it from the same file.
+Two modes pair ms-365 with a docglean profile. They must match; a mismatch is `blocked_host` on every read.
+
+| ms-365 setting                                | URL it mints                      | docglean profile that accepts it                                                     |
+| --------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
+| No `MS365_MCP_ATTACHMENT_URL_KEY`/`_KEY_FILE` | `/attachment?t=<43-char ticket>`  | Unsigned: `_ORIGIN`, `_ALLOW_CIDRS` (one `/32`), `_UNSIGNED_TICKET_PATH=/attachment` |
+| Key set                                       | the same plus `dgk`, `dgx`, `dgs` | Keyed: `_ORIGIN`, `_ALLOW_CIDRS`, `_KEY_FILE`, `_KEY_ID`                             |
+
+- A keyed ms-365 against a keyless docglean profile is rejected: that profile refuses any URL carrying `dgk`, `dgx` or `dgs`.
+- A keyless ms-365 against a keyed-only docglean profile is `blocked_host`: the bare URL is not signed, so it is never dialled. A docglean profile with both a key and the unsigned path accepts both (a migration window).
+
+This walkthrough uses the unsigned mode, so there is no key to generate. The unsigned profile needs a docglean build that includes the unsigned-ticket change (not yet released). For the keyed mode see Appendix A.
 
 ```bash
-mkdir -p secrets && umask 077
-openssl rand -hex 32 > secrets/attachment_url_key
-chmod 644 secrets/attachment_url_key     # docglean runs as uid 10001; throwaway test key
+umask 077
 cat > .env <<EOF
 DOCGLEAN_REPO=/path/to/docglean-mcp
 DOCGLEAN_TOKEN=$(openssl rand -hex 32)
@@ -37,22 +45,10 @@ EOF
 
 Notes:
 
-- A trailing newline in the key file is fine: both sides strip it (ms-365 uses Python's whitespace set to match docglean's `.strip()`). Do not let an editor add a BOM.
 - `DOCGLEAN_TOKEN` is the bearer docglean demands because it binds `0.0.0.0` (it refuses to start with none). ms-365 sends it via `MS365_MCP_ATTACHMENT_PROXY_TOKEN`. Neither side offers a `_FILE` form for this one, hence `.env`. Keep `.env` out of git.
-- Throwaway for this test; delete both at teardown.
-
-### Signing compatibility (checked against code)
-
-| Item              | ms-365 (`src/lib/url-signing.ts`, `attachment-url-config.ts`)                                                     | docglean (`signing.py`)                      | Match                                                                              |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Canonical string  | `v1\nscheme\nhost\nport\npath\nquery\nexpiry`, port always explicit, query minus `dgk/dgx/dgs`, sorted, re-quoted | same                                         | yes (documented as a port; ms-365 has Python-parity vectors)                       |
-| HMAC              | SHA-256, key = UTF-8 bytes, base64url, no padding                                                                 | same                                         | yes                                                                                |
-| Key id            | `MS365_MCP_ATTACHMENT_URL_KEY_ID`, default `1`                                                                    | `..._KEY_ID`, default `1`, compared to `dgk` | yes; keep both `1` or change both                                                  |
-| TTL               | `MS365_MCP_ATTACHMENT_URL_TTL_S`, default 120, hard max 300                                                       | `..._MAX_TTL_S`, default 300, plus 5 s skew  | yes; ms-365 can never exceed docglean's default. If you raise one, raise the other |
-| Key file          | stripped, rejects control chars                                                                                   | stripped                                     | yes                                                                                |
-| Host in signature | from `MS365_MCP_ATTACHMENT_URL_BASE` (`m365`), IPv6 literal refused                                               | from `_ORIGIN`                               | yes; both must say `m365:3001`                                                     |
-
-No blocking inconsistency found. Two operator-side facts that do bite: the docglean `_ORIGIN` must equal the URL base exactly (scheme, host, port), and `_ALLOW_CIDRS` must contain the resolved address of that host (here `10.89.1.2/32`).
+- Throwaway for this test; delete it at teardown.
+- Without a signature the ticket is the only credential, so it is single-use (3 fetches for `read-document`) and short-lived, and the docglean `_ALLOW_CIDRS` pin (a single address, the attachment listener) is what keeps the fetch on that listener.
+- The unsigned profile requires the docglean origin to equal the URL base (`http://m365:3001`) and the path to be exactly `/attachment`. No other query parameter is accepted.
 
 ## 2a. Bring up (Docker path)
 
@@ -82,14 +78,14 @@ Expected startup lines (wording may differ slightly):
 
 - `Server listening on 10.89.0.2:3000` and `MCP endpoint: http://10.89.0.2:3000/mcp`
 - `Document proxy: http://docglean:8080/mcp (read-document only; ...bearer credential set)`
-- `Attachment URLs: http://m365:3001/attachment (ttl 120s, signed, key id 1)`
+- `Attachment URLs: http://m365:3001/attachment (ttl 120s, unsigned)`, or `(ttl 120s, signed, key id 1)` in the keyed variant
 - `Attachment listener: separate, port 3001 ...`
 - No warning about both listeners sharing an interface. If you see one, `--attachment-host` is not taking effect.
 
 Startup refusals and what they mean:
 
-- `--attachment-proxy requires a URL signing key`: `_KEY_FILE` missing, unreadable or empty.
-- `MS365_MCP_ATTACHMENT_URL_BASE` required / invalid / IPv6 literal with a key.
+- `MS365_MCP_ATTACHMENT_URL_KEY_FILE could not be read` / `is empty`: only if you set a key file; unset it for the unsigned mode.
+- `MS365_MCP_ATTACHMENT_URL_BASE` required / invalid / IPv6 literal (only refused when a key is set).
 - `--attachment-port requires --enable-attachment-urls` / `--attachment-host requires --attachment-port`.
 - Proxy flag with `--toon` is refused.
 - Stdio mode ignores the flag with a warning; the proxy is HTTP only.
@@ -111,15 +107,13 @@ cd docs/e2e
 H=$(docker run --rm docglean-mcp:e2e python -c "import socket;print(socket.gethostbyname('host.docker.internal'))")
 docker run -d --name docglean-e2e -p 127.0.0.1:8080:8080 \
   --add-host host.docker.internal:host-gateway \
-  -v "$PWD/secrets/attachment_url_key:/run/secrets/k:ro" \
   --env-file <(grep DOCGLEAN_TOKEN .env | sed 's/^DOCGLEAN_TOKEN/DOCGLEAN_MCP_BEARER_TOKEN/') \
   -e DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ORIGIN=http://host.docker.internal:3001 \
-  -e DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_FILE=/run/secrets/k \
   -e DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ALLOW_CIDRS="[\"$H/32\"]" \
+  -e DOCGLEAN_MCP_SIGNED_ORIGIN_M365_UNSIGNED_TICKET_PATH=/attachment \
   -e DOCGLEAN_MCP_ALLOW_INSECURE_SIGNED_ORIGIN=true docglean-mcp:e2e
 
 export MS365_MCP_ATTACHMENT_URL_BASE=http://host.docker.internal:3001
-export MS365_MCP_ATTACHMENT_URL_KEY_FILE=$PWD/secrets/attachment_url_key
 export MS365_MCP_ATTACHMENT_PROXY_TOKEN=$(grep ^DOCGLEAN_TOKEN .env | cut -d= -f2)
 cd ../..
 node dist/index.js --http 127.0.0.1:3000 --trust-proxy-auth --preset mail \
@@ -220,21 +214,21 @@ Error results are JSON text: `{"error":"<code>","message":...,"name":...,"conten
 
 Only these docglean codes pass through under their own name: `unsupported_format`, `too_large`, `password_required`, `conversion_failed`, `fetch_failed`. Every other docglean code (including `blocked_host`, `timeout`, `busy`, `invalid_pages`, `pages_unsupported`) arrives as `error:"proxy_error"` with the raw code at the start of `message` (`blocked_host: ...`) and in `proxyCode`.
 
-| Symptom                                                                | Cause                                                                                                                                                                                                                                                                                              | Fix                                                                                                                                                                                                               |
-| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `proxy_error`, `blocked_host`                                          | docglean did not accept the signature or the address: origin not equal to URL base, wrong/missing key file, key id mismatch, expiry out of window (clock skew over 5 s, TTL over docglean max), or resolved IP not in `_ALLOW_CIDRS`. docglean deliberately gives the same answer for all of them. | Compare `MS365_MCP_ATTACHMENT_URL_BASE` with `..._ORIGIN` character by character; confirm `docker compose exec docglean getent hosts m365` is `10.89.1.2`; same key file in both; `docker compose logs docglean`. |
-| `fetch_failed` on a first read                                         | docglean reached m365 but m365 answered non-200: ticket spent/expired (404 is uniform), or Graph error (502)                                                                                                                                                                                       | Retry the call (each call mints a fresh ticket). Check `docker compose logs m365`. A 502 on redemption usually means the cached login expired: redo `--login`.                                                    |
-| `fetch_failed` on a repeat of the same URL                             | ticket spent: `read-document` tickets allow 3 fetches, counting failures, one at a time                                                                                                                                                                                                            | Mint a new one by calling `read-document` again. Only reproducible directly: see 7.                                                                                                                               |
-| `proxy_unreachable`                                                    | m365 cannot reach `http://docglean:8080/mcp` (down, still warming, wrong name). The server retries once with a fresh mint                                                                                                                                                                          | `docker compose ps`; `/readyz`; check `MS365_MCP_ATTACHMENT_PROXY` URL ends in `/mcp`. Wrong bearer gives `proxy_error` ("proxy refused the call"), not this.                                                     |
-| `identity_not_supported`                                               | server not running on its own cached account: OAuth/OBO/bearer mode, or a bearer header reached the tool                                                                                                                                                                                           | Use `--trust-proxy-auth`, no OBO, no `MS365_MCP_OAUTH_TOKEN`.                                                                                                                                                     |
-| `invalid_target`                                                       | target not a plain `/$value` or `/content` Graph path (absolute URL, query, fragment, `..`, encoded slash), or mint failed                                                                                                                                                                         | Use the shape in 5.3. Result message echoes the target.                                                                                                                                                           |
-| `no_capacity`                                                          | 256 live tickets held                                                                                                                                                                                                                                                                              | Wait for TTL.                                                                                                                                                                                                     |
-| `unsupported_format`                                                   | docglean could not identify the type (it uses the URL extension, then Content-Disposition filename, then Content-Type; ms-365 forwards Graph's type and filename)                                                                                                                                  | Check `contentType`/`name` in the error; unsupported types such as images are expected here.                                                                                                                      |
-| `too_large`                                                            | over 25 MB, or converted output limits                                                                                                                                                                                                                                                             | Smaller file; or raise docglean's cap deliberately.                                                                                                                                                               |
-| `password_required`                                                    | encrypted file                                                                                                                                                                                                                                                                                     | Expected for protected docs.                                                                                                                                                                                      |
-| `no_text_content` (`contentStatus` `no_text_layer` / `empty_document`) | conversion worked, no text                                                                                                                                                                                                                                                                         | Scan: expected before OCR. Blank: expected.                                                                                                                                                                       |
-| `no_text_in_selection`                                                 | `pages`/`offset` selected nothing                                                                                                                                                                                                                                                                  | You paged past the end; stop.                                                                                                                                                                                     |
-| `expand_not_allowed`                                                   | a `$expand` of attachments was attempted on a list call                                                                                                                                                                                                                                            | Do not expand; use `list-mail-attachments`.                                                                                                                                                                       |
+| Symptom                                                                | Cause                                                                                                                                                                                                                                                                                                                                                                                                                 | Fix                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `proxy_error`, `blocked_host`                                          | docglean did not accept the URL or the address: signing-mode mismatch (keyed ms-365 against a keyless docglean profile, or keyless ms-365 against a keyed-only profile), origin not equal to URL base, wrong/missing key file, key id mismatch, expiry out of window (clock skew over 5 s, TTL over docglean max), or resolved IP not in `_ALLOW_CIDRS`. docglean deliberately gives the same answer for all of them. | First check both sides use the same mode (section 1). Compare `MS365_MCP_ATTACHMENT_URL_BASE` with `..._ORIGIN` character by character; confirm `docker compose exec docglean getent hosts m365` is `10.89.1.2`; same key file in both (keyed mode); `docker compose logs docglean`. |
+| `fetch_failed` on a first read                                         | docglean reached m365 but m365 answered non-200: ticket spent/expired (404 is uniform), or Graph error (502)                                                                                                                                                                                                                                                                                                          | Retry the call (each call mints a fresh ticket). Check `docker compose logs m365`. A 502 on redemption usually means the cached login expired: redo `--login`.                                                                                                                       |
+| `fetch_failed` on a repeat of the same URL                             | ticket spent: `read-document` tickets allow 3 fetches, counting failures, one at a time                                                                                                                                                                                                                                                                                                                               | Mint a new one by calling `read-document` again. Only reproducible directly: see 7.                                                                                                                                                                                                  |
+| `proxy_unreachable`                                                    | m365 cannot reach `http://docglean:8080/mcp` (down, still warming, wrong name). The server retries once with a fresh mint                                                                                                                                                                                                                                                                                             | `docker compose ps`; `/readyz`; check `MS365_MCP_ATTACHMENT_PROXY` URL ends in `/mcp`. Wrong bearer gives `proxy_error` ("proxy refused the call"), not this.                                                                                                                        |
+| `identity_not_supported`                                               | server not running on its own cached account: OAuth/OBO/bearer mode, or a bearer header reached the tool                                                                                                                                                                                                                                                                                                              | Use `--trust-proxy-auth`, no OBO, no `MS365_MCP_OAUTH_TOKEN`.                                                                                                                                                                                                                        |
+| `invalid_target`                                                       | target not a plain `/$value` or `/content` Graph path (absolute URL, query, fragment, `..`, encoded slash), or mint failed                                                                                                                                                                                                                                                                                            | Use the shape in 5.3. Result message echoes the target.                                                                                                                                                                                                                              |
+| `no_capacity`                                                          | 256 live tickets held                                                                                                                                                                                                                                                                                                                                                                                                 | Wait for TTL.                                                                                                                                                                                                                                                                        |
+| `unsupported_format`                                                   | docglean could not identify the type (it uses the URL extension, then Content-Disposition filename, then Content-Type; ms-365 forwards Graph's type and filename)                                                                                                                                                                                                                                                     | Check `contentType`/`name` in the error; unsupported types such as images are expected here.                                                                                                                                                                                         |
+| `too_large`                                                            | over 25 MB, or converted output limits                                                                                                                                                                                                                                                                                                                                                                                | Smaller file; or raise docglean's cap deliberately.                                                                                                                                                                                                                                  |
+| `password_required`                                                    | encrypted file                                                                                                                                                                                                                                                                                                                                                                                                        | Expected for protected docs.                                                                                                                                                                                                                                                         |
+| `no_text_content` (`contentStatus` `no_text_layer` / `empty_document`) | conversion worked, no text                                                                                                                                                                                                                                                                                                                                                                                            | Scan: expected before OCR. Blank: expected.                                                                                                                                                                                                                                          |
+| `no_text_in_selection`                                                 | `pages`/`offset` selected nothing                                                                                                                                                                                                                                                                                                                                                                                     | You paged past the end; stop.                                                                                                                                                                                                                                                        |
+| `expand_not_allowed`                                                   | a `$expand` of attachments was attempted on a list call                                                                                                                                                                                                                                                                                                                                                               | Do not expand; use `list-mail-attachments`.                                                                                                                                                                                                                                          |
 
 ## 7. Negative checks
 
@@ -292,7 +286,7 @@ print(u.urlopen(r).read()[:600])"
 ```
 
 - First run: Markdown. Run it again with the same URL: `fetch_failed` (ticket spent; docglean sees ms-365's 404).
-- Expired: mint, wait 25 s, then try both. Direct fetch: 404. docglean: `blocked_host` (expiry is past its 5 s skew, so the URL is treated as unsigned and never dialled). Different code from the spent case on purpose: expired fails verification before any request, spent fails after.
+- Expired: mint, wait 25 s, then try both. Direct fetch: 404. docglean: in the keyed mode `blocked_host` (expiry is past its 5 s skew, so the URL is treated as unsigned and never dialled); in the unsigned mode there is no expiry to check, so docglean fetches and gets ms-365's 404, `fetch_failed`.
 - Budget of 3 is only visible for `read-document` tickets (`maxRedemptions` 3: docglean may probe then convert). `get-download-url` tickets are 1.
 - `get-upload-url` also exists under this profile; ignore it.
 
@@ -300,7 +294,7 @@ Restore: `docker compose --profile negative stop m365-mint && docker compose up 
 
 ### 7.3 Other cheap checks
 
-- Wrong key: write a different `secrets/attachment_url_key`, restart both: expect `blocked_host` on every read. Restore the key afterwards.
+- Mode mismatch: set `MS365_MCP_ATTACHMENT_URL_KEY` on ms-365 only (against the unsigned profile above): expect `blocked_host` on every read (not verified), with the operator hint in `message`. Unset it afterwards. (Keyed variant: a different key file on each side gives the same result.)
 - `read-document` with `"target":"https://graph.microsoft.com/v1.0/me/messages"`: `invalid_target`.
 - `read-document` with the bare attachment path (no `/$value`): `invalid_target`.
 - Stop docglean (`docker compose stop docglean`), call `read-document`: `proxy_unreachable` after one retry (two warn lines in `docker compose logs m365`).
@@ -315,3 +309,29 @@ docker rmi m365-mcp:e2e docglean-mcp:e2e
 ```
 
 Revoke the app consent in your Microsoft account if this was a throwaway sign-in.
+
+## Appendix A. Keyed variant (signed URLs)
+
+Use it when the docglean build predates the unsigned-ticket change, or you want signatures on top of the address pin. Both sides then read one key from the same file, and the docglean profile must not carry `_UNSIGNED_TICKET_PATH` (a keyless ms-365 would otherwise still be accepted).
+
+```bash
+mkdir -p secrets && umask 077
+openssl rand -hex 32 > secrets/attachment_url_key
+chmod 644 secrets/attachment_url_key     # docglean runs as uid 10001; throwaway test key
+docker compose -f docker-compose.yml -f docker-compose.keyed.yml up -d docglean   # Compose 2.24+
+```
+
+Use the same `-f` pair for every later `docker compose` command. The override adds the key file and key id to both services, and `MAX_TTL_S` to docglean. A trailing newline in the key file is fine: both sides strip it. Do not let an editor add a BOM. Delete the key at teardown.
+
+### Signing compatibility (checked against code)
+
+| Item              | ms-365 (`src/lib/url-signing.ts`, `attachment-url-config.ts`)                                                     | docglean (`signing.py`)                      | Match                                                                              |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Canonical string  | `v1\nscheme\nhost\nport\npath\nquery\nexpiry`, port always explicit, query minus `dgk/dgx/dgs`, sorted, re-quoted | same                                         | yes (documented as a port; ms-365 has Python-parity vectors)                       |
+| HMAC              | SHA-256, key = UTF-8 bytes, base64url, no padding                                                                 | same                                         | yes                                                                                |
+| Key id            | `MS365_MCP_ATTACHMENT_URL_KEY_ID`, default `1`                                                                    | `..._KEY_ID`, default `1`, compared to `dgk` | yes; keep both `1` or change both                                                  |
+| TTL               | `MS365_MCP_ATTACHMENT_URL_TTL_S`, default 120, hard max 300                                                       | `..._MAX_TTL_S`, default 300, plus 5 s skew  | yes; ms-365 can never exceed docglean's default. If you raise one, raise the other |
+| Key file          | stripped, rejects control chars                                                                                   | stripped                                     | yes                                                                                |
+| Host in signature | from `MS365_MCP_ATTACHMENT_URL_BASE` (`m365`), IPv6 literal refused                                               | from `_ORIGIN`                               | yes; both must say `m365:3001`                                                     |
+
+No blocking inconsistency found. Two operator-side facts that do bite: the docglean `_ORIGIN` must equal the URL base exactly (scheme, host, port), and `_ALLOW_CIDRS` must contain the resolved address of that host (here `10.89.1.2/32`).
