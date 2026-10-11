@@ -21,8 +21,17 @@ import type { CommandOptions } from './cli.ts';
 import { getCloudEndpoints } from './cloud-config.js';
 import { dumpError } from './crash-logging.js';
 import GraphClient from './graph-client.js';
-import { registerDiscoveryTools, registerGraphTools } from './graph-tools.js';
+import {
+  registerDiscoveryTools,
+  registerGraphTools,
+  utilityToolWillRegister,
+} from './graph-tools.js';
 import { configureAttachmentMinting } from './lib/attachment-minting.js';
+import { AttachmentProxyClient, PROXY_TOKEN_ENV } from './lib/attachment-proxy.js';
+import {
+  ATTACHMENT_PROXY_TIMEOUT_MS,
+  configureAttachmentProxy,
+} from './lib/attachment-proxy-runtime.js';
 import { AttachmentTicketStore } from './lib/attachment-tickets.js';
 import { ATTACHMENT_ROUTE, loadAttachmentUrlConfig } from './lib/attachment-url-config.js';
 import {
@@ -303,11 +312,18 @@ class MicrosoftGraphServer {
   }
 
   /**
-   * Gate for the tools/call response scrubber. Off until the attachment proxy
-   * lands: the --attachment-proxy flag should set this when it is given, and
-   * nothing else should. Left false, the server returns tool results untouched.
+   * Is proxy mode actually in force? Gates the tools/call response scrubber, the registration
+   * of read-document and the suppression of the byte tools. With the flag off the server
+   * returns tool results untouched.
+   *
+   * HTTP mode is part of the answer: the proxy reads a document by dialling this server's
+   * attachment listener, and stdio has none. A stdio run with the flag is plain behaviour
+   * plus one warning, rather than a server with every byte tool removed and nothing put in
+   * their place. One definition, because createMcpServer and start() both need it.
    */
-  private attachmentProxyActive = false;
+  private get attachmentProxyActive(): boolean {
+    return Boolean(this.options.attachmentProxy) && Boolean(this.options.http);
+  }
 
   private hidesStdioOnlyTools(): boolean {
     return Boolean(this.options.http) && !this.options.httpLocalFileTools;
@@ -344,6 +360,7 @@ class MicrosoftGraphServer {
       allowedScopes: this.options.allowedScopes,
       httpMode: this.hidesStdioOnlyTools(),
       userFields: this.options.userFields,
+      attachmentProxy: this.attachmentProxyActive,
     };
 
     if (this.options.discovery) {
@@ -491,6 +508,36 @@ class MicrosoftGraphServer {
       logger.warn(
         '--enable-attachment-urls has no effect in stdio mode and is being ignored: ' +
           'the minted URL has to be reachable over HTTP. Start with --http to use it.'
+      );
+    }
+
+    if (this.options.attachmentProxy && !this.options.http) {
+      logger.warn(
+        '--attachment-proxy has no effect in stdio mode and is being ignored: the proxy reads a ' +
+          "document by fetching a URL from this server's attachment listener, and stdio has none. " +
+          'Every byte tool stays registered. Start with --http to use it.'
+      );
+    }
+
+    // Under --attachment-proxy read-document is the only readable path to any document, and a
+    // filter that drops it leaves a server whose byte tools are gone and whose replacement
+    // never registered. Asks the same selector registration asks.
+    if (
+      this.attachmentProxyActive &&
+      !utilityToolWillRegister('read-document', {
+        readOnly: Boolean(this.options.readOnly),
+        httpMode: this.hidesStdioOnlyTools(),
+        enabledTools: this.options.enabledTools,
+        attachmentProxy: true,
+      })
+    ) {
+      logger.warn(
+        '--attachment-proxy is set but read-document is NOT registered, so no document on this ' +
+          'server can be read at all: download-bytes, get-download-url and get-mail-message-mime ' +
+          'are suppressed and nothing replaced them. The active tool filter ' +
+          `(--enabled-tools / ENABLED_TOOLS = ${JSON.stringify(this.options.enabledTools ?? null)}) ` +
+          'excludes it. Add read-document to the filter, drop the filter, or remove ' +
+          '--attachment-proxy.'
       );
     }
 
@@ -1125,11 +1172,48 @@ class MicrosoftGraphServer {
       // loadAttachmentUrlConfig throws on a half-configured feature, and that
       // exception is deliberately not caught: failing to start names the bad
       // variable once, to the person who can fix it.
-      const attachmentConfig = loadAttachmentUrlConfig(Boolean(this.options.enableAttachmentUrls));
+      const attachmentConfig = loadAttachmentUrlConfig(
+        Boolean(this.options.enableAttachmentUrls) || this.attachmentProxyActive
+      );
+      // The signing key is optional for plain --enable-attachment-urls but not here: the
+      // proxy verifies the URL signature before it dials a private address, so keyless URLs
+      // would make every read-document call fail at the proxy rather than at startup.
+      if (this.attachmentProxyActive && !attachmentConfig?.key) {
+        throw new Error(
+          '--attachment-proxy requires a URL signing key: set MS365_MCP_ATTACHMENT_URL_KEY ' +
+            '(or MS365_MCP_ATTACHMENT_URL_KEY_FILE). The proxy verifies the signature on the ' +
+            'URL it is handed before fetching it, so an unsigned URL is never read. The key is ' +
+            'optional only for --enable-attachment-urls without --attachment-proxy.'
+        );
+      }
       let attachmentApp: express.Express | null = null;
       if (attachmentConfig) {
         const ticketStore = new AttachmentTicketStore(attachmentConfig.ttlSeconds);
         configureAttachmentMinting({ store: ticketStore, config: attachmentConfig });
+
+        // The document proxy, when one was configured. Built here because it belongs with
+        // the listener it feeds: the URL this client hands the proxy is minted by the store
+        // above and redeemed on the route mounted below.
+        if (this.attachmentProxyActive) {
+          const proxyUrl = String(this.options.attachmentProxy);
+          // The bearer credential is NOT injected here. `AttachmentProxyClient` reads
+          // `PROXY_TOKEN_ENV` itself, per call; wrapping fetch to add the header as well
+          // would send `Bearer x, Bearer x` and be answered 401. One owner only.
+          configureAttachmentProxy({
+            client: new AttachmentProxyClient({
+              url: proxyUrl,
+              timeoutMs: ATTACHMENT_PROXY_TIMEOUT_MS,
+            }),
+            url: proxyUrl,
+          });
+          logger.info(
+            `  - Document proxy: ${proxyUrl} (read-document only; download-bytes, ` +
+              `get-download-url and get-mail-message-mime are NOT registered` +
+              `${process.env[PROXY_TOKEN_ENV] ? ', bearer credential set' : ', no bearer credential set'})`
+          );
+        } else {
+          configureAttachmentProxy(null);
+        }
 
         // Where the route goes.
         //
@@ -1222,6 +1306,7 @@ class MicrosoftGraphServer {
         }
       } else {
         configureAttachmentMinting(null);
+        configureAttachmentProxy(null);
       }
 
       // Health check endpoint
