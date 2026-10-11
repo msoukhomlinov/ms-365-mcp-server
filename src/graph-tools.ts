@@ -20,6 +20,7 @@ import { getAttachmentMinting } from './lib/attachment-minting.js';
 import { MAX_UPLOAD_BYTES } from './attachment-route.js';
 import {
   buildAttachmentUrl,
+  type DownloadProbe,
   isPlainGraphPath,
   isUnalteredGraphPath,
   TicketStoreFullError,
@@ -1150,13 +1151,47 @@ async function mintUploadUrl(
   };
 }
 
+// A single mail or event attachment's bytes. Graph gives `name` and `contentType` for these
+// and for nothing else a /$value reaches: $select on a photo or a message is a guaranteed 400.
+const MAIL_EVENT_ATTACHMENT_VALUE =
+  /^(?:\/me|\/users\/[^/]+|\/groups\/[^/]+)\/(?:messages|events)\/[^/]+\/attachments\/[^/]+\/\$value$/;
+
+/**
+ * Ask Graph what it says an attachment is, for the redemption route to fall back on when the
+ * `/$value` response carries only the generic default. Used exactly as Graph states it, with
+ * no inference: a null `contentType` yields nothing, and the route behaves as it always did.
+ * Any failure is swallowed -- a probe must never block or replace the mint.
+ */
+async function probeMailEventAttachment(
+  target: string,
+  graphClient: Pick<GraphClient, 'makeRequest'>,
+  accessToken: string | undefined
+): Promise<DownloadProbe> {
+  if (!MAIL_EVENT_ATTACHMENT_VALUE.test(target)) return {};
+  try {
+    const meta = (await graphClient.makeRequest(
+      `${target.slice(0, -'/$value'.length)}?$select=name,contentType`,
+      { accessToken }
+    )) as { name?: unknown; contentType?: unknown } | null;
+    return {
+      ...(typeof meta?.contentType === 'string' && { probedContentType: meta.contentType }),
+      ...(typeof meta?.name === 'string' && { probedName: meta.name }),
+    };
+  } catch {
+    return {};
+  }
+}
+
 export async function mintDownloadUrl(
   target: string,
   accountParam: string | undefined,
   authManager: AuthManager | undefined,
   // Default is one fetch. A caller whose flow probes, converts or paginates one URL opts in
   // to a small finite count; get-download-url itself never does.
-  options: { maxRedemptions?: number } = {}
+  // `probeWith` opts in to the content-type probe: pass the Graph client to ask it what a
+  // mail or event attachment is, so a generic response header can be corrected. Absent, the
+  // mint is exactly what get-download-url has always done.
+  options: { maxRedemptions?: number; probeWith?: Pick<GraphClient, 'makeRequest'> } = {}
 ): Promise<CallToolResult | null> {
   const minting = getAttachmentMinting();
   if (!minting) return null;
@@ -1228,11 +1263,18 @@ export async function mintDownloadUrl(
   }
 
   const maxRedemptions = options.maxRedemptions ?? 1;
+  const probe = options.probeWith
+    ? await probeMailEventAttachment(
+        target,
+        options.probeWith,
+        requestToken ?? (await authManager?.getTokenForAccount(accountParam).catch(() => undefined))
+      )
+    : {};
   let ticket: { id: string; expiresAtMs: number };
   try {
     ticket = requestToken
-      ? minting.store.mintWithToken(target, requestToken, undefined, maxRedemptions)
-      : minting.store.mint(target, accountParam, undefined, maxRedemptions);
+      ? minting.store.mintWithToken(target, requestToken, undefined, maxRedemptions, probe)
+      : minting.store.mint(target, accountParam, undefined, maxRedemptions, probe);
   } catch (error) {
     if (error instanceof TicketStoreFullError) {
       return {

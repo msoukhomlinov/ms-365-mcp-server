@@ -120,6 +120,16 @@ export type TicketIdentity =
   | { readonly kind: 'request-token'; readonly accessToken: string };
 
 /**
+ * What Graph's own metadata said about a mail or event attachment at mint time. Plain data:
+ * the redemption route decides whether to use it, so a stale or wrong probe can never cost
+ * more than falling back to what the fetch itself reports.
+ */
+export type DownloadProbe = {
+  readonly probedContentType?: string;
+  readonly probedName?: string;
+};
+
+/**
  * What redeeming the ticket does. A download ticket authorises one GET of
  * `target`; an upload ticket authorises one PUT of a file that becomes an
  * attachment in the `target` collection (a draft message's or an event's
@@ -127,7 +137,7 @@ export type TicketIdentity =
  * pick the branch it was written for and cannot serve the other by accident.
  */
 export type TicketPurpose =
-  | { readonly purpose: 'download' }
+  | ({ readonly purpose: 'download' } & DownloadProbe)
   | {
       readonly purpose: 'upload';
       /** Attachment name as Graph will store it. */
@@ -237,36 +247,39 @@ export class AttachmentTicketStore {
 
   /**
    * Mint a ticket redeemed with this server's own token for `accountName`.
-   * `maxRedemptions` (1 to MAX_REDEMPTIONS, default 1) is how many attempts it is good for.
+   * `maxRedemptions` (1 to MAX_REDEMPTIONS, default 1) is how many attempts it is good for;
+   * `probe` is what Graph's metadata said about the target, if the minting caller asked.
    */
   mint(
     target: string,
     accountName: string | undefined,
     nowMs: number = Date.now(),
-    maxRedemptions = 1
+    maxRedemptions = 1,
+    probe: DownloadProbe = {}
   ): { id: string; expiresAtMs: number } {
     return this.add(
       target,
       { kind: 'server-account', accountName },
       nowMs,
-      undefined,
+      { purpose: 'download', ...probe },
       maxRedemptions
     );
   }
 
-  /** Mint a ticket redeemed with `accessToken` and nothing else; `maxRedemptions` as for `mint`. */
+  /** Mint a ticket redeemed with `accessToken` and nothing else; `maxRedemptions` and `probe` as for `mint`. */
   mintWithToken(
     target: string,
     accessToken: string,
     nowMs: number = Date.now(),
-    maxRedemptions = 1
+    maxRedemptions = 1,
+    probe: DownloadProbe = {}
   ): { id: string; expiresAtMs: number } {
     if (!accessToken) throw new Error('A request-token ticket needs a token');
     return this.add(
       target,
       { kind: 'request-token', accessToken },
       nowMs,
-      undefined,
+      { purpose: 'download', ...probe },
       maxRedemptions
     );
   }
