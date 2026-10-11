@@ -1,0 +1,121 @@
+# Topology for the attachment -> docglean e2e run (see ../e2e-attachment-to-markdown.md).
+#
+#   agent-net   10.89.0.0/24  normal bridge: m365 MCP port (3000) + Graph egress
+#   convert-net 10.89.1.0/24  internal (no egress): m365 attachment port (3001) + docglean
+#
+# m365 binds /mcp to 10.89.0.2 and /attachment to 10.89.1.2, so docglean (convert-net only)
+# has no socket to dial on :3000 at all.
+#
+# Required env (put them in ./.env next to this file; the walkthrough writes it):
+#   DOCGLEAN_REPO, DOCGLEAN_TOKEN   (M365_REPO optional; defaults to this repo)
+# Required files: ./secrets/attachment_url_key (see step 1 of the walkthrough)
+
+name: e2e
+
+x-m365: &m365
+  image: m365-mcp:e2e
+  build:
+    context: ${M365_REPO:-../..}
+  environment: &m365-env
+    MS365_MCP_ATTACHMENT_URL_BASE: http://m365:3001
+    MS365_MCP_ATTACHMENT_URL_KEY_FILE: /run/secrets/attachment_url_key
+    MS365_MCP_ATTACHMENT_URL_KEY_ID: '1'
+    MS365_MCP_TOKEN_CACHE_PATH: /data/.token-cache.json
+    MS365_MCP_SELECTED_ACCOUNT_PATH: /data/.selected-account.json
+    MS365_MCP_USE_KEYTAR: '0'
+    # Personal Microsoft accounts: export MS365_MCP_TENANT_ID=consumers before `up`/`login`.
+    MS365_MCP_TENANT_ID: ${MS365_MCP_TENANT_ID:-common}
+  secrets: [attachment_url_key]
+  volumes: ['m365-data:/data']
+
+services:
+  docglean:
+    build:
+      context: ${DOCGLEAN_REPO:?set DOCGLEAN_REPO}
+    image: docglean-mcp:e2e
+    environment:
+      DOCGLEAN_MCP_BEARER_TOKEN: ${DOCGLEAN_TOKEN:?set DOCGLEAN_TOKEN}
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ORIGIN: http://m365:3001
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_FILE: /run/secrets/attachment_url_key
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_KEY_ID: '1'
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_ALLOW_CIDRS: '["10.89.1.2/32"]'
+      DOCGLEAN_MCP_SIGNED_ORIGIN_M365_MAX_TTL_S: '300'
+      DOCGLEAN_MCP_ALLOW_INSECURE_SIGNED_ORIGIN: 'true' # plain http on an internal bridge
+    secrets: [attachment_url_key]
+    networks:
+      convert-net: { ipv4_address: 10.89.1.3 }
+
+  m365:
+    <<: *m365
+    command:
+      - --http
+      - 10.89.0.2:3000
+      - --trust-proxy-auth
+      - --preset
+      - mail
+      - --attachment-proxy
+      - http://docglean:8080/mcp
+      - --attachment-port
+      - '3001'
+      - --attachment-host
+      - 10.89.1.2
+    environment:
+      <<: *m365-env
+      MS365_MCP_ATTACHMENT_PROXY_TOKEN: ${DOCGLEAN_TOKEN:?set DOCGLEAN_TOKEN}
+    depends_on:
+      docglean: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://10.89.0.2:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    # Optional host access for an MCP client on your Mac. Whether Docker forwards to the
+    # agent-net address of a two-network container is NOT verified; the walkthrough uses
+    # `docker compose exec` instead.
+    # ports: ["127.0.0.1:3000:3000"]
+    networks:
+      agent-net: { ipv4_address: 10.89.0.2 }
+      convert-net: { ipv4_address: 10.89.1.2 }
+
+  # Negative checks only (walkthrough step 7): same addresses and the alias `m365`, no document
+  # proxy, so get-download-url exists and prints a URL. Stop `m365` before starting this.
+  m365-mint:
+    <<: *m365
+    profiles: [negative]
+    command:
+      - --http
+      - 10.89.0.2:3000
+      - --trust-proxy-auth
+      - --preset
+      - mail
+      - --enable-attachment-urls
+      - --attachment-port
+      - '3001'
+      - --attachment-host
+      - 10.89.1.2
+    environment:
+      <<: *m365-env
+      MS365_MCP_ATTACHMENT_URL_TTL_S: '20'
+    networks:
+      agent-net: { ipv4_address: 10.89.0.2 }
+      convert-net: { ipv4_address: 10.89.1.2, aliases: [m365] }
+
+networks:
+  agent-net:
+    ipam: { config: [{ subnet: 10.89.0.0/24 }] }
+  convert-net:
+    internal: true
+    ipam: { config: [{ subnet: 10.89.1.0/24 }] }
+
+volumes:
+  m365-data:
+
+secrets:
+  attachment_url_key:
+    file: ./secrets/attachment_url_key

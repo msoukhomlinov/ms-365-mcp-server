@@ -984,6 +984,8 @@ on the same instance. Behind a load balancer that means one replica or sticky ro
 reading to an MCP conversion proxy such as [docglean-mcp](https://github.com/msoukhomlinov/docglean-mcp),
 so a PDF or Word attachment reaches the model as markdown rather than base64. The proxy must
 expose `convert_to_markdown(uri, pages?, offset?, max_chars?)` over stateless Streamable HTTP.
+For a step-by-step setup from a mail attachment to Markdown, with a compose file, see
+[docs/e2e-attachment-to-markdown.md](docs/e2e-attachment-to-markdown.md).
 
 - **Tools.** `read-document` (`target`, `pages`, `offset`, `maxChars`) is registered, and
   `download-bytes`, `get-download-url` and `get-mail-message-mime` are not. Tool descriptions,
