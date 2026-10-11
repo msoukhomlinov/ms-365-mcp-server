@@ -47,6 +47,7 @@ import {
   TIMEZONE_PARAM_DESCRIPTION,
   TOP_UNSUPPORTED_DELTA_TOOLS,
 } from './lib/param-descriptions.js';
+import { stripStaleToolGuidance } from './lib/guidance-text.js';
 import { describePathParam } from './lib/path-params.js';
 import { queryParameterSchema } from './lib/query-parameter-schema.js';
 import {
@@ -2519,14 +2520,107 @@ export function utilityToolWillRegister(name: string, gates: UtilityToolGates): 
   return selectUtilityTools(gates).some((utility) => utility.name === name);
 }
 
+/**
+ * What read-document says in place of the guidance that named the tools `--attachment-proxy`
+ * removed. Written once and appended wherever a sentence was dropped, carrying the part of those
+ * sentences worth keeping: the exact target shapes, including the `/$value` suffix a mail
+ * attachment needs.
+ *
+ * The scrubber sentence describes a mechanism rather than promising an absence: proxy
+ * suppression matches only GET paths ending in `/$value`, so graph-batch can still batch such a
+ * GET (see isProxySuppressedGraphTool). The identity sentence is here because this text is
+ * appended to Graph tool descriptions: without it a model reading list-mail-attachments is sent
+ * to a tool that answers identity_not_supported in OAuth, OBO and bearer deployments.
+ */
+export const PROXY_DOCUMENT_READ_GUIDANCE =
+  'Read the content with read-document, which returns markdown and takes the same relative Microsoft ' +
+  'Graph path: a mail or event attachment keeps its /$value suffix ' +
+  '(/me/messages/{message-id}/attachments/{attachment-id}/$value), a drive or SharePoint file its ' +
+  '/content (/drives/{drive-id}/items/{driveItem-id}/content). ' +
+  'Byte payloads are stripped from tool results here: any contentBytes field, and any large base64 ' +
+  'value. ' +
+  'read-document refuses with identity_not_supported when Graph identity comes from the request ' +
+  '(OAuth, OBO, or bearer mode) rather than from the server token cache.';
+
+/** Every gate that decides whether a tool -- Graph or utility -- is registered. */
+export interface ToolRegistrationGates extends UtilityToolGates {
+  orgMode?: boolean;
+  /** Raw --allowed-scopes value, parsed the way registration parses it. */
+  allowedScopes?: string;
+}
+
+/**
+ * THE set of tool names a configuration exposes. Everything that needs to know "does this server
+ * have tool X" asks this and nothing re-derives it.
+ *
+ * Not a delta between two selections: a tool dropped by two gates at once (proxy mode AND an
+ * --enabled-tools regex) is missing from both sides of a delta, cancels out, and reads as still
+ * registered. The Graph half is `buildToolsRegistry` and the utility half `selectUtilityTools`,
+ * the same functions registration calls.
+ */
+export function resolveRegisteredToolNames(gates: ToolRegistrationGates): Set<string> {
+  const names = new Set<string>();
+  const registry = buildToolsRegistry(
+    Boolean(gates.readOnly),
+    Boolean(gates.orgMode),
+    compileToolFilter(gates.enabledTools),
+    gates.allowedScopes,
+    [],
+    Boolean(gates.attachmentProxy)
+  );
+  for (const name of registry.keys()) names.add(name);
+  for (const utility of selectUtilityTools(gates)) names.add(utility.name);
+  return names;
+}
+
+/**
+ * The tools --attachment-proxy takes away, from their markings alone (not a delta between two
+ * selections, for the reason given on resolveRegisteredToolNames).
+ */
+export function proxySuppressedToolNames(gates: UtilityToolGates): string[] {
+  if (!gates.attachmentProxy) return [];
+  const utilityNames = UTILITY_TOOLS.filter((utility) => utility.bytesToModel).map(
+    (utility) => utility.name
+  );
+  const graphNames = endpointsData
+    .filter((endpoint) => isProxySuppressedGraphTool(endpoint.method, endpoint.pathPattern))
+    .map((endpoint) => endpoint.toolName);
+  return [...new Set([...utilityNames, ...graphNames])];
+}
+
+/**
+ * Guidance rewriter for one resolved configuration: drops the sentences that direct the model at
+ * a byte tool --attachment-proxy took away, and points at read-document instead.
+ *
+ * Scoped to those tools, NOT to every name absent from the registered set, because a sentence
+ * carries more than one fact and dropping it destroys all of them: update-planner-bucket's whole
+ * tip is one sentence requiring an If-Match ETag from get-planner-bucket, and losing it because
+ * that tool is filtered out costs a 412 nobody can explain. Naming an unregistered tool costs one
+ * failed call whose error says what is wrong. The byte-tool sentences are safe to drop because
+ * "call download-bytes with target=X" is a direction and nothing else.
+ *
+ * The replacement is offered only when read-document actually registered: an --enabled-tools
+ * filter can drop it too, and substituting one unregistered name for another fixes nothing.
+ */
+export function createGuidanceFilter(gates: ToolRegistrationGates): (text: string) => string {
+  const registered = resolveRegisteredToolNames(gates);
+  const suppressed = proxySuppressedToolNames(gates).filter((name) => !registered.has(name));
+  if (suppressed.length === 0) return (text: string) => text;
+  const replacement = registered.has('read-document')
+    ? { text: PROXY_DOCUMENT_READ_GUIDANCE, whenDropped: suppressed }
+    : undefined;
+  return (text: string) => stripStaleToolGuidance(text, suppressed, replacement);
+}
+
 function registerUtilityToolWithMcp(
   server: McpServer,
   utility: UtilityTool,
-  ctx: UtilityToolContext
+  ctx: UtilityToolContext,
+  filterGuidance: (text: string) => string = (text) => text
 ): void {
   server.tool(
     utility.name,
-    utility.description,
+    filterGuidance(utility.description),
     utility.buildSchema(ctx),
     {
       title: utility.name,
@@ -3770,6 +3864,14 @@ export function registerGraphTools(
   let failedCount = 0;
   const allowedScopes = parseAllowedScopes(allowedScopesValue);
   const disabledByAllowedScopes: DisabledToolScope[] = [];
+  const filterGuidance = createGuidanceFilter({
+    readOnly,
+    orgMode,
+    httpMode,
+    enabledTools: enabledToolsPattern,
+    allowedScopes: allowedScopesValue,
+    attachmentProxy,
+  });
   const deniedTools = collectDeniedToolPolicies({
     readOnly,
     orgMode,
@@ -3919,13 +4021,20 @@ export function registerGraphTools(
     }
 
     // Build the tool description, optionally appending LLM tips
+    // The base text and the tip are filtered separately, before they are joined: the filter works
+    // a sentence at a time and the "\n\n💡 TIP: " seam is not a sentence boundary.
     let toolDescription = withApiVersionPrefix(
-      (endpointConfig?.descriptionOverride ?? tool.description) ||
-        `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
+      filterGuidance(
+        (endpointConfig?.descriptionOverride ?? tool.description) ||
+          `Execute ${tool.method.toUpperCase()} request to ${tool.path}`
+      ),
       endpointConfig
     );
     if (endpointConfig?.llmTip) {
-      toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
+      // A tip filtered down to nothing gets no header: an empty "💡 TIP:" promises advice that
+      // is not there.
+      const tip = filterGuidance(endpointConfig.llmTip);
+      if (tip.length > 0) toolDescription += `\n\n💡 TIP: ${tip}`;
     }
 
     // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
@@ -3985,7 +4094,7 @@ export function registerGraphTools(
     attachmentProxy,
   })) {
     try {
-      registerUtilityToolWithMcp(server, utility, utilityCtx);
+      registerUtilityToolWithMcp(server, utility, utilityCtx, filterGuidance);
       registeredCount++;
     } catch (error) {
       logger.error(`Failed to register tool ${utility.name}: ${(error as Error).message}`);
@@ -4222,6 +4331,14 @@ export function registerDiscoveryTools(
     userFields,
   };
   const utilityByName = new Map(utilityTools.map((u) => [u.name, u]));
+  const filterGuidance = createGuidanceFilter({
+    readOnly,
+    orgMode,
+    httpMode,
+    enabledTools,
+    allowedScopes: allowedScopesValue,
+    attachmentProxy,
+  });
 
   const categoryNames = Object.keys(TOOL_CATEGORIES).join(', ');
 
@@ -4229,16 +4346,19 @@ export function registerDiscoveryTools(
     const entry = toolsRegistry.get(name);
     if (entry) {
       const { tool, config } = entry;
+      const llmTip = config?.llmTip ? filterGuidance(config.llmTip) : undefined;
       return {
         name,
         method: tool.method.toUpperCase(),
         path: tool.path,
         description: withApiVersionPrefix(
-          (config?.descriptionOverride ?? tool.description) ||
-            `${tool.method.toUpperCase()} ${tool.path}`,
+          filterGuidance(
+            (config?.descriptionOverride ?? tool.description) ||
+              `${tool.method.toUpperCase()} ${tool.path}`
+          ),
           config
         ),
-        ...(config?.llmTip ? { llmTip: config.llmTip } : {}),
+        ...(llmTip ? { llmTip } : {}),
       };
     }
     const utility = utilityByName.get(name);
@@ -4247,7 +4367,7 @@ export function registerDiscoveryTools(
         name: utility.name,
         method: utility.method,
         path: utility.path,
-        description: utility.description,
+        description: filterGuidance(utility.description),
       };
     }
     return null;
@@ -4332,14 +4452,24 @@ export function registerDiscoveryTools(
     async ({ tool_name }) => {
       const entry = toolsRegistry.get(tool_name);
       if (entry) {
-        const schema = describeToolSchema(entry.tool, entry.config, { multiAccount, accountNames });
+        const described = describeToolSchema(entry.tool, entry.config, {
+          multiAccount,
+          accountNames,
+        });
+        // The same guidance strings search-tools returns, reaching the model by a second route.
+        const schema = {
+          ...described,
+          description: filterGuidance(described.description),
+          ...(described.llmTip ? { llmTip: filterGuidance(described.llmTip) } : {}),
+        };
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };
       }
       const utility = utilityByName.get(tool_name);
       if (utility) {
-        const schema = describeUtilityToolSchema(utility, utilityCtx);
+        const described = describeUtilityToolSchema(utility, utilityCtx);
+        const schema = { ...described, description: filterGuidance(described.description) };
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };
