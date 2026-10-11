@@ -39,6 +39,7 @@ import { installToolSchemaRefNormalization } from './normalize-tool-schema.js';
 import { MicrosoftOAuthProvider } from './oauth-provider.js';
 import OboClient from './obo-client.js';
 import { requestContext } from './request-context.js';
+import { installResponseScrubbing } from './response-scrubbing.js';
 import { getSecrets, type AppSecrets } from './secrets.js';
 
 const LOOPBACK_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]'];
@@ -301,6 +302,13 @@ class MicrosoftGraphServer {
     return !publicUrl && isLoopbackHost(parseHttpOption(this.options.http).host);
   }
 
+  /**
+   * Gate for the tools/call response scrubber. Off until the attachment proxy
+   * lands: the --attachment-proxy flag should set this when it is given, and
+   * nothing else should. Left false, the server returns tool results untouched.
+   */
+  private attachmentProxyActive = false;
+
   private hidesStdioOnlyTools(): boolean {
     return Boolean(this.options.http) && !this.options.httpLocalFileTools;
   }
@@ -349,6 +357,12 @@ class MicrosoftGraphServer {
     // refs for recursive/shared Microsoft Graph schemas and hard-codes its conversion
     // options, so normalize the emitted schemas here. See issue #571.
     installToolSchemaRefNormalization(server);
+
+    // Installed after every tool is registered because it decorates the tools/call
+    // handler the registrations create. Inactive unless attachmentProxyActive is set.
+    if (this.attachmentProxyActive) {
+      installResponseScrubbing(server);
+    }
 
     return server;
   }
