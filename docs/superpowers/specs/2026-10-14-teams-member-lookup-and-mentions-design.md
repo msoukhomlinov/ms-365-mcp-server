@@ -52,6 +52,7 @@ The Planner task-chat post tool also accepts mentions, but with a different body
 Written first, in `src/__tests__/graph-tools.test.ts`, mirroring the existing `$search` normalization tests.
 
 PR A:
+
 - match on name
 - match on email
 - no match returns empty `value`
@@ -60,6 +61,7 @@ PR A:
 - filter runs after projection, and a field removed by projection is not matched
 
 PR B:
+
 - single mention
 - multiple mentions
 - id collision with hand-built mentions

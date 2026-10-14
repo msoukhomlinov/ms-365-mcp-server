@@ -13,13 +13,13 @@ Portal labels below are from memory and may differ; when a step does not match t
 
 ## The questions
 
-| # | Question | Why it matters |
-|---|---|---|
-| Q1 | Can a bot be registered through the **Teams Developer Portal** with **no Azure subscription**? | Decides whether the Azure dependency exists at all |
-| Q2 | Does an app holding only per-team RSC (`*.Group`) permissions read channel messages **without** the protected-API request form? | Decides whether reads work without a Microsoft approval request |
-| Q3 | Does Graph `POST .../messages` honour `ChannelMessage.Send.Group` for an app-only caller? | If yes, top-level posts need no bot |
-| Q4 | Can the bot post a new thread and a reply through the Bot Connector with **no messaging endpoint**, and where does the `serviceUrl` come from? | Decides whether writes work and how the service learns the regional URL |
-| Q5 | Does the RSC grant stay scoped: a team without the app installed is refused? | Proves the per-team boundary |
+| #   | Question                                                                                                                                       | Why it matters                                                          |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Q1  | Can a bot be registered through the **Teams Developer Portal** with **no Azure subscription**?                                                 | Decides whether the Azure dependency exists at all                      |
+| Q2  | Does an app holding only per-team RSC (`*.Group`) permissions read channel messages **without** the protected-API request form?                | Decides whether reads work without a Microsoft approval request         |
+| Q3  | Does Graph `POST .../messages` honour `ChannelMessage.Send.Group` for an app-only caller?                                                      | If yes, top-level posts need no bot                                     |
+| Q4  | Can the bot post a new thread and a reply through the Bot Connector with **no messaging endpoint**, and where does the `serviceUrl` come from? | Decides whether writes work and how the service learns the regional URL |
+| Q5  | Does the RSC grant stay scoped: a team without the app installed is refused?                                                                   | Proves the per-team boundary                                            |
 
 ## Setup (tenant admin)
 
@@ -33,7 +33,7 @@ Portal labels below are from memory and may differ; when a step does not match t
 2. Record: did it ask for an Azure subscription? Did it create an app id and a client secret for you? Is the bot single-tenant? Record the app id as `APP_ID`, the tenant id as `TENANT`, and the secret via `read -s APP_SECRET`.
 3. If the portal route is unavailable or demands an Azure subscription, stop this step and record it. Fall back to an Entra app registration (single tenant, client secret) and, only if Azure is acceptable, an Azure Bot resource with the Teams channel enabled and **no messaging endpoint**. Continue with that app id.
 
-**Q1 result:** portal registration works without Azure: yes / no. Details: ______
+**Q1 result:** portal registration works without Azure: yes / no. Details: **\_\_**
 
 ## Step 2: build and install the test Teams app
 
@@ -122,31 +122,31 @@ Record: HTTP statuses, whether both messages appear in the channel, and that the
 
 ## Results table
 
-| Q | Result (pass / fail / partial) | HTTP status | Verbatim error or note |
-|---|---|---|---|
-| Q1 portal registration without Azure | | | |
-| Q2 RSC-only reads without protected-API form | | | |
-| Q3 Graph POST app-only | | | |
-| Q4 thread post via Bot Connector | | | |
-| Q4 thread reply via Bot Connector | | | |
-| Q4 working serviceUrl region | | | |
-| Q5 uninstalled team refused | | | |
-| RSC-only app accepted without `bots[]` | | | |
+| Q                                            | Result (pass / fail / partial) | HTTP status | Verbatim error or note |
+| -------------------------------------------- | ------------------------------ | ----------- | ---------------------- |
+| Q1 portal registration without Azure         |                                |             |                        |
+| Q2 RSC-only reads without protected-API form |                                |             |                        |
+| Q3 Graph POST app-only                       |                                |             |                        |
+| Q4 thread post via Bot Connector             |                                |             |                        |
+| Q4 thread reply via Bot Connector            |                                |             |                        |
+| Q4 working serviceUrl region                 |                                |             |                        |
+| Q5 uninstalled team refused                  |                                |             |                        |
+| RSC-only app accepted without `bots[]`       |                                |             |                        |
 
 ## Decisions the results drive
 
-| Result | What it means for the design |
-|---|---|
-| Q1 yes | No Azure subscription needed. Remove that dependency from the scope. |
-| Q1 no | Writes from day one require an Azure subscription and an Azure Bot resource, or the dedicated service-account option instead. |
-| Q2 pass | Reads work with per-team consent only. No Microsoft access request. |
-| Q2 fail | Reads need the protected-API request, which is slow and not guaranteed. Reconsider read paths. |
-| Q3 pass | Top-level posts can go through Graph. The bot would then only be needed for replies and edits. |
-| Q3 fail | As expected. Writes go through the bot. |
-| Q4 pass | The bot-only-outbound design works. Use the recorded `serviceUrl` approach. |
-| Q4 fail on all regions | The service needs a messaging endpoint so it can learn the `serviceUrl`. That changes deployment (inbound HTTPS). |
-| Q5 pass | The per-team boundary is real. The service-side allowlist is defence in depth. |
-| Q5 fail | The app can read teams it is not installed in. Stop: the security model in the scope is wrong. |
+| Result                 | What it means for the design                                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Q1 yes                 | No Azure subscription needed. Remove that dependency from the scope.                                                          |
+| Q1 no                  | Writes from day one require an Azure subscription and an Azure Bot resource, or the dedicated service-account option instead. |
+| Q2 pass                | Reads work with per-team consent only. No Microsoft access request.                                                           |
+| Q2 fail                | Reads need the protected-API request, which is slow and not guaranteed. Reconsider read paths.                                |
+| Q3 pass                | Top-level posts can go through Graph. The bot would then only be needed for replies and edits.                                |
+| Q3 fail                | As expected. Writes go through the bot.                                                                                       |
+| Q4 pass                | The bot-only-outbound design works. Use the recorded `serviceUrl` approach.                                                   |
+| Q4 fail on all regions | The service needs a messaging endpoint so it can learn the `serviceUrl`. That changes deployment (inbound HTTPS).             |
+| Q5 pass                | The per-team boundary is real. The service-side allowlist is defence in depth.                                                |
+| Q5 fail                | The app can read teams it is not installed in. Stop: the security model in the scope is wrong.                                |
 
 ## Clean-up
 

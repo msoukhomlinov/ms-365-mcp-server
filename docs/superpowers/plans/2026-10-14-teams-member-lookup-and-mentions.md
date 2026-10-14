@@ -52,10 +52,12 @@ Line numbers below are approximate. Locate each site by its anchor text.
 ### Task 1: `filterMembersByName` helper
 
 **Files:**
+
 - Modify: `src/graph-tools.ts` (add near `normalizeSearchQueryParam`)
 - Test: `src/__tests__/graph-tools.test.ts`
 
 **Interfaces:**
+
 - Produces: `export function filterMembersByName(parsed: unknown, name: string): unknown` and `const MEMBER_NAME_FILTER_TOOLS: Set<string>`, `const MEMBER_NAME_PARAM_DESCRIPTION: string`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -63,53 +65,53 @@ Line numbers below are approximate. Locate each site by its anchor text.
 Append a new describe at the end of the top-level `describe` in `src/__tests__/graph-tools.test.ts`:
 
 ```ts
-  describe('filterMembersByName', () => {
-    const body = {
-      value: [
-        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
-        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
-        { id: '3', displayName: null, email: null },
-      ],
-      '@odata.count': 3,
-    };
-    const ids = (r: any) => r.value.map((m: any) => m.id);
+describe('filterMembersByName', () => {
+  const body = {
+    value: [
+      { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+      { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+      { id: '3', displayName: null, email: null },
+    ],
+    '@odata.count': 3,
+  };
+  const ids = (r: any) => r.value.map((m: any) => m.id);
 
-    it('matches displayName case-insensitively', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(ids(filterMembersByName(body, 'JANE'))).toEqual(['1']);
-    });
-
-    it('matches email', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(ids(filterMembersByName(body, 'jsmith@'))).toEqual(['2']);
-    });
-
-    it('returns an empty value array when nothing matches', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(ids(filterMembersByName(body, 'zzz'))).toEqual([]);
-    });
-
-    it('returns everything for an empty or whitespace-only name', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(ids(filterMembersByName(body, '   '))).toEqual(['1', '2', '3']);
-    });
-
-    it('does not match or throw on null fields', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(ids(filterMembersByName(body, 'null'))).toEqual([]);
-    });
-
-    it('keeps other top-level fields', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect((filterMembersByName(body, 'jane') as any)['@odata.count']).toBe(3);
-    });
-
-    it('returns non-collection input unchanged', async () => {
-      const { filterMembersByName } = await loadModule();
-      expect(filterMembersByName('plain', 'x')).toBe('plain');
-      expect(filterMembersByName({ id: '1' }, 'x')).toEqual({ id: '1' });
-    });
+  it('matches displayName case-insensitively', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(ids(filterMembersByName(body, 'JANE'))).toEqual(['1']);
   });
+
+  it('matches email', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(ids(filterMembersByName(body, 'jsmith@'))).toEqual(['2']);
+  });
+
+  it('returns an empty value array when nothing matches', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(ids(filterMembersByName(body, 'zzz'))).toEqual([]);
+  });
+
+  it('returns everything for an empty or whitespace-only name', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(ids(filterMembersByName(body, '   '))).toEqual(['1', '2', '3']);
+  });
+
+  it('does not match or throw on null fields', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(ids(filterMembersByName(body, 'null'))).toEqual([]);
+  });
+
+  it('keeps other top-level fields', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect((filterMembersByName(body, 'jane') as any)['@odata.count']).toBe(3);
+  });
+
+  it('returns non-collection input unchanged', async () => {
+    const { filterMembersByName } = await loadModule();
+    expect(filterMembersByName('plain', 'x')).toBe('plain');
+    expect(filterMembersByName({ id: '1' }, 'x')).toEqual({ id: '1' });
+  });
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -160,11 +162,13 @@ git commit -m "feat(tools): add member name filter helper"
 ### Task 2: Wire `name` into the member-list tools
 
 **Files:**
+
 - Modify: `src/graph-tools.ts` (four sites, below)
 - Modify: `src/endpoints.json` (`list-team-members`, `list-chat-members` tips)
 - Test: `src/__tests__/graph-tools.test.ts`
 
 **Interfaces:**
+
 - Consumes: `MEMBER_NAME_FILTER_TOOLS`, `MEMBER_NAME_PARAM_DESCRIPTION`, `filterMembersByName` from Task 1.
 
 - [ ] **Step 1: Write the failing tests**
@@ -172,98 +176,98 @@ git commit -m "feat(tools): add member name filter helper"
 Append inside the top-level `describe`:
 
 ```ts
-  describe('member name filter (tool wiring)', () => {
-    const membersBody = {
-      value: [
-        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
-        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
-        { id: '3', displayName: null, email: null },
-      ],
-      '@odata.count': 3,
-    };
-    const page = (b: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(b) }] });
-    const ids = (result: any) => JSON.parse(result.content[0].text).value.map((m: any) => m.id);
+describe('member name filter (tool wiring)', () => {
+  const membersBody = {
+    value: [
+      { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+      { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+      { id: '3', displayName: null, email: null },
+    ],
+    '@odata.count': 3,
+  };
+  const page = (b: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(b) }] });
+  const ids = (result: any) => JSON.parse(result.content[0].text).value.map((m: any) => m.id);
 
-    async function run(
-      args: Record<string, unknown>,
-      responses: any[] = [page(membersBody)],
-      alias = 'list-team-members',
-      path = '/teams/{team-id}/members'
-    ) {
-      mockEndpoints.push(makeEndpoint({ alias, path }));
-      mockEndpointsJson = [makeConfig({ toolName: alias, pathPattern: path })];
-      const graphClient = createMockGraphClient(responses);
-      const server = createMockServer();
-      const { registerGraphTools } = await loadModule();
-      registerGraphTools(server as any, graphClient as any);
-      const result = await server.tools.get(alias)!.handler({ 'team-id': 't1', ...args });
-      return { result, graphClient };
-    }
+  async function run(
+    args: Record<string, unknown>,
+    responses: any[] = [page(membersBody)],
+    alias = 'list-team-members',
+    path = '/teams/{team-id}/members'
+  ) {
+    mockEndpoints.push(makeEndpoint({ alias, path }));
+    mockEndpointsJson = [makeConfig({ toolName: alias, pathPattern: path })];
+    const graphClient = createMockGraphClient(responses);
+    const server = createMockServer();
+    const { registerGraphTools } = await loadModule();
+    registerGraphTools(server as any, graphClient as any);
+    const result = await server.tools.get(alias)!.handler({ 'team-id': 't1', ...args });
+    return { result, graphClient };
+  }
 
-    it('filters list-team-members by name', async () => {
-      const { result } = await run({ name: 'jane' });
-      expect(ids(result)).toEqual(['1']);
-    });
-
-    it('filters list-chat-members by email', async () => {
-      const { result } = await run(
-        { 'chat-id': 'c1', name: 'jsmith' },
-        [page(membersBody)],
-        'list-chat-members',
-        '/chats/{chat-id}/members'
-      );
-      expect(ids(result)).toEqual(['2']);
-    });
-
-    it('does not send name to Graph', async () => {
-      const { graphClient } = await run({ name: 'jane' });
-      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('name');
-    });
-
-    it('returns the full list for a whitespace-only name', async () => {
-      const { result } = await run({ name: '  ' });
-      expect(ids(result)).toEqual(['1', '2', '3']);
-    });
-
-    it('leaves an error response untouched', async () => {
-      const err = { content: [{ type: 'text', text: '{"error":"nope"}' }], isError: true };
-      const { result } = await run({ name: 'jane' }, [err]);
-      expect(result.content[0].text).toBe('{"error":"nope"}');
-    });
-
-    it('keeps @odata.count as the unfiltered total', async () => {
-      const { result } = await run({ name: 'jane' });
-      expect(JSON.parse(result.content[0].text)['@odata.count']).toBe(3);
-    });
-
-    it('filters after fetchAllPages merges the pages', async () => {
-      const { result } = await run({ name: 'ann', fetchAllPages: true }, [
-        page({
-          value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
-          '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
-        }),
-        page({
-          value: [
-            { id: '2', displayName: 'Bob', email: 'b@x.com' },
-            { id: '3', displayName: 'Annette', email: 'n@x.com' },
-          ],
-        }),
-      ]);
-      expect(ids(result)).toEqual(['1', '3']);
-    });
-
-    it('matches only fields that survive $select projection', async () => {
-      const { result } = await run({ select: 'id,displayName', name: 'contoso' });
-      expect(ids(result)).toEqual([]);
-    });
-
-    it('still matches a projected field', async () => {
-      const { result } = await run({ select: 'id,displayName', name: 'jane' });
-      expect(JSON.parse(result.content[0].text).value).toEqual([
-        { id: '1', displayName: 'Jane Doe' },
-      ]);
-    });
+  it('filters list-team-members by name', async () => {
+    const { result } = await run({ name: 'jane' });
+    expect(ids(result)).toEqual(['1']);
   });
+
+  it('filters list-chat-members by email', async () => {
+    const { result } = await run(
+      { 'chat-id': 'c1', name: 'jsmith' },
+      [page(membersBody)],
+      'list-chat-members',
+      '/chats/{chat-id}/members'
+    );
+    expect(ids(result)).toEqual(['2']);
+  });
+
+  it('does not send name to Graph', async () => {
+    const { graphClient } = await run({ name: 'jane' });
+    expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('name');
+  });
+
+  it('returns the full list for a whitespace-only name', async () => {
+    const { result } = await run({ name: '  ' });
+    expect(ids(result)).toEqual(['1', '2', '3']);
+  });
+
+  it('leaves an error response untouched', async () => {
+    const err = { content: [{ type: 'text', text: '{"error":"nope"}' }], isError: true };
+    const { result } = await run({ name: 'jane' }, [err]);
+    expect(result.content[0].text).toBe('{"error":"nope"}');
+  });
+
+  it('keeps @odata.count as the unfiltered total', async () => {
+    const { result } = await run({ name: 'jane' });
+    expect(JSON.parse(result.content[0].text)['@odata.count']).toBe(3);
+  });
+
+  it('filters after fetchAllPages merges the pages', async () => {
+    const { result } = await run({ name: 'ann', fetchAllPages: true }, [
+      page({
+        value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
+        '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
+      }),
+      page({
+        value: [
+          { id: '2', displayName: 'Bob', email: 'b@x.com' },
+          { id: '3', displayName: 'Annette', email: 'n@x.com' },
+        ],
+      }),
+    ]);
+    expect(ids(result)).toEqual(['1', '3']);
+  });
+
+  it('matches only fields that survive $select projection', async () => {
+    const { result } = await run({ select: 'id,displayName', name: 'contoso' });
+    expect(ids(result)).toEqual([]);
+  });
+
+  it('still matches a projected field', async () => {
+    const { result } = await run({ select: 'id,displayName', name: 'jane' });
+    expect(JSON.parse(result.content[0].text).value).toEqual([
+      { id: '1', displayName: 'Jane Doe' },
+    ]);
+  });
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -278,58 +282,59 @@ In `src/graph-tools.ts`, four edits:
 1. In the parameter loop, immediately before the `// Skip control parameters` block:
 
 ```ts
-      if (paramName === 'name' && MEMBER_NAME_FILTER_TOOLS.has(tool.alias)) continue;
+if (paramName === 'name' && MEMBER_NAME_FILTER_TOOLS.has(tool.alias)) continue;
 ```
 
 2. Before the loop (next to `const strayBodyFields`):
 
 ```ts
-    const memberNameFilter =
-      MEMBER_NAME_FILTER_TOOLS.has(tool.alias) && typeof params.name === 'string'
-        ? params.name
-        : undefined;
+const memberNameFilter =
+  MEMBER_NAME_FILTER_TOOLS.has(tool.alias) && typeof params.name === 'string'
+    ? params.name
+    : undefined;
 ```
 
 3. Where `forceJsonOutput` is decided, replace the existing condition:
 
 ```ts
-    const willFilterMembers =
-      memberNameFilter !== undefined &&
-      memberNameFilter.trim() !== '' &&
-      params.excludeResponse !== true;
-    if (mergePages || willProject || willProjectBatch || willFilterMembers) {
-      options.forceJsonOutput = true;
-    }
+const willFilterMembers =
+  memberNameFilter !== undefined &&
+  memberNameFilter.trim() !== '' &&
+  params.excludeResponse !== true;
+if (mergePages || willProject || willProjectBatch || willFilterMembers) {
+  options.forceJsonOutput = true;
+}
 ```
 
 4. After the `willProjectBatch` block and before `if (response?.content?.[0]?.text) {` that logs `Response size`:
 
 ```ts
-    if (willFilterMembers && !response?.isError && response?.content?.[0]?.text) {
-      try {
-        const filtered = filterMembersByName(
-          JSON.parse(response.content[0].text),
-          memberNameFilter as string
-        );
-        response.content[0].text = graphClient.serialize(filtered);
-        if (isPlainObject(filtered) && Array.isArray(filtered.value) && response._meta) {
-          response._meta = { ...response._meta, result_count: filtered.value.length };
-        }
-      } catch {
-        // Body was not JSON after all; nothing to filter.
-      }
+if (willFilterMembers && !response?.isError && response?.content?.[0]?.text) {
+  try {
+    const filtered = filterMembersByName(
+      JSON.parse(response.content[0].text),
+      memberNameFilter as string
+    );
+    response.content[0].text = graphClient.serialize(filtered);
+    if (isPlainObject(filtered) && Array.isArray(filtered.value) && response._meta) {
+      response._meta = { ...response._meta, result_count: filtered.value.length };
     }
+  } catch {
+    // Body was not JSON after all; nothing to filter.
+  }
+}
 ```
 
 5. In the `paramSchema` construction, directly after the `isFetchAllPagesApplicable` block:
 
 ```ts
-    if (MEMBER_NAME_FILTER_TOOLS.has(tool.alias)) {
-      paramSchema['name'] = z.string().describe(MEMBER_NAME_PARAM_DESCRIPTION).optional();
-    }
+if (MEMBER_NAME_FILTER_TOOLS.has(tool.alias)) {
+  paramSchema['name'] = z.string().describe(MEMBER_NAME_PARAM_DESCRIPTION).optional();
+}
 ```
 
 In `src/endpoints.json`:
+
 - `list-team-members` (no tip today): add `"llmTip": "Lists members of a team. Each member has displayName, email, roles and userId. Pass name to keep only members whose displayName or email contains that text (case-insensitive); use the returned userId in an @mention."`
 - `list-chat-members`: append to the existing tip: ` Pass name to keep only members whose displayName or email contains that text (case-insensitive); use the returned userId in an @mention.`
 
@@ -357,95 +362,98 @@ git commit -m "feat(tools): add name filter to list-team-members and list-chat-m
 ### Task 3: `rewriteMentionShorthand` helper
 
 **Files:**
+
 - Modify: `src/graph-tools.ts` (add near `bodyForRecipientWalk`)
 - Test: `src/__tests__/graph-tools.test.ts`
 
 **Interfaces:**
+
 - Produces: `export function rewriteMentionShorthand(body: unknown): { body: unknown; error?: string }` and `const MENTION_SHORTHAND_TOOLS: Set<string>` (the seven aliases).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-  describe('rewriteMentionShorthand', () => {
-    const U1 = '11111111-2222-3333-4444-555555555555';
-    const U2 = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-    const html = (content: string, extra: Record<string, unknown> = {}) => ({
-      body: { contentType: 'html', content },
-      ...extra,
-    });
-    const mention = (id: number, userId: string, name: string) => ({
-      id,
-      mentionText: name,
-      mentioned: { user: { id: userId, displayName: name, userIdentityType: 'aadUser' } },
-    });
-
-    it('rewrites one tag and builds the mentions array', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      expect(
-        rewriteMentionShorthand(html(`Hi <at user-id="${U1}">Jane Doe</at>!`)).body
-      ).toEqual(html('Hi <at id="0">Jane Doe</at>!', { mentions: [mention(0, U1, 'Jane Doe')] }));
-    });
-
-    it('numbers several tags in order, including a repeated user', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const out = rewriteMentionShorthand(
-        html(`<at user-id="${U1}">Jane</at> <at user-id="${U2}">Bob</at> <at user-id="${U1}">Jane</at>`)
-      ).body as any;
-      expect(out.body.content).toBe(
-        '<at id="0">Jane</at> <at id="1">Bob</at> <at id="2">Jane</at>'
-      );
-      expect(out.mentions.map((m: any) => m.id)).toEqual([0, 1, 2]);
-    });
-
-    it('starts above ids already in the content and mentions', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const input = html(`<at id="0">Old</at> <at user-id="${U1}">Jane</at>`, {
-        mentions: [mention(0, U2, 'Old')],
-      });
-      const out = rewriteMentionShorthand(input).body as any;
-      expect(out.body.content).toBe('<at id="0">Old</at> <at id="1">Jane</at>');
-      expect(out.mentions).toEqual([mention(0, U2, 'Old'), mention(1, U1, 'Jane')]);
-    });
-
-    it('passes a correct hand-built body through unchanged', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const input = html('<at id="0">Jane</at>', { mentions: [mention(0, U1, 'Jane')] });
-      expect(rewriteMentionShorthand(input).body).toBe(input);
-    });
-
-    it('returns an error for a user-id that is not a GUID', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const input = html('<at user-id="jane@contoso.com">Jane</at>');
-      const out = rewriteMentionShorthand(input);
-      expect(out.error).toContain('jane@contoso.com');
-      expect(out.body).toBe(input);
-    });
-
-    it('leaves non-html content alone', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const input = { body: { contentType: 'text', content: `<at user-id="${U1}">Jane</at>` } };
-      expect(rewriteMentionShorthand(input).body).toBe(input);
-    });
-
-    it('leaves a body with no contentType alone', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const input = { body: { content: `<at user-id="${U1}">Jane</at>` } };
-      expect(rewriteMentionShorthand(input).body).toBe(input);
-    });
-
-    it('leaves a raw string body alone', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      expect(rewriteMentionShorthand('{"body":{}}').body).toBe('{"body":{}}');
-      expect(rewriteMentionShorthand(null).body).toBeNull();
-    });
-
-    it('keeps the display name verbatim', async () => {
-      const { rewriteMentionShorthand } = await loadModule();
-      const out = rewriteMentionShorthand(html(`<at user-id="${U1}">Smith &amp; Co</at>`)).body as any;
-      expect(out.body.content).toBe('<at id="0">Smith &amp; Co</at>');
-      expect(out.mentions[0].mentionText).toBe('Smith &amp; Co');
-    });
+describe('rewriteMentionShorthand', () => {
+  const U1 = '11111111-2222-3333-4444-555555555555';
+  const U2 = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const html = (content: string, extra: Record<string, unknown> = {}) => ({
+    body: { contentType: 'html', content },
+    ...extra,
   });
+  const mention = (id: number, userId: string, name: string) => ({
+    id,
+    mentionText: name,
+    mentioned: { user: { id: userId, displayName: name, userIdentityType: 'aadUser' } },
+  });
+
+  it('rewrites one tag and builds the mentions array', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    expect(rewriteMentionShorthand(html(`Hi <at user-id="${U1}">Jane Doe</at>!`)).body).toEqual(
+      html('Hi <at id="0">Jane Doe</at>!', { mentions: [mention(0, U1, 'Jane Doe')] })
+    );
+  });
+
+  it('numbers several tags in order, including a repeated user', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const out = rewriteMentionShorthand(
+      html(
+        `<at user-id="${U1}">Jane</at> <at user-id="${U2}">Bob</at> <at user-id="${U1}">Jane</at>`
+      )
+    ).body as any;
+    expect(out.body.content).toBe('<at id="0">Jane</at> <at id="1">Bob</at> <at id="2">Jane</at>');
+    expect(out.mentions.map((m: any) => m.id)).toEqual([0, 1, 2]);
+  });
+
+  it('starts above ids already in the content and mentions', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const input = html(`<at id="0">Old</at> <at user-id="${U1}">Jane</at>`, {
+      mentions: [mention(0, U2, 'Old')],
+    });
+    const out = rewriteMentionShorthand(input).body as any;
+    expect(out.body.content).toBe('<at id="0">Old</at> <at id="1">Jane</at>');
+    expect(out.mentions).toEqual([mention(0, U2, 'Old'), mention(1, U1, 'Jane')]);
+  });
+
+  it('passes a correct hand-built body through unchanged', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const input = html('<at id="0">Jane</at>', { mentions: [mention(0, U1, 'Jane')] });
+    expect(rewriteMentionShorthand(input).body).toBe(input);
+  });
+
+  it('returns an error for a user-id that is not a GUID', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const input = html('<at user-id="jane@contoso.com">Jane</at>');
+    const out = rewriteMentionShorthand(input);
+    expect(out.error).toContain('jane@contoso.com');
+    expect(out.body).toBe(input);
+  });
+
+  it('leaves non-html content alone', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const input = { body: { contentType: 'text', content: `<at user-id="${U1}">Jane</at>` } };
+    expect(rewriteMentionShorthand(input).body).toBe(input);
+  });
+
+  it('leaves a body with no contentType alone', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const input = { body: { content: `<at user-id="${U1}">Jane</at>` } };
+    expect(rewriteMentionShorthand(input).body).toBe(input);
+  });
+
+  it('leaves a raw string body alone', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    expect(rewriteMentionShorthand('{"body":{}}').body).toBe('{"body":{}}');
+    expect(rewriteMentionShorthand(null).body).toBeNull();
+  });
+
+  it('keeps the display name verbatim', async () => {
+    const { rewriteMentionShorthand } = await loadModule();
+    const out = rewriteMentionShorthand(html(`<at user-id="${U1}">Smith &amp; Co</at>`))
+      .body as any;
+    expect(out.body.content).toBe('<at id="0">Smith &amp; Co</at>');
+    expect(out.mentions[0].mentionText).toBe('Smith &amp; Co');
+  });
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -533,95 +541,95 @@ git commit -m "feat(tools): add Teams mention shorthand rewriter"
 ### Task 4: Wire the rewriter into the seven message tools
 
 **Files:**
+
 - Modify: `src/graph-tools.ts` (one site)
 - Modify: `src/endpoints.json` (seven tips)
 - Test: `src/__tests__/graph-tools.test.ts`
 
 **Interfaces:**
+
 - Consumes: `MENTION_SHORTHAND_TOOLS`, `rewriteMentionShorthand` from Task 3.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-  describe('mention shorthand (tool wiring)', () => {
-    const U1 = '11111111-2222-3333-4444-555555555555';
-    const aliases = [
-      ['send-channel-message', 'post'],
-      ['reply-to-channel-message', 'post'],
-      ['update-channel-message', 'patch'],
-      ['update-channel-message-reply', 'patch'],
-      ['send-chat-message', 'post'],
-      ['reply-to-chat-message', 'post'],
-      ['update-chat-message', 'patch'],
-    ] as const;
+describe('mention shorthand (tool wiring)', () => {
+  const U1 = '11111111-2222-3333-4444-555555555555';
+  const aliases = [
+    ['send-channel-message', 'post'],
+    ['reply-to-channel-message', 'post'],
+    ['update-channel-message', 'patch'],
+    ['update-channel-message-reply', 'patch'],
+    ['send-chat-message', 'post'],
+    ['reply-to-chat-message', 'post'],
+    ['update-chat-message', 'patch'],
+  ] as const;
 
-    async function call(alias: string, method: string, body: unknown) {
-      mockEndpoints.push(
-        makeEndpoint({
-          alias,
-          method,
-          path: '/chats/{chat-id}/messages',
-          parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
-        })
-      );
-      mockEndpointsJson = [
-        makeConfig({ toolName: alias, method, pathPattern: '/chats/{chat-id}/messages' }),
-      ];
-      const graphClient = createMockGraphClient([
-        { content: [{ type: 'text', text: JSON.stringify({ id: 'm1' }) }] },
-      ]);
-      const server = createMockServer();
-      const { registerGraphTools } = await loadModule();
-      registerGraphTools(server as any, graphClient as any);
-      const result = await server.tools
-        .get(alias)!
-        .handler({ 'chat-id': 'c1', body, confirm: true });
-      return { result, graphClient };
-    }
-    const sent = (graphClient: any) => JSON.parse(graphClient.graphRequest.mock.calls[0][1].body);
+  async function call(alias: string, method: string, body: unknown) {
+    mockEndpoints.push(
+      makeEndpoint({
+        alias,
+        method,
+        path: '/chats/{chat-id}/messages',
+        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+      })
+    );
+    mockEndpointsJson = [
+      makeConfig({ toolName: alias, method, pathPattern: '/chats/{chat-id}/messages' }),
+    ];
+    const graphClient = createMockGraphClient([
+      { content: [{ type: 'text', text: JSON.stringify({ id: 'm1' }) }] },
+    ]);
+    const server = createMockServer();
+    const { registerGraphTools } = await loadModule();
+    registerGraphTools(server as any, graphClient as any);
+    const result = await server.tools.get(alias)!.handler({ 'chat-id': 'c1', body, confirm: true });
+    return { result, graphClient };
+  }
+  const sent = (graphClient: any) => JSON.parse(graphClient.graphRequest.mock.calls[0][1].body);
 
-    it.each(aliases)('rewrites the shorthand on %s', async (alias, method) => {
-      const { graphClient } = await call(alias, method, {
-        body: { contentType: 'html', content: `Hi <at user-id="${U1}">Jane</at>` },
-      });
-      const out = sent(graphClient);
-      expect(out.body.content).toBe('Hi <at id="0">Jane</at>');
-      expect(out.mentions).toEqual([
-        {
-          id: 0,
-          mentionText: 'Jane',
-          mentioned: { user: { id: U1, displayName: 'Jane', userIdentityType: 'aadUser' } },
-        },
-      ]);
+  it.each(aliases)('rewrites the shorthand on %s', async (alias, method) => {
+    const { graphClient } = await call(alias, method, {
+      body: { contentType: 'html', content: `Hi <at user-id="${U1}">Jane</at>` },
     });
-
-    it('returns a tool error and sends nothing for a bad user-id', async () => {
-      const { result, graphClient } = await call('send-chat-message', 'post', {
-        body: { contentType: 'html', content: '<at user-id="jane">Jane</at>' },
-      });
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain('not an Entra object id');
-      expect(graphClient.graphRequest).not.toHaveBeenCalled();
-    });
-
-    it('does not rewrite on a tool outside the seven', async () => {
-      const { graphClient } = await call('create-draft-email', 'post', {
-        body: { contentType: 'html', content: `<at user-id="${U1}">Jane</at>` },
-      });
-      expect(sent(graphClient).body.content).toBe(`<at user-id="${U1}">Jane</at>`);
-    });
-
-    it('lists only tools that exist in endpoints.json and documents the shorthand', () => {
-      const endpoints = JSON.parse(
-        readFileSync(join(__dirname, '..', 'endpoints.json'), 'utf8')
-      ) as Array<{ toolName: string; llmTip?: string }>;
-      for (const [alias] of aliases) {
-        const entry = endpoints.find((e) => e.toolName === alias);
-        expect(entry, alias).toBeDefined();
-        expect(entry!.llmTip, alias).toContain('user-id=');
-      }
-    });
+    const out = sent(graphClient);
+    expect(out.body.content).toBe('Hi <at id="0">Jane</at>');
+    expect(out.mentions).toEqual([
+      {
+        id: 0,
+        mentionText: 'Jane',
+        mentioned: { user: { id: U1, displayName: 'Jane', userIdentityType: 'aadUser' } },
+      },
+    ]);
   });
+
+  it('returns a tool error and sends nothing for a bad user-id', async () => {
+    const { result, graphClient } = await call('send-chat-message', 'post', {
+      body: { contentType: 'html', content: '<at user-id="jane">Jane</at>' },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('not an Entra object id');
+    expect(graphClient.graphRequest).not.toHaveBeenCalled();
+  });
+
+  it('does not rewrite on a tool outside the seven', async () => {
+    const { graphClient } = await call('create-draft-email', 'post', {
+      body: { contentType: 'html', content: `<at user-id="${U1}">Jane</at>` },
+    });
+    expect(sent(graphClient).body.content).toBe(`<at user-id="${U1}">Jane</at>`);
+  });
+
+  it('lists only tools that exist in endpoints.json and documents the shorthand', () => {
+    const endpoints = JSON.parse(
+      readFileSync(join(__dirname, '..', 'endpoints.json'), 'utf8')
+    ) as Array<{ toolName: string; llmTip?: string }>;
+    for (const [alias] of aliases) {
+      const entry = endpoints.find((e) => e.toolName === alias);
+      expect(entry, alias).toBeDefined();
+      expect(entry!.llmTip, alias).toContain('user-id=');
+    }
+  });
+});
 ```
 
 If `makeEndpoint` rejects `method: 'patch'` in this harness, check how existing tests build PATCH endpoints (`grep -n "method: 'patch'" src/__tests__/graph-tools.test.ts`) and mirror them.
@@ -636,16 +644,16 @@ Expected: FAIL (body sent unchanged; tips lack `user-id=`).
 In `src/graph-tools.ts`, directly after the `if (Object.keys(strayBodyFields).length > 0) { ... }` block and before the `// Defense-in-depth: the calendar delta tools` comment:
 
 ```ts
-    if (MENTION_SHORTHAND_TOOLS.has(tool.alias)) {
-      const rewritten = rewriteMentionShorthand(body);
-      if (rewritten.error) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ error: rewritten.error }) }],
-          isError: true,
-        };
-      }
-      body = rewritten.body;
-    }
+if (MENTION_SHORTHAND_TOOLS.has(tool.alias)) {
+  const rewritten = rewriteMentionShorthand(body);
+  if (rewritten.error) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: rewritten.error }) }],
+      isError: true,
+    };
+  }
+  body = rewritten.body;
+}
 ```
 
 Update the seven tips with a one-off script (keeps the file's formatting via prettier). Save as `scratch/set-tips.mjs` outside the repo tree or in the scratchpad dir, run from the worktree root, do not commit it:
@@ -655,8 +663,12 @@ import { readFileSync, writeFileSync } from 'node:fs';
 const path = 'src/endpoints.json';
 const endpoints = JSON.parse(readFileSync(path, 'utf8'));
 const aliases = [
-  'send-channel-message', 'reply-to-channel-message', 'update-channel-message',
-  'update-channel-message-reply', 'send-chat-message', 'reply-to-chat-message',
+  'send-channel-message',
+  'reply-to-channel-message',
+  'update-channel-message',
+  'update-channel-message-reply',
+  'send-chat-message',
+  'reply-to-chat-message',
   'update-chat-message',
 ];
 const lead =

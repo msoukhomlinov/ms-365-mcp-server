@@ -44,16 +44,16 @@ One container, one process, streamable HTTP at `/mcp`. A bearer token read from 
 
 ### Components
 
-| Component | Responsibility | Depends on |
-|---|---|---|
-| Config loader | Reads and validates the config file and secret file at startup; fails fast on any problem | filesystem |
-| Allowlist resolver | Resolves `team` and `channel` aliases to ids, and enforces the per-channel `write` flag | config |
-| Token provider | Client-credentials tokens for the Graph scope and the Bot Connector scope; cached until about 5 minutes before expiry; one in-flight request per scope | config, `fetch` |
-| Graph client | Thin `fetch` GETs; retries 429 and 503 honouring `Retry-After`, at most 3 attempts; validates `@odata.nextLink` cursors against the allowed team and channel path | token provider |
-| Connector client | Thin `fetch` calls to the Bot Connector for post, reply, edit, delete | token provider, config (`serviceUrl`) |
-| Mention resolver | Resolves names to member ids using the cached member list (5 minute TTL) | Graph client |
-| Audit log | One JSON line per tool call to stderr: time, caller, tool, team, channel, message id, outcome, error class; never bodies | none |
-| Tools | The MCP tool layer; each tool resolves aliases first, then calls a client, then audits | all of the above |
+| Component          | Responsibility                                                                                                                                                    | Depends on                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Config loader      | Reads and validates the config file and secret file at startup; fails fast on any problem                                                                         | filesystem                            |
+| Allowlist resolver | Resolves `team` and `channel` aliases to ids, and enforces the per-channel `write` flag                                                                           | config                                |
+| Token provider     | Client-credentials tokens for the Graph scope and the Bot Connector scope; cached until about 5 minutes before expiry; one in-flight request per scope            | config, `fetch`                       |
+| Graph client       | Thin `fetch` GETs; retries 429 and 503 honouring `Retry-After`, at most 3 attempts; validates `@odata.nextLink` cursors against the allowed team and channel path | token provider                        |
+| Connector client   | Thin `fetch` calls to the Bot Connector for post, reply, edit, delete                                                                                             | token provider, config (`serviceUrl`) |
+| Mention resolver   | Resolves names to member ids using the cached member list (5 minute TTL)                                                                                          | Graph client                          |
+| Audit log          | One JSON line per tool call to stderr: time, caller, tool, team, channel, message id, outcome, error class; never bodies                                          | none                                  |
+| Tools              | The MCP tool layer; each tool resolves aliases first, then calls a client, then audits                                                                            | all of the above                      |
 
 ### Config file
 
@@ -96,17 +96,17 @@ A team-level `serviceUrl` overrides the top-level one. The connector token is on
 
 All tool names are prefixed `teams-bot-`. `team` is optional when exactly one team is configured. A channel is always given by its alias.
 
-| Tool | Input | Output |
-|---|---|---|
-| `teams-bot-list-teams` | none | allowed teams and channels with aliases and write flags, from config only |
-| `teams-bot-list-channels` | `team?` | the allowed channels for the team, with the display name and membership type from Graph |
-| `teams-bot-list-threads` | `channel`, `team?`, `top?` (1-50, default 20), `cursor?` | `{ threads: [{ id, createdDateTime, from, text }], nextCursor? }` |
-| `teams-bot-read-thread` | `channel`, `thread`, `team?`, `top?`, `cursor?` | the root message and its replies, same message shape, with `nextCursor?` |
-| `teams-bot-list-members` | `team?`, `name?` | `[{ id, userId, displayName, email, roles }]`; `name` is a case-insensitive substring over displayName and email |
-| `teams-bot-post` | `channel`, `text`, `team?`, `mentions?` | `{ threadId, messageId }` |
-| `teams-bot-reply` | `channel`, `thread`, `text`, `team?`, `mentions?` | `{ messageId }` |
-| `teams-bot-edit` | `channel`, `thread`, `message`, `text`, `team?` | `{ messageId }` |
-| `teams-bot-delete` | `channel`, `thread`, `message`, `team?` | `{ deleted: true }` |
+| Tool                      | Input                                                    | Output                                                                                                           |
+| ------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `teams-bot-list-teams`    | none                                                     | allowed teams and channels with aliases and write flags, from config only                                        |
+| `teams-bot-list-channels` | `team?`                                                  | the allowed channels for the team, with the display name and membership type from Graph                          |
+| `teams-bot-list-threads`  | `channel`, `team?`, `top?` (1-50, default 20), `cursor?` | `{ threads: [{ id, createdDateTime, from, text }], nextCursor? }`                                                |
+| `teams-bot-read-thread`   | `channel`, `thread`, `team?`, `top?`, `cursor?`          | the root message and its replies, same message shape, with `nextCursor?`                                         |
+| `teams-bot-list-members`  | `team?`, `name?`                                         | `[{ id, userId, displayName, email, roles }]`; `name` is a case-insensitive substring over displayName and email |
+| `teams-bot-post`          | `channel`, `text`, `team?`, `mentions?`                  | `{ threadId, messageId }`                                                                                        |
+| `teams-bot-reply`         | `channel`, `thread`, `text`, `team?`, `mentions?`        | `{ messageId }`                                                                                                  |
+| `teams-bot-edit`          | `channel`, `thread`, `message`, `text`, `team?`          | `{ messageId }`                                                                                                  |
+| `teams-bot-delete`        | `channel`, `thread`, `message`, `team?`                  | `{ deleted: true }`                                                                                              |
 
 Notes:
 
@@ -157,14 +157,14 @@ For each resolved mention, the first occurrence of `@<the string passed>` in `te
 
 ## Conditional on the Phase 0 probe
 
-| Unknown | Isolated behind | Fallback if the probe says no |
-|---|---|---|
-| Bot registration without Azure (Q1) | Setup docs only, no code | Azure Bot resource and subscription, or the service-account option |
-| RSC-only reads without the protected-API form (Q2) | Graph client | Reconsider read paths; the service cannot ship reads as designed |
-| Graph POST with `ChannelMessage.Send.Group` (Q3) | Connector client | Post through Graph, and reply too if the same holds for replies; the bot remains for edit and delete |
-| `serviceUrl` source and region (Q4) | Config `serviceUrl` fields | A small inbound endpoint so the service can learn the URL from `conversationUpdate` |
-| Reaction call shape | Connector client | Leave reactions out of v1 |
-| RSC-only Teams app accepted without `bots[]` | Setup docs only | Include a placeholder tab or the bot entry |
+| Unknown                                            | Isolated behind            | Fallback if the probe says no                                                                        |
+| -------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Bot registration without Azure (Q1)                | Setup docs only, no code   | Azure Bot resource and subscription, or the service-account option                                   |
+| RSC-only reads without the protected-API form (Q2) | Graph client               | Reconsider read paths; the service cannot ship reads as designed                                     |
+| Graph POST with `ChannelMessage.Send.Group` (Q3)   | Connector client           | Post through Graph, and reply too if the same holds for replies; the bot remains for edit and delete |
+| `serviceUrl` source and region (Q4)                | Config `serviceUrl` fields | A small inbound endpoint so the service can learn the URL from `conversationUpdate`                  |
+| Reaction call shape                                | Connector client           | Leave reactions out of v1                                                                            |
+| RSC-only Teams app accepted without `bots[]`       | Setup docs only            | Include a placeholder tab or the bot entry                                                           |
 
 If the probe shows the connector token cannot reach a channel without an inbound endpoint, this design changes in one place: the deployment gains an HTTPS listener for Bot Framework traffic, and the config gains no new fields beyond a public URL.
 
