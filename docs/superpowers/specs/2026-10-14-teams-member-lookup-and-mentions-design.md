@@ -43,8 +43,8 @@ The Planner task-chat post tool also accepts mentions, but with a different body
 - The server rewrites each tag to `<at id="N">Jane Doe</at>`. N starts above the highest numeric `<at id>` already in the content, so hand-built tags never collide.
 - For each rewritten tag it appends `{ id: N, mentionText: "Jane Doe", mentioned: { user: { id: "<guid>", displayName: "Jane Doe", userIdentityType: "aadUser" } } }` to `mentions`. If the caller already supplied a `mentions` array, new entries are merged into it.
 - A body that already uses numeric `<at id>` tags and its own `mentions` array passes through untouched.
-- A `user-id` that is not a GUID returns a tool error naming the bad value. A literal tag is never sent to Graph.
-- Only `contentType: "html"` is rewritten. Other content types are left alone.
+- A `user-id` that is not a GUID returns a tool error naming the bad value. A tag that tries the shorthand in a form the rewriter cannot handle (single quotes, extra attributes, nested markup) is also a tool error. A literal tag is never sent to Graph.
+- Only `contentType: "html"` is rewritten. Content without the shorthand is left alone whatever its type. The shorthand with another or missing `contentType` is a tool error, so raw markup is never posted as visible text.
 - `llmTip` on each affected tool shows the shorthand first and keeps the raw form as the fallback.
 
 ## Tests
