@@ -225,3 +225,20 @@ Operator (us):
 - The two unverified Graph points (protected-API form for `.Group`-only apps; Graph POST with `ChannelMessage.Send.Group`) are settled only by the Phase 0 probe.
 
 Status: scoping draft produced by a research subagent; its Microsoft Learn citations have not been independently re-checked. No design approval yet, so no repo or tenant changes have been made.
+
+## Superseded by the design
+
+`2026-10-14-teams-bot-service-design.md` replaces or drops these points from this scoping draft:
+
+- Two phases (reads first, writes later): writes ship in the first release.
+- Env prefix `TEAMS_MCP_*` and `TEAMS_MCP_ALLOWED_TEAMS`: the allowlist is a JSON config file, env prefix `TEAMS_BOT_*`.
+- `teams-bot-find-member`: merged into `teams-bot-list-members` with a `name` filter.
+- `teams-bot-list-channels`, `teams-bot-get-hosted-content`, `teams-bot-react` and `teams-bot-unreact`: not in v1.
+- Teams SDK v2 for the write path: thin REST clients, no SDK.
+- Certificate preference: the user chose a client secret.
+- stdio transport: streamable HTTP only.
+- Per-agent bearer tokens: a single bearer token in v1.
+- Mention resolution by name: the fork's inline `<at user-id>` shorthand.
+- The Graph-POST path and `ChannelMessage.Send.Group`: removed, and the manifest holds only `ChannelMessage.Read.Group` and `TeamMember.Read.Group`.
+- Regional and per-team `serviceUrl`: one global `serviceUrl` by default.
+- Kept from this draft: the MCP `initialize` instructions text that tells an agent when to use the m365 server instead.
