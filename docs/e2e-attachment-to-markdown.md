@@ -2,7 +2,7 @@
 
 Proves: M365 mail attachment -> ms-365-mcp-server (`--attachment-proxy`) -> ticket URL -> docglean-mcp -> Markdown.
 
-This walkthrough has not been run end to end; steps marked "not verified" are inferred from the code and the converter's docs. Never paste keys, tokens or device codes into chat or tickets.
+The default (unsigned, Docker) path — sections 0 through 5, plus the slicing/error checks in 5.3/6 and the network-isolation checks in 7.1 — was run end to end on 2026-10-11 against a real mailbox, using generated (not hand-crafted-in-Outlook) test attachments; results are folded into the sections below. Steps still marked "not verified" are paths that run was not required to exercise: the plain-`node` path (2b), the keyed variant (Appendix A), and the ticket-reuse/expiry checks in 7.2 that need stopping and swapping the compose profile. Never paste keys, tokens or device codes into chat or tickets.
 
 It follows the `ms-365-mcp-server` source on this branch. The default (unsigned) setup needs a `docglean-mcp` build that includes the unsigned-ticket change, which is not yet released; the keyed appendix works against a docglean `main` build. For the configuration behind it, see "Reading documents through a conversion proxy" in the [README](../README.md#reading-documents-through-a-conversion-proxy).
 
@@ -54,8 +54,8 @@ Notes:
 
 ```bash
 docker compose build                      # builds m365-mcp:e2e and docglean-mcp:e2e locally; nothing is pushed
-                                          # (ms-365 build runs `npm run generate`; needs network: not verified)
-docker compose up -d docglean             # first boot: up to ~90 s (healthcheck start period)
+                                          # (ms-365 build runs `npm run generate`, which needs network; confirmed working)
+docker compose up -d docglean             # healthcheck start period allows up to ~90 s; observed healthy in ~7 s
 ```
 
 Log in the server's own account once (the cache lands in the `m365-data` volume, file-backed, keytar off):
@@ -81,6 +81,8 @@ Expected startup lines (wording may differ slightly):
 - `Attachment URLs: http://m365:3001/attachment (ttl 120s, unsigned)`, or `(ttl 120s, signed, key id 1)` in the keyed variant
 - `Attachment listener: separate, port 3001 ...`
 - No warning about both listeners sharing an interface. If you see one, `--attachment-host` is not taking effect.
+
+None of these lines appeared in `docker compose logs m365` at the default log level in the 2026-10-11 run — the container was otherwise healthy and correct (confirmed via the health checks below and a full, successful run), so treat their absence as a log-verbosity gap, not a startup failure. Use the health checks in section 3 to confirm readiness instead of grepping for these lines.
 
 Startup refusals and what they mean:
 
@@ -144,7 +146,7 @@ mcp() { # usage: mcp '<json-rpc body>'
 mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 3000
 ```
 
-Expected tool list (preset `mail`, proxy on): `read-document` present; `download-bytes`, `get-download-url`, `get-mail-message-mime` absent. The server is stateless (no session), so `tools/list` and `tools/call` should work without `initialize` **(not verified; if a client complains, send an `initialize` first)**.
+Expected tool list (preset `mail`, proxy on): `read-document` present; `download-bytes`, `get-download-url`, `get-mail-message-mime` absent — confirmed exactly on 2026-10-11 (44 tools registered, including `send-mail`, `get-upload-url`). The server is stateless (no session); `tools/list` and `tools/call` were both called directly with no `initialize` and worked.
 
 Optional real client from your Mac instead of the helper: uncomment `ports:` on `m365` in the compose file and use `claude mcp add --transport http ms365-e2e http://127.0.0.1:3000/mcp` or `npx @modelcontextprotocol/inspector` (Streamable HTTP, URL `http://127.0.0.1:3000/mcp`). Whether Docker forwards a published port to a two-network container bound to one address is **not verified**; if it times out, keep the helper. No Authorization header is needed under `--trust-proxy-auth`.
 
@@ -154,6 +156,8 @@ Optional real client from your Mac instead of the helper: uncomment `ports:` on 
 2. **docx**: subject `E2E docx`. Attach a `.docx` with a heading, a bullet list and a small table.
 3. **item attachment (rfc822)**: subject `E2E item`. In Outlook, open any received message, choose Forward as attachment (OWA/new Outlook: `...` menu, Forward as attachment; classic: Home, More, Forward, As Attachment, or Insert, Attach Item, Outlook Item on a new message). Send it to yourself. Graph models that as an `itemAttachment`, not a file. For the contrast case also send a message with a `.eml` file saved to disk attached (a `fileAttachment` with type `message/rfc822`).
 4. **scanned**: subject `E2E scan`. Attach an image-only PDF: print a page to PNG or screenshot it, then export that image as PDF so there is no text layer (select-all should select nothing). Do not OCR it first.
+
+Verified 2026-10-11, programmatically rather than through the Outlook UI: a real 4-page PDF built with a genuine `Tj`-operator text layer (`cupsfilter` on plain text with form-feed page breaks), a real `.docx` built as raw OOXML (heading style, `numPr` bullet list, `w:tbl` table — no Word/python-docx involved), an image-only PDF with no `/Font` dictionary (Pillow-drawn PNG wrapped via `sips`), and a hand-built RFC 5322 `.eml` for the contrast case. For the item-attachment case, rather than driving Outlook's UI, a `send-mail` call was made directly with an attachment of `"@odata.type": "#microsoft.graph.itemAttachment"` carrying an embedded `#microsoft.graph.message` object — Graph accepted it and `list-mail-attachments` reported it back with `contentType: "message/rfc822"`, the same shape a real "Forward as attachment" produces. All four — and the `.eml` contrast case — converted correctly; see section 6.
 
 ## 5. MCP calls
 
@@ -200,11 +204,11 @@ Success: the tool result is plain Markdown text (not JSON, no base64). docglean 
 
 | Mail                   | Expect                                                                                                                                                                                                                                                                                                                            |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| pdf-text               | Both unique phrases present. `pages:"1"` returns only page 1; `pages` beyond the end returns `no_text_in_selection` (text already read still stands).                                                                                                                                                                             |
-| docx                   | Heading as `#`, bullets as `-`, table as pipe table. `pages` is rejected (docx has no page unit): use `offset`/`maxChars`. Expect `proxy_error` with `pages_unsupported` in the message.                                                                                                                                          |
-| item attachment        | Markdown of the forwarded message (headers, body, its attachments listed/converted). Microsoft documents `/$value` on item attachments as returning the item as MIME; **not verified** here, nor how docglean's mail converter renders it.                                                                                        |
-| `.eml` file attachment | Same converter path as above (docglean `message/rfc822` support).                                                                                                                                                                                                                                                                 |
-| scanned PDF            | Without OCR: error `no_text_content` with `contentStatus: "no_text_layer"` and the message saying the document has no text layer (it is a statement about the document, retrying will not help). With OCR: Markdown of the recognised text, possibly imperfect. Which of the two you get depends on the docglean image you built. |
+| pdf-text               | Both unique phrases present — **confirmed**. `pages:"1"` returns only page 1 — **confirmed**. `pages` beyond the end (document has 4 pages; tried `pages:"99"`) returns `proxy_error` with `invalid_pages` in the message ("That selection lies entirely outside the document, which has 4 page(s)...") — **not** `no_text_in_selection` as this row previously claimed; that code is for `offset`/`maxChars` selecting nothing (not independently verified here). |
+| docx                   | Heading as `#`, bullets as `-`, table as pipe table — **confirmed** exactly. `pages` is rejected (docx has no page unit): use `offset`/`maxChars`. Confirmed `proxy_error` with `pages_unsupported` in the message, word-for-word: "docx has no page, slide or sheet unit. Use offset to read it in slices."                     |
+| item attachment        | Markdown of the forwarded message (headers, body) — **confirmed**, via a programmatically-built itemAttachment rather than Outlook's UI (see section 4); output was a `#`-heading, a bulleted Subject/From/To block, then the body text. Not confirmed: an item attachment that itself carries sub-attachments.                  |
+| `.eml` file attachment | Same converter path as above — **confirmed**: same heading/metadata/body shape, docglean's `message/rfc822` support works.                                                                                                                                                                                                       |
+| scanned PDF            | Without OCR: error `no_text_content` with `contentStatus: "no_text_layer"` (not exercised in this run — the docglean build used has OCR on by default). With OCR: **confirmed** — the image-only test PDF (no `/Font` dict, confirmed before sending) came back as clean Markdown with the embedded marker text recovered essentially perfectly, not merely "possibly imperfect". |
 
 Paging caveat: `read-document` returns only the Markdown. docglean's `next_offset`/total-size fields are not shown to you by this tool, so continue by hand: `offset` = previous `offset` + characters you received. Every continuation mints a fresh ticket and re-fetches and re-converts the whole document.
 
@@ -295,9 +299,11 @@ Restore: `docker compose --profile negative stop m365-mint && docker compose up 
 ### 7.3 Other cheap checks
 
 - Mode mismatch: set `MS365_MCP_ATTACHMENT_URL_KEY` on ms-365 only (against the unsigned profile above): expect `blocked_host` on every read (not verified), with the operator hint in `message`. Unset it afterwards. (Keyed variant: a different key file on each side gives the same result.)
-- `read-document` with `"target":"https://graph.microsoft.com/v1.0/me/messages"`: `invalid_target`.
-- `read-document` with the bare attachment path (no `/$value`): `invalid_target`.
-- Stop docglean (`docker compose stop docglean`), call `read-document`: `proxy_unreachable` after one retry (two warn lines in `docker compose logs m365`).
+- `read-document` with `"target":"https://graph.microsoft.com/v1.0/me/messages"`: `invalid_target` — **confirmed**.
+- `read-document` with the bare attachment path (no `/$value`): `invalid_target` — **confirmed**.
+- Stop docglean (`docker compose stop docglean`), call `read-document`: `proxy_unreachable` after one retry (two warn lines in `docker compose logs m365`). Not exercised in this run.
+
+The network-isolation checks in 7.1 were all run on 2026-10-11 and matched exactly: docglean reaching `10.89.0.2:3000` directly gets "Network is unreachable" (no route to agent-net at all), reaching `10.89.1.2:3000/mcp` on the shared bridge gets "Connection refused" (nothing listens there), and the attachment port gives a uniform 404 both with no ticket at all and with a bogus `t=nope&dgk=1&dgx=1&dgs=x`.
 
 ## 8. Teardown
 
